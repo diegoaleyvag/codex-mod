@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking
+
+- Removed built-in `sol`, `sol-high`, `astra-audit` agents and the `roles` option. To restore equivalent roles, copy the example in README's "Roles per project" section into `.claude/codex-mod.json`; the new names are `implementer`, `implementer-high` and `auditor`. The generic `codex-mod:codex` agent remains available. Leftover `roles` settings are ignored with a warning.
+
+### Added
+
+- Project roles in `.claude/codex-mod.json`, loaded at session start, with validated profiles, descriptions and optional role instructions prepended to every Codex task and live steer.
+- `projectRoles` (default `true`) to enable project role loading and `allowProjectFullAccess` (default `false`) as the user-level opt-in for repository-declared `danger-full-access` roles.
+
 ### Fixed
 
 - In `handbackMode: auto`, use text directly when the complete API conversation has no handback signal, and remember failed handbacks per session so new agents avoid repeating an unavailable `SubagentHandback` call. Explicit tool signals still take precedence.

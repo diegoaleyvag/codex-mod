@@ -1,7 +1,7 @@
 {
   "name": "codex-mod",
   "version": "1.1.0",
-  "description": "Subagent types codex-mod:codex, sol, sol-high and astra-audit answered by the local OpenAI Codex CLI (codex exec) instead of an Anthropic model.",
+  "description": "Subagent types codex-mod:codex and project-declared roles answered by the local OpenAI Codex CLI (codex exec) instead of an Anthropic model.",
   "author": {
     "name": "Diego Leyva",
     "url": "https://github.com/diegoaleyvag"
@@ -45,16 +45,17 @@
         "danger-full-access"
       ]
     },
-    "roles": {
-      "type": "string",
-      "title": "Role agents",
-      "description": "Which role agents to register besides codex: sol, sol-high, astra-audit.",
-      "multiple": true,
-      "default": [
-        "sol",
-        "sol-high",
-        "astra-audit"
-      ]
+    "projectRoles": {
+      "type": "boolean",
+      "title": "Roles per project",
+      "description": "Read .claude/codex-mod.json in the session working directory at session start and register its roles besides codex. Off: do not read the file.",
+      "default": true
+    },
+    "allowProjectFullAccess": {
+      "type": "boolean",
+      "title": "Allow project full access",
+      "description": "Allow roles declared by a repository to request the danger-full-access sandbox. Off: refuse those roles.",
+      "default": false
     },
     "lean": {
       "type": "boolean",

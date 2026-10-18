@@ -14,7 +14,7 @@ codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hoo
 
 ```
 Claude (orchestrator)
-   |  Agent(subagent_type = "codex-mod:sol", prompt)
+   |  Agent(subagent_type = "codex-mod:codex", prompt)
    v
 turn.step hook  --- never calls the model: no Anthropic request ---
    |  starts: codex exec --json   (task on stdin, thread resumed on follow-ups)
@@ -74,9 +74,9 @@ claude plugin marketplace remove codex-mod
 Ask Claude to delegate, or name the agent directly:
 
 ```
-Use codex-mod:sol to add input validation to src/api.ts. Allowed paths: src/. Verify with `npm test`. Report the diff summary.
+Use codex-mod:codex to add input validation to src/api.ts. Allowed paths: src/. Verify with `npm test`. Report the diff summary.
 
-Use codex-mod:astra-audit to review the diff of branch feature/x against main. Report findings only.
+Use codex-mod:auditor (declared below) to review the diff of branch feature/x against main. Report findings only.
 ```
 
 Codex sees only the prompt and the repository's `AGENTS.md`, so the prompt must carry the whole task: branch, allowed paths, how to verify, what to report.
@@ -101,16 +101,29 @@ codex · gpt-6-luna · low · workspace-write · 3 actions · 37.4K new tokens (
 
 It shows the agent, model, effort, sandbox, number of actions, Codex's token counts (new, cached, output) and the Codex thread id. With the `app-server` transport it also shows `app-server` and, when any were delivered, `N steer(s)`. Failures are never silent: the answer starts with `codex failed: <reason>` followed by the last lines of Codex's stderr.
 
-## Agents
+## Roles per project
 
-| Agent | Default model | Effort | Sandbox | Use it for |
-| --- | --- | --- | --- | --- |
-| `codex-mod:codex` | option `defaultModel` (empty: first model Codex lists) | option `defaultEffort` | option `defaultSandbox` | A self-contained coding or research task |
-| `codex-mod:sol` | `gpt-6.1-sol` | `medium` | `workspace-write` | A normal, bounded implementation task |
-| `codex-mod:sol-high` | `gpt-6.1-sol` | `xhigh` | `workspace-write` | High-risk work, or a retry |
-| `codex-mod:astra-audit` | `gpt-6-astra` | `xhigh` | `read-only` | Independent read-only review; never edits |
+`codex-mod:codex` is always available. Its defaults come from `defaultModel` (empty: first model Codex lists), `defaultEffort` and `defaultSandbox`. Projects can declare additional roles in `.claude/codex-mod.json`, relative to the session's working directory:
 
-A role agent whose model is not in your Codex model list is not registered. Agent descriptions list the models available on your machine.
+```json
+{"roles": {
+  "implementer": {"model": "gpt-6.1-sol", "effort": "medium", "sandbox": "workspace-write", "description": "Normal bounded coding task; the prompt carries the full spec (branch, allowed paths, verification command, report format)."},
+  "implementer-high": {"model": "gpt-6.1-sol", "effort": "xhigh", "sandbox": "workspace-write", "description": "High-risk work or a retry after a failed attempt."},
+  "auditor": {"model": "gpt-6-astra", "effort": "low", "sandbox": "read-only", "description": "One read-only cross-model review of a whole change.", "instructions": "You are a read-only auditor. Never edit files. Report findings with file:line and a failure scenario."}
+}}
+```
+
+This registers `codex-mod:implementer`, `codex-mod:implementer-high` and `codex-mod:auditor` when their profiles are available. There are no built-in role agents in 1.2; this example replaces the former `sol`, `sol-high` and `astra-audit` roles.
+
+- The file must be an object with a `roles` object. Each role requires string `model`, `effort` and `description` fields; model and effort must be nonempty. `sandbox` defaults to `workspace-write`; `instructions` is an optional string.
+- Names must match `^[a-z][a-z0-9-]{0,31}$` and cannot be `codex`. Only the first 16 entries are considered. Descriptions are limited to 600 characters and instructions to 2000. Invalid roles are skipped with debug warnings; unknown keys are ignored with debug warnings.
+- Sandboxes are `read-only`, `workspace-write` or `danger-full-access`. Repository files may be untrusted: `danger-full-access` roles are refused unless you enable the user-level `allowProjectFullAccess` option (default `false`). A file cannot opt itself in.
+- A role whose model or effort is absent from Codex's `models_cache.json` is skipped with a debug message. If the catalog cannot be read, profiles are not validated, as before. Agent descriptions list the available models when known.
+- A missing file silently leaves only the generic agent. Malformed JSON or a wrong file shape produces a debug message and one user-visible notice per session; the generic agent remains available. Set `projectRoles: false` to skip reading the file entirely.
+
+Roles load at session start (and again if agent registration must be retried). Start a new session after editing the file; a cwd change mid-session does not reload it. Running agents retain the model, effort and sandbox in their records even if their role disappears. Instructions are looked up from the loaded role snapshot for every launch and live steer, rather than stored in the agent record: edits on disk do not change them until registration reloads the file. If a role is removed on reload, its existing agents continue without role instructions.
+
+Role instructions are prepended to the task with a blank line on first runs, resumed runs, follow-ups and live steers, after prompt override lines are removed. They are never added to rendered action rows, delivery notes or footers.
 
 ## Options
 
@@ -122,7 +135,8 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `defaultModel` | empty | Model of `codex-mod:codex`. Empty: first model Codex lists. |
 | `defaultEffort` | `medium` | Effort of `codex-mod:codex`; must be supported by the model. |
 | `defaultSandbox` | `workspace-write` | `read-only`, `workspace-write` or `danger-full-access`. |
-| `roles` | `sol`, `sol-high`, `astra-audit` | Role agents to register besides `codex`. |
+| `projectRoles` | `true` | Load roles from `.claude/codex-mod.json` at session start. Off: do not read the file. |
+| `allowProjectFullAccess` | `false` | Allow project roles to request `danger-full-access`. User-level opt-in. |
 | `lean` | `true` | Turn off Codex plugins, apps, skills instructions, web search, multi-agent and configured MCP servers per launch. |
 | `globalRules` | `true` | Off (experimental): run Codex with a plugin-owned `CODEX_HOME` so your user-level `AGENTS.md` is not loaded. |
 | `extraConfig` | none | Raw `key=value` entries passed as `-c` to every launch. `model`, `model_reasoning_effort` and `sandbox_mode` are refused. |
@@ -136,6 +150,8 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `transport` | `exec` | `exec` (`codex exec --json`, most stable) or `app-server` (experimental, see [Transports](#transports)). |
 | `nodePath` | empty | Absolute path of Node (18 or later) for the `app-server` sidecar. Empty: `PATH`, then common locations. |
 | `pruneDays` | `2` | Delete stored agent records (thread, model, effort) unused for this many days. |
+
+`handbackMode: "tool"` can lose answers in a session where the host does not offer `SubagentHandback`; keep `auto`.
 
 To set `transport` from a settings file:
 
@@ -197,7 +213,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - Any other Bash, Edit or Write call from a codex-mod agent, or from a subagent whose type cannot be resolved, is refused. A failing guard refuses too, and a `tool.check` hook denies such a call as a backstop. No option turns this off.
 - Launch guard: at most one launch per new message and `maxRunsPerWindow` launches per agent in 10 minutes. Beyond that the agent hands back `codex failed: launch guard tripped`. Counters live in the stored record, so a restart does not reset them.
 - Engine notices (reminders, nudges) are never treated as tasks; they re-deliver the last answer without a Codex run.
-- Codex itself runs under the sandbox of the chosen agent. Prefer `read-only` or `workspace-write`; `danger-full-access` is opt-in via `defaultSandbox`.
+- Codex itself runs under the sandbox of the chosen agent. Prefer `read-only` or `workspace-write`; `danger-full-access` requires `defaultSandbox` for the generic agent or the user-level `allowProjectFullAccess` opt-in for project roles.
 
 ## Troubleshooting
 

@@ -40,3 +40,14 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
 - Why: Sol xhigh is the Codex counterpart of Opus, whose steps are not reviewed one by one;
   Fable and Astra play the same role, and Astra costs about 5x Sol.
 - Consequences: findings surface later, so each phase must leave tests that make the final review cheap to act on.
+
+## D-006 - Roles are declared per project, with a user-level full-access opt-in
+- Date: 2026-10-18 (1.2.0).
+- Decision: roles are declared in `.claude/codex-mod.json` in the session working directory;
+  the generic `codex-mod:codex` agent is always present. A repository file cannot request
+  `danger-full-access` without the user-level `allowProjectFullAccess` opt-in.
+- Why: role names, profiles and instructions belong to each project's workflow rather than
+  a hardcoded plugin roster. Repository content may be untrusted and cannot grant itself full access.
+- Consequences: roles load at session start (or registration retry); edits need a new session,
+  and cwd changes do not reload them. Existing records retain their profiles; instructions
+  come from the loaded snapshot, and invalid project files never block the generic agent.

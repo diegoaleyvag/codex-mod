@@ -1,4 +1,4 @@
-// codex-mod: the agent types `codex-mod:<codex|sol|sol-high|astra-audit>` are
+// codex-mod: the generic and project-declared agent types are
 // answered by OpenAI Codex (`codex exec --json`) running on this machine,
 // never by an Anthropic model.
 //
@@ -207,22 +207,61 @@ const INTERRUPT_GRACE_MS = 1500
 // ---- roles -----------------------------------------------------------------
 
 type Profile = { model: string; effort: string; sandbox: string }
-type Role = Profile & { summary: string }
+type ProjectRole = Profile & { description: string; instructions?: string }
+const PROJECT_FILE = '.claude/codex-mod.json'
 
-/** The role agents: what Codex runs each with. `codex` (the generic agent) is built from userConfig. */
-export const ROLES: Record<string, Role> = {
-  sol: {
-    model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write',
-    summary: 'Implementer for a normal, bounded coding task. The prompt must carry the full task spec (branch, allowed paths, verification command, report format); Codex sees only the prompt and the repo\'s AGENTS.md. It cannot commit in git worktrees or use the network, so the caller commits and pushes.',
-  },
-  'sol-high': {
-    model: 'gpt-6.1-sol', effort: 'xhigh', sandbox: 'workspace-write',
-    summary: 'Implementer for high-risk work or a retry after a failed attempt. The prompt must carry the full task spec (branch, allowed paths, verification command, report format); the caller commits and pushes.',
-  },
-  'astra-audit': {
-    model: 'gpt-6-astra', effort: 'xhigh', sandbox: 'read-only',
-    summary: 'Independent read-only auditor of someone else\'s change; it never edits files. Give it the diff or branch and the acceptance criteria, and it reports findings.',
-  },
+/** Validates an untrusted project file without I/O; catalog checks happen at registration. */
+export function parseProjectRoles(text: string, { allowFullAccess = false } = {}): { roles: Record<string, ProjectRole>; warnings: string[]; invalid?: true } {
+  const roles: Record<string, ProjectRole> = Object.create(null)
+  const warnings: string[] = []
+  const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { roles, warnings: ['invalid JSON; project roles ignored'], invalid: true }
+  }
+  if (!object(parsed) || !object(parsed.roles)) {
+    return { roles, warnings: ['expected an object with a roles object; project roles ignored'], invalid: true }
+  }
+  const unknown = (o: Record<string, unknown>, keys: string[], where: string) => {
+    for (const k of Object.keys(o)) if (!keys.includes(k)) warnings.push(`${where}: unknown key ${JSON.stringify(k)} ignored`)
+  }
+  unknown(parsed, ['roles'], 'project')
+  const entries = Object.entries(parsed.roles)
+  if (entries.length > 16) warnings.push('at most 16 roles allowed; extra roles skipped')
+  for (const [name, value] of entries.slice(0, 16)) {
+    const bad = (why: string) => warnings.push(`role ${JSON.stringify(name)} skipped: ${why}`)
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(name) || name === 'codex') {
+      bad('invalid or reserved name')
+      continue
+    }
+    if (!object(value)) {
+      bad('expected an object')
+      continue
+    }
+    unknown(value, ['model', 'effort', 'sandbox', 'description', 'instructions'], `role ${name}`)
+    const { model, effort, description, instructions } = value
+    const sandbox = value.sandbox === undefined ? 'workspace-write' : value.sandbox
+    if (typeof model !== 'string' || model.trim() === '' || typeof effort !== 'string' || effort.trim() === '' || typeof description !== 'string') {
+      bad('model, effort and description must be strings (model and effort nonempty)')
+      continue
+    }
+    if (description.length > 600 || (instructions !== undefined && (typeof instructions !== 'string' || instructions.length > 2000))) {
+      bad('description must be at most 600 chars; instructions must be a string of at most 2000 chars')
+      continue
+    }
+    if (typeof sandbox !== 'string' || !SANDBOXES.includes(sandbox)) {
+      bad('invalid sandbox')
+      continue
+    }
+    if (sandbox === 'danger-full-access' && !allowFullAccess) {
+      bad('danger-full-access requires the user-level allowProjectFullAccess option')
+      continue
+    }
+    roles[name] = { model, effort, sandbox, description, ...(instructions !== undefined ? { instructions } : {}) }
+  }
+  return { roles, warnings }
 }
 const GENERIC_SUMMARY = 'Delegates the task to OpenAI Codex (codex exec) running locally in the session\'s working directory. Use for a self-contained coding or research task you want done by Codex rather than Claude. The prompt is sent to Codex verbatim.'
 const PLACEHOLDER_PROMPT = 'You are a placeholder. The codex-mod plugin answers this agent\'s turns with OpenAI Codex and no Anthropic request is sent. If you are reading this, the plugin\'s turn.step hook did not run: reply with exactly "codex-mod: hook not active; no Codex run was made." and nothing else. Do not call any tool.'
@@ -241,7 +280,8 @@ export type Config = {
   lean: boolean
   globalRules: boolean
   generic: Profile
-  roles: string[]
+  projectRoles: boolean
+  allowProjectFullAccess: boolean
   extraConfig: string[]
   intervalMs: number
   maxActionsPerStep: number
@@ -260,8 +300,6 @@ export type Config = {
   /** Option values that were refused (the default was used), for the debug log. */
   warnings: string[]
 }
-
-const DEFAULT_ROLES = Object.keys(ROLES)
 
 /** Validates the userConfig values; a refused value falls back to its default with a warning. */
 export function parseConfig(raw: unknown): Config {
@@ -303,11 +341,7 @@ export function parseConfig(raw: unknown): Config {
   const model = str('defaultModel', '')
   if (model !== '' && !/^[\w.:-]+$/.test(model)) bad('defaultModel', 'not a model name')
   const effort = str('defaultEffort', FALLBACK_EFFORT).toLowerCase()
-  const roles = list('roles', DEFAULT_ROLES).filter(r => {
-    if (r in ROLES) return true
-    warnings.push(`roles: unknown role "${r}" ignored`)
-    return false
-  })
+  if (Object.prototype.hasOwnProperty.call(o, 'roles')) warnings.push('roles: removed in 1.2; declare roles in .claude/codex-mod.json')
   const extraConfig = list('extraConfig', []).filter(kv => {
     const m = /^([A-Za-z0-9_.\-"]+)=([\s\S]+)$/.exec(kv)
     if (!m) return warnings.push(`extraConfig: "${kv}" is not key=value; ignored`), false
@@ -326,7 +360,8 @@ export function parseConfig(raw: unknown): Config {
       effort: /^[a-z]+$/.test(effort) ? effort : (bad('defaultEffort', 'not an effort name'), FALLBACK_EFFORT),
       sandbox: oneOf('defaultSandbox', 'workspace-write', SANDBOXES),
     },
-    roles,
+    projectRoles: bool('projectRoles', true),
+    allowProjectFullAccess: bool('allowProjectFullAccess', false),
     extraConfig,
     intervalMs: int('progressIntervalMs', 1000, 0, 60000),
     maxActionsPerStep: int('maxActionsPerStep', 10, 1, 50),
@@ -1121,6 +1156,9 @@ let preflight: string | undefined
 let catalog: ModelInfo[] | null | undefined
 // The config of the loaded module (set by register).
 let cfg: Config = parseConfig({})
+// Session-start snapshot, refreshed only when registration is retried, never on cwd changes.
+let projectRoles = new Map<string, ProjectRole>()
+const projectNotified = new Set<string>()
 // False after a session start whose agent registration failed: retried once on the next main-loop step.
 let agentsReady = true
 // The app-server transport as checked (session start, else the first launch); undefined: not checked.
@@ -1155,8 +1193,17 @@ export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentI
 }
 
 /** The profile of an agent type name; undefined for a name this module does not define. */
-const profileOf = (name: string): Profile | undefined =>
-  name === 'codex' ? { ...cfg.generic } : name in ROLES ? { model: ROLES[name]!.model, effort: ROLES[name]!.effort, sandbox: ROLES[name]!.sandbox } : undefined
+const profileOf = (name: string): Profile | undefined => {
+  if (name === 'codex') return { ...cfg.generic }
+  const role = projectRoles.get(name)
+  return role === undefined ? undefined : { model: role.model, effort: role.effort, sandbox: role.sandbox }
+}
+
+/** Shared by launches and live steers; instructions never enter task records or rendered notes. */
+const roleTask = (name: string, text: string): string => {
+  const instructions = projectRoles.get(name)?.instructions
+  return instructions ? `${instructions}\n\n${text}` : text
+}
 
 export const register: Register = (on, options) => {
   cfg = parseConfig(options)
@@ -1267,8 +1314,8 @@ export const register: Register = (on, options) => {
       known.set(e.agentId, name)
     }
     if (name === undefined) return yield* next(e)
-    if (profileOf(name) === undefined) {
-      return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not defined by this version of the plugin`, handbackFor(e.agentId, undefined))
+    if (profileOf(name) === undefined && await loadRecord($, e.agentId) === undefined) {
+      return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not declared by this project (.claude/codex-mod.json) or this version of the plugin`, handbackFor(e.agentId, undefined))
     }
     budgets.set(next.signal, () => next.budget.remainingMs)
     return yield* answerWithCodex($, e, next.signal, config, name)
@@ -1411,8 +1458,44 @@ async function pruneRuns($: EngineInterface, ttlMs: number): Promise<void> {
   }
 }
 
-/** Registers the generic agent and each enabled role whose model Codex lists. */
+/** Reads relative to the session cwd, only at registration; a missing file is normal. */
+async function loadProjectRoles($: EngineInterface, config: Config): Promise<void> {
+  projectRoles = new Map()
+  if (!config.projectRoles) return
+  let text: string
+  try {
+    text = await $.fs.read(PROJECT_FILE)
+  } catch {
+    // The file is optional; a failed read must leave the generic agent usable.
+    return
+  }
+  const parsed = parseProjectRoles(text, { allowFullAccess: config.allowProjectFullAccess })
+  for (const w of parsed.warnings) $.ui.log(`codex-mod: ${PROJECT_FILE}: ${w}`, { to: 'debug' })
+  projectRoles = new Map(Object.entries(parsed.roles).filter(([name, role]) => {
+    const why = checkProfile(catalog ?? undefined, role.model, role.effort)
+    if (why === undefined) return true
+    $.ui.log(`codex-mod: role ${name} not registered: ${why}`, { to: 'debug' })
+    return false
+  }))
+  if (parsed.invalid) {
+    const sid = await sessionId($)
+    if (projectNotified.has(sid)) return
+    projectNotified.add(sid)
+    const notice = `codex-mod: ${PROJECT_FILE}: ${parsed.warnings[0]}; the generic codex agent is still available`
+    const sent = await $.ui.notify(notice).catch(() => ({ isSent: false as const }))
+    if (!sent.isSent) {
+      try {
+        $.ui.toast(notice, { timeoutMs: 10000 })
+      } catch {
+        // UI availability must not prevent generic agent registration either.
+      }
+    }
+  }
+}
+
+/** Registers the generic agent and each project role whose model Codex lists. */
 async function registerAgents($: EngineInterface, config: Config): Promise<boolean> {
+  await loadProjectRoles($, config)
   let failed = false
   const list = catalog ?? undefined
   const models = list !== undefined ? ` Codex models available here: ${catalogLine(list)}.` : ''
@@ -1423,14 +1506,8 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
     name: 'codex',
     description: `${GENERIC_SUMMARY} Defaults: ${g.model || list?.[0]?.slug || FALLBACK_MODEL} at ${g.effort} reasoning, sandbox ${g.sandbox}.${override}${models}`,
   })
-  for (const name of config.roles) {
-    const r = ROLES[name]!
-    const why = checkProfile(list, r.model, r.effort)
-    if (why !== undefined) {
-      $.ui.log(`codex-mod: role ${name} not registered: ${why}`, { to: 'debug' })
-      continue
-    }
-    specs.push({ name, description: `${r.summary} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox.${override}${models}` })
+  for (const [name, r] of projectRoles) {
+    specs.push({ name, description: `${r.description} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox (declared by this project).${override}${models}` })
   }
   for (const s of specs) {
     try {
@@ -1794,7 +1871,7 @@ async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> 
   const text = parseOverrides(f.text).rest.trim()
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
     try {
-      await $.fs.write(`${run.control}/steer-${steerFileId(f)}.json`, JSON.stringify({ text }))
+      await $.fs.write(`${run.control}/steer-${steerFileId(f)}.json`, JSON.stringify({ text: roleTask(run.name, text) }))
       run.pendingSteers.push(f)
       $.ui.log(`codex-mod: agent ${run.agentId}: message received mid-run; steered into the running turn`, { to: 'debug' })
       return
@@ -1881,7 +1958,7 @@ async function* startRun(
   rec.launchKey = key
   rec.guardTrip = undefined
   await saveRecord($, agentId, rec)
-  const task = o.rest
+  const task = roleTask(name, o.rest)
 
   const cwd = await $.session.cwd()
   const lean = config.lean ? await leanArgs($) : []

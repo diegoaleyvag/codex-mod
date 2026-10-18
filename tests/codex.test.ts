@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -14,6 +14,13 @@ const MODELS_CACHE = JSON.stringify({
   ],
 })
 
+// A project file supplied through the session-relative fs.read mock, never the real repo.
+const PROJECT_ROLES = JSON.stringify({ roles: {
+  implementer: { model: 'gpt-6.1-sol', effort: 'medium', description: 'Bounded implementation.', instructions: 'Keep the change bounded.' },
+  'implementer-high': { model: 'gpt-6.1-sol', effort: 'xhigh', sandbox: 'workspace-write', description: 'High-risk implementation.' },
+  auditor: { model: 'gpt-6-astra', effort: 'xhigh', sandbox: 'read-only', description: 'Read-only review.', instructions: 'Never edit files.' },
+} })
+
 const CODEX_JSONL = [
   '{"type":"thread.started","thread_id":"t-1"}',
   '{"type":"turn.started"}',
@@ -24,19 +31,20 @@ const CODEX_JSONL = [
 
 type Status = 'running' | 'completed' | 'killed'
 const AGENT_TYPES: Record<string, string> = {
+  'agent-project': 'codex-mod:implementer',
+  'agent-project-high': 'codex-mod:implementer-high',
+  'agent-project-auditor': 'codex-mod:auditor',
   'agent-codex': 'codex-mod:codex',
-  'agent-sol': 'codex-mod:sol',
-  'agent-solh': 'codex-mod:sol-high',
-  'agent-astra': 'codex-mod:astra-audit',
-  'agent-resume': 'codex-mod:sol',
-  'agent-deny': 'codex-mod:sol',
+  'agent-normal': 'codex-mod:codex',
+  'agent-resume': 'codex-mod:codex',
+  'agent-deny': 'codex-mod:codex',
   'agent-gp': 'general-purpose',
-  'agent-keep': 'codex-mod:sol',
-  'agent-new-effort': 'codex-mod:sol',
-  'agent-persist': 'codex-mod:sol',
-  'agent-restarted': 'codex-mod:sol-high',
-  'agent-moved': 'codex-mod:sol',
-  'agent-compact': 'codex-mod:sol',
+  'agent-keep': 'codex-mod:codex',
+  'agent-new-effort': 'codex-mod:codex',
+  'agent-persist': 'codex-mod:codex',
+  'agent-restarted': 'codex-mod:codex',
+  'agent-moved': 'codex-mod:codex',
+  'agent-compact': 'codex-mod:codex',
   'agent-progress': 'codex-mod:codex',
   'agent-throttle': 'codex-mod:codex',
   'agent-files': 'codex-mod:codex',
@@ -52,7 +60,7 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-force-tool': 'codex-mod:codex',
   'agent-throws': 'codex-mod:codex',
   'agent-unknown-role': 'codex-mod:retired',
-  'agent-restart-guard': 'codex-mod:sol',
+  'agent-restart-guard': 'codex-mod:codex',
   'agent-gp2': 'general-purpose',
   'agent-wrapped': 'codex-mod:codex',
   'agent-wrapped-mid': 'codex-mod:codex',
@@ -60,8 +68,8 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-timeout': 'codex-mod:codex',
   'agent-plain': 'codex-mod:codex',
   'agent-plain-tool': 'codex-mod:codex',
-  'agent-footer-short': 'codex-mod:sol',
-  'agent-footer-off': 'codex-mod:sol',
+  'agent-footer-short': 'codex-mod:codex',
+  'agent-footer-off': 'codex-mod:codex',
   'agent-extra': 'codex-mod:codex',
   'agent-shadow': 'codex-mod:codex',
   'agent-cat-model': 'codex-mod:codex',
@@ -71,19 +79,17 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-live-rows': 'codex-mod:codex',
   'agent-fallback': 'codex-mod:codex',
   'agent-window': 'codex-mod:codex',
-  'agent-guard-restart': 'codex-mod:sol',
+  'agent-guard-restart': 'codex-mod:codex',
   'agent-drift': 'codex-mod:codex',
   'agent-drift-ok': 'codex-mod:codex',
   'agent-drift-version': 'codex-mod:codex',
   'agent-exec-notimer': 'codex-mod:codex',
   'agent-provider': 'codex-mod:codex',
-  'agent-app': 'codex-mod:sol',
   'agent-app-fallback': 'codex-mod:codex',
   'agent-app-lazy': 'codex-mod:codex',
   'agent-app-steer': 'codex-mod:codex',
   'agent-app-reject': 'codex-mod:codex',
   'agent-app-unacked': 'codex-mod:codex',
-  'agent-app-mid': 'codex-mod:codex',
   'agent-app-kill': 'codex-mod:codex',
   'agent-app-kill-hard': 'codex-mod:codex',
   'agent-app-fatal': 'codex-mod:codex',
@@ -113,7 +119,7 @@ type WorldOpts = {
    */
   pieces?: readonly (Piece | 'block' | (() => boolean))[]
   store?: Map<string, unknown>
-  /** What `$.fs.read` finds, by absolute path (mutable between steps). */
+  /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
   /** False: the agent's conversation lacks the host's SubagentHandback reminder. */
   handback?: boolean
@@ -140,6 +146,8 @@ function world(on: On, opts: WorldOpts = {}) {
   const status = new Map<string, Status>()
   const store = opts.store ?? new Map<string, unknown>()
   const files = opts.files ?? new Map<string, string>()
+  const reads: string[] = []
+  const location = { cwd: '/tmp/project' }
   const clock = { now: 1_000_000 }
   // every call that reached the engine's own tool path (permission + run)
   const core: { tool: string; id?: string; agentId?: string }[] = []
@@ -159,7 +167,7 @@ function world(on: On, opts: WorldOpts = {}) {
     if (opts.listThrows) throw new Error('agent list unavailable')
     return { value: Object.entries(AGENT_TYPES).map(([id, type]) => ({ id, type, description: id, status: status.get(id) ?? ('running' as const) })) }
   })
-  on('session.cwd', () => ({ value: '/tmp/project' }))
+  on('session.cwd', () => ({ value: location.cwd }))
   on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
   on('clock.now', () => ({ value: clock.now }))
   on('clock.sleep', (_$, e: any) => {
@@ -169,7 +177,10 @@ function world(on: On, opts: WorldOpts = {}) {
   })
   on('env.get', (_$, e: any) => ({ value: e.name === 'HOME' ? '/home/t' : undefined }))
   on('fs.read', (_$, e: any) => {
-    const text = files.get(e.path)
+    // The host resolves relative reads before dispatching this mock hook.
+    const path = e.path.endsWith('/.claude/codex-mod.json') ? '.claude/codex-mod.json' : e.path
+    reads.push(path)
+    const text = files.get(path)
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
@@ -237,7 +248,7 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes }
+  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, reads, location }
 }
 
 /** A SessionMessage-shaped test row in the Messages API form. */
@@ -355,29 +366,33 @@ test('a leading codex-model line picks the model and is stripped', async ($, on)
   expect(w.spawned[0]!.input).toBe('Say hi')
 })
 
-test('each agent type maps to its model, effort and sandbox', async ($, on) => {
-  const w = world(on)
+test('project roles: each agent maps to its declared profile and instructions', async ($, on) => {
+  const w = await startProject($, on)
   for (const [id, name, model, effort, sandbox] of [
-    ['agent-sol', 'sol', 'gpt-6.1-sol', 'medium', 'workspace-write'],
-    ['agent-solh', 'sol-high', 'gpt-6.1-sol', 'xhigh', 'workspace-write'],
-    ['agent-astra', 'astra-audit', 'gpt-6-astra', 'xhigh', 'read-only'],
+    ['agent-project', 'implementer', 'gpt-6.1-sol', 'medium', 'workspace-write'],
+    ['agent-project-high', 'implementer-high', 'gpt-6.1-sol', 'xhigh', 'workspace-write'],
+    ['agent-project-auditor', 'auditor', 'gpt-6-astra', 'xhigh', 'read-only'],
   ] as const) {
     const { result } = await step($, id)
     const argv = w.spawned.at(-1)!.argv
     expect(argOf(argv, '--sandbox')).toBe(sandbox)
     expect(argOf(argv, '-m')).toBe(model)
     expect(argv).toContain(`model_reasoning_effort="${effort}"`)
+    const instructions = name === 'implementer' ? 'Keep the change bounded.\n\n' : name === 'auditor' ? 'Never edit files.\n\n' : ''
+    expect(w.spawned.at(-1)!.input).toBe(`${instructions}Reply with the single word PONG`)
+    expect(handback(result)).not.toContain('Keep the change bounded.')
+    expect(handback(result)).not.toContain('Never edit files.')
     expect(lastLine(handback(result)).startsWith(`${name} · ${model} · ${effort} · ${sandbox} · 0 actions`)).toBe(true)
   }
 })
 
-test('codex-effort and codex-model lines override the table', async ($, on) => {
+test('codex-effort and codex-model lines override the defaults', async ($, on) => {
   const w = world(on, { task: 'codex-effort: low\ncodex-model: gpt-mini-test\nHi' })
-  const { result } = await step($, 'agent-sol')
+  const { result } = await step($, 'agent-normal')
   expect(w.spawned[0]!.argv).toContain('model_reasoning_effort="low"')
   expect(w.spawned[0]!.argv).toContain('gpt-mini-test')
   expect(w.spawned[0]!.input).toBe('Hi')
-  expect(lastLine(handback(result))).toContain('sol · gpt-mini-test · low')
+  expect(lastLine(handback(result))).toContain('codex · gpt-mini-test · low')
 })
 
 test('failure: spawn rejected', async ($, on) => {
@@ -406,13 +421,13 @@ test('failure: turn.failed with exit 0', async ($, on) => {
   expect(firstLine(handback(result))).toBe('codex failed: quota')
 })
 
-test('failure: denied session read (auto: SubagentHandback by default)', async ($, on) => {
+test('failure: denied session read (auto: SubagentHandback by default)', { options: { defaultModel: 'gpt-6.1-sol' } }, async ($, on) => {
   const w = world(on, { messages: () => ({ deny: 'no access' }) })
   const { result } = await step($, 'agent-deny')
   expect(w.spawned.length).toBe(0)
   expect(result.stopReason).toBe('tool_use')
   expect(firstLine(handback(result))).toBe('codex failed: session read denied: no access')
-  expect(lastLine(handback(result))).toBe('sol · gpt-6.1-sol · medium · workspace-write · 0 actions')
+  expect(lastLine(handback(result))).toBe('codex · gpt-6.1-sol · medium · workspace-write · 0 actions')
 })
 
 test('follow-up message resumes the thread; the tool-result step ends the turn', async ($, on) => {
@@ -451,7 +466,7 @@ test('(a) a follow-up without override lines resumes with the first run\'s model
   expect(argv.slice(1, 3)).toEqual(['exec', 'resume'])
   expect(argOf(argv, '-m')).toBe('gpt-pinned')
   expect(argv).toContain('model_reasoning_effort="high"')
-  expect(lastLine(handback(result))).toContain('sol · gpt-pinned · high · workspace-write')
+  expect(lastLine(handback(result))).toContain('codex · gpt-pinned · high · workspace-write')
 })
 
 test('(b) a follow-up with a new codex-effort line uses it and persists it', async ($, on) => {
@@ -473,7 +488,7 @@ test('(b) a follow-up with a new codex-effort line uses it and persists it', asy
 
 // What a first run of agent-persist writes; the restart test below starts from it.
 const PERSISTED = {
-  agentName: 'sol',
+  agentName: 'codex',
   model: 'gpt-pinned',
   effort: 'xhigh',
   sandbox: 'workspace-write',
@@ -491,7 +506,7 @@ test('(c1) the first run persists the agent record under agent:<session>:<agent>
 })
 
 test('(c2) after a worker restart (empty memory) a follow-up resumes from the stored record', async ($, on) => {
-  const store = new Map<string, unknown>([['agent:sess-1:agent-restarted', { ...PERSISTED, agentName: 'sol-high', updatedAt: 1_000_000 }]])
+  const store = new Map<string, unknown>([['agent:sess-1:agent-restarted', { ...PERSISTED, agentName: 'codex', updatedAt: 1_000_000 }]])
   const conv: any[] = [user(PERSISTED.lastTask), ...toolResult('SubagentHandback')]
   const w = world(on, { messages: () => conv, store })
   const ended = await step($, 'agent-restarted', 1)
@@ -504,7 +519,7 @@ test('(c2) after a worker restart (empty memory) a follow-up resumes from the st
   expect(argv).toContain('t-1')
   expect(argOf(argv, '-m')).toBe('gpt-pinned')
   expect(argv).toContain('model_reasoning_effort="xhigh"')
-  expect(lastLine(handback(result))).toContain('sol-high · gpt-pinned · xhigh')
+  expect(lastLine(handback(result))).toContain('codex · gpt-pinned · xhigh')
   expect(w.logs.some(l => l.includes('record reloaded from the store'))).toBe(true)
 })
 
@@ -887,8 +902,16 @@ test('helpers: shell unwrapping, descriptions, footer numbers, MCP names, diffs'
 
 const runOk = (stdout = 'ok') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 
+const startProject = async ($: any, on: On, opts: WorldOpts = {}) => {
+  const w = world(on, { ...opts, files: new Map([['.claude/codex-mod.json', PROJECT_ROLES], ...(opts.files ?? [])]) })
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  return w
+}
+
 test('session.start: finds codex on PATH, checks it, registers the agents with the models Codex lists', async ($, on) => {
-  const w = world(on, { files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE]]) })
+  const w = world(on, { files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE], ['.claude/codex-mod.json', PROJECT_ROLES]]) })
   const runs: string[][] = []
   const registered: any[] = []
   on('agent.register', (_$, e: any) => {
@@ -903,12 +926,17 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   on('ui.toast', () => ({ value: undefined }))
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
-  expect(registered.map(r => r.name)).toEqual(['codex', 'sol', 'sol-high'])
+  expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
   expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(registered[0].description).toContain('gpt-6.1-sol (low|medium|high|xhigh|max|ultra), gpt-6-luna (low|medium|high|xhigh|max)')
   expect(registered[0].description).not.toContain('gpt-hidden')
-  // astra-audit's model is not listed: skipped, with a debug line
-  expect(w.logs.some(l => l.includes('role astra-audit not registered: model gpt-6-astra not available'))).toBe(true)
+  expect(registered[1].description).toContain('Bounded implementation. Runs OpenAI Codex gpt-6.1-sol at medium reasoning in a workspace-write sandbox (declared by this project). Start the prompt')
+  expect(registered[1].description).toContain('Codex models available here:')
+  expect(registered[1].description).not.toContain('Keep the change bounded.')
+  // The auditor's model is not listed: skipped, with a debug line.
+  expect(w.logs.some(l => l.includes('role auditor not registered: model gpt-6-astra not available'))).toBe(true)
+  const missing = await step($, 'agent-project-auditor')
+  expect(firstLine(handback(missing.result))).toContain('is not declared by this project')
   expect(w.logs.some(l => l.includes('Codex ready (/usr/local/bin/codex)'))).toBe(true)
   // the launch uses what was found
   await step($, 'agent-extra')
@@ -924,8 +952,8 @@ test('session.start: without codex on PATH, the first common install location th
   expect(w.logs.some(l => l.includes('Codex ready (/home/t/.local/bin/codex)'))).toBe(true)
 })
 
-test('session.start: the codexPath option wins and roles can be turned off', { options: { codexPath: '/opt/codex', roles: ['sol'] } }, async ($, on) => {
-  world(on)
+test('session.start: projectRoles false never reads the file; codexPath wins', { options: { codexPath: '/opt/codex', projectRoles: false } }, async ($, on) => {
+  const w = world(on, { files: new Map([['.claude/codex-mod.json', PROJECT_ROLES]]) })
   const runs: string[][] = []
   const registered: string[] = []
   on('agent.register', (_$, e: any) => {
@@ -938,7 +966,8 @@ test('session.start: the codexPath option wins and roles can be turned off', { o
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r[0])).toEqual(['/opt/codex', '/opt/codex'])
-  expect(registered).toEqual(['codex', 'sol'])
+  expect(registered).toEqual(['codex'])
+  expect(w.reads).not.toContain('.claude/codex-mod.json')
 })
 
 test('session.start: warns when logged out; first use carries the launch check', async ($, on) => {
@@ -1108,7 +1137,7 @@ test('a type of this plugin it does not define fails closed: no model, no Codex'
   const { result } = await step($, 'agent-unknown-role')
   expect(w.modelCalls).toEqual([])
   expect(w.spawned.length).toBe(0)
-  expect(firstLine(handback(result))).toBe('codex failed: agent type codex-mod:retired is not defined by this version of the plugin')
+  expect(firstLine(handback(result))).toBe('codex failed: agent type codex-mod:retired is not declared by this project (.claude/codex-mod.json) or this version of the plugin')
 })
 
 test('when the agent list fails, an agent with a stored record is still answered by Codex', async ($, on) => {
@@ -1300,8 +1329,8 @@ test('nativeActions off with SubagentHandback: the stream, then one handback cal
 })
 
 test('footer short and off', async ($, on) => {
-  const p = { agent: 'sol', model: 'm', effort: 'low', sandbox: 'read-only', actions: 2, thread: 'abcdefghij' }
-  expect(footer(p, 'short')).toBe('sol · m · low')
+  const p = { agent: 'codex', model: 'm', effort: 'low', sandbox: 'read-only', actions: 2, thread: 'abcdefghij' }
+  expect(footer(p, 'short')).toBe('codex · m · low')
   expect(footer(p, 'off')).toBe('')
 })
 
@@ -1314,7 +1343,7 @@ test('footer off: the handback carries the answer alone', { options: { footer: '
 test('footer short in a run', { options: { footer: 'short' } }, async ($, on) => {
   world(on)
   const { result } = await step($, 'agent-footer-short')
-  expect(handback(result)).toBe('PONG\n\nsol · gpt-6.1-sol · medium')
+  expect(handback(result)).toBe('PONG\n\ncodex · gpt-6.1-sol · medium')
 })
 
 test('extraConfig entries are passed as -c to every launch', { options: { extraConfig: ['tools.view_image=false'], lean: false } }, async ($, on) => {
@@ -1327,31 +1356,187 @@ test('extraConfig entries are passed as -c to every launch', { options: { extraC
 test('option validation: every knob, defaults on refused values', async () => {
   const d = parseConfig({})
   expect(d).toMatchObject({
-    lean: true, globalRules: true, generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, roles: ['sol', 'sol-high', 'astra-audit'],
+    lean: true, globalRules: true, generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, projectRoles: true, allowProjectFullAccess: false,
     extraConfig: [], intervalMs: 1000, maxActionsPerStep: 10, handbackMode: 'auto', footer: 'full', timeoutMs: 0, nativeActions: true, ttlMs: 2 * 86_400_000, maxRunsPerWindow: 3, warnings: [],
   })
   expect(d.codexPath).toBe(undefined)
   const good = parseConfig({
-    codexPath: '/x/codex', defaultModel: 'gpt-6-luna', defaultEffort: 'ULTRA', defaultSandbox: 'read-only', roles: ['sol'], lean: false, globalRules: false,
+    codexPath: '/x/codex', defaultModel: 'gpt-6-luna', defaultEffort: 'ULTRA', defaultSandbox: 'read-only', projectRoles: false, allowProjectFullAccess: true, lean: false, globalRules: false,
     extraConfig: ['a.b=1'], progressIntervalMs: 0, maxActionsPerStep: 3, handbackMode: 'tool', footer: 'short', timeoutMinutes: 30, nativeActions: false, pruneDays: 7,
     maxRunsPerWindow: 5,
   })
   expect(good).toMatchObject({
-    codexPath: '/x/codex', generic: { model: 'gpt-6-luna', effort: 'ultra', sandbox: 'read-only' }, roles: ['sol'], lean: false, globalRules: false,
+    codexPath: '/x/codex', generic: { model: 'gpt-6-luna', effort: 'ultra', sandbox: 'read-only' }, projectRoles: false, allowProjectFullAccess: true, lean: false, globalRules: false,
     extraConfig: ['a.b=1'], intervalMs: 0, maxActionsPerStep: 3, handbackMode: 'tool', footer: 'short', timeoutMs: 1_800_000, nativeActions: false, ttlMs: 7 * 86_400_000, maxRunsPerWindow: 5, warnings: [],
   })
   const bad = parseConfig({
-    defaultModel: 'bad model!', defaultEffort: 'not-an-effort', defaultSandbox: 'yolo', roles: ['sol', 'ghost'], lean: 'yes', globalRules: 1,
+    defaultModel: 'bad model!', defaultEffort: 'not-an-effort', defaultSandbox: 'yolo', projectRoles: 'yes', allowProjectFullAccess: 1, lean: 'yes', globalRules: 1,
     extraConfig: ['novalue', 'model=gpt-x', 'sandbox_mode="danger-full-access"', 'ok=1'], progressIntervalMs: -5, maxActionsPerStep: 99, handbackMode: 'never',
     footer: 'huge', timeoutMinutes: 99999, nativeActions: 'no', pruneDays: 0, maxRunsPerWindow: 0,
   })
   expect(bad).toMatchObject({
-    generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, roles: ['sol'], lean: true, globalRules: true, extraConfig: ['ok=1'],
+    generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, projectRoles: true, allowProjectFullAccess: false, lean: true, globalRules: true, extraConfig: ['ok=1'],
     intervalMs: 1000, maxActionsPerStep: 10, handbackMode: 'auto', footer: 'full', timeoutMs: 0, nativeActions: true, ttlMs: 2 * 86_400_000, maxRunsPerWindow: 3,
   })
-  for (const k of ['defaultModel', 'defaultEffort', 'defaultSandbox', 'ghost', 'lean', 'globalRules', 'novalue', '"model"', '"sandbox_mode"', 'progressIntervalMs', 'maxActionsPerStep', 'handbackMode', 'footer', 'timeoutMinutes', 'nativeActions', 'pruneDays', 'maxRunsPerWindow']) {
+  for (const k of ['defaultModel', 'defaultEffort', 'defaultSandbox', 'projectRoles', 'allowProjectFullAccess', 'lean', 'globalRules', 'novalue', '"model"', '"sandbox_mode"', 'progressIntervalMs', 'maxActionsPerStep', 'handbackMode', 'footer', 'timeoutMinutes', 'nativeActions', 'pruneDays', 'maxRunsPerWindow']) {
     expect(bad.warnings.some(w => w.includes(k))).toBe(true)
   }
+})
+
+test('parseProjectRoles: valid file, defaults and length boundaries', async () => {
+  const parsed = parseProjectRoles(PROJECT_ROLES)
+  expect(Object.keys(parsed.roles)).toEqual(['implementer', 'implementer-high', 'auditor'])
+  expect(parsed.roles.implementer).toEqual({ model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', description: 'Bounded implementation.', instructions: 'Keep the change bounded.' })
+  expect(parsed.warnings).toEqual([])
+  const boundary = { model: 'm', effort: 'low', description: 'd'.repeat(600), instructions: 'i'.repeat(2000) }
+  const names = { ['a'.repeat(32)]: boundary, constructor: boundary }
+  expect(Object.keys(parseProjectRoles(JSON.stringify({ roles: names })).roles)).toEqual(Object.keys(names))
+})
+
+for (const [label, name, changes] of [
+  ['bad name', 'Bad_role', {}],
+  ['long name', 'a'.repeat(33), {}],
+  ['codex name', 'codex', {}],
+  ['long description', 'worker', { description: 'd'.repeat(601) }],
+  ['long instructions', 'worker', { instructions: 'i'.repeat(2001) }],
+  ['bad instructions type', 'worker', { instructions: 1 }],
+  ['bad sandbox', 'worker', { sandbox: 'yolo' }],
+  ['full access refused', 'worker', { sandbox: 'danger-full-access' }],
+  ['missing model', 'worker', { model: undefined }],
+  ['missing effort', 'worker', { effort: undefined }],
+  ['missing description', 'worker', { description: undefined }],
+  ['empty model', 'worker', { model: '' }],
+  ['bad effort type', 'worker', { effort: 2 }],
+] as const) {
+  test(`parseProjectRoles: refuses ${label}`, async () => {
+    const parsed = parseProjectRoles(JSON.stringify({ roles: { [name]: { model: 'm', effort: 'low', description: 'Task.', ...changes } } }))
+    expect(Object.keys(parsed.roles)).toEqual([])
+    expect(parsed.warnings.length).toBe(1)
+  })
+}
+
+test('parseProjectRoles: skips roles beyond 16 with a warning', async () => {
+  const roles = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`role-${i}`, { model: 'm', effort: 'low', description: 'Task.' }]))
+  const parsed = parseProjectRoles(JSON.stringify({ roles }))
+  expect(Object.keys(parsed.roles).length).toBe(16)
+  expect(parsed.roles['role-16']).toBe(undefined)
+  expect(parsed.warnings).toEqual(['at most 16 roles allowed; extra roles skipped'])
+})
+
+test('parseProjectRoles: full access allowed only by user opt-in; unknown keys ignored', async () => {
+  const parsed = parseProjectRoles(JSON.stringify({ ignored: true, roles: { worker: { model: 'm', effort: 'low', sandbox: 'danger-full-access', description: 'Task.', extra: 'ignored' } } }), { allowFullAccess: true })
+  expect(parsed.roles.worker).toEqual({ model: 'm', effort: 'low', sandbox: 'danger-full-access', description: 'Task.' })
+  expect(parsed.warnings).toEqual(['project: unknown key "ignored" ignored', 'role worker: unknown key "extra" ignored'])
+})
+
+test('parseProjectRoles: malformed JSON and wrong shapes never throw', async () => {
+  for (const text of ['{', 'null', '[]', '{}', '{"roles":null}', '{"roles":[]}', '{"roles":"bad"}']) {
+    const parsed = parseProjectRoles(text)
+    expect(Object.keys(parsed.roles)).toEqual([])
+    expect(parsed.invalid).toBe(true)
+    expect(parsed.warnings.length).toBe(1)
+  }
+  for (const value of [null, [], 1, 'bad']) {
+    const parsed = parseProjectRoles(JSON.stringify({ roles: { worker: value } }))
+    expect(Object.keys(parsed.roles)).toEqual([])
+    expect(parsed.warnings.length).toBe(1)
+  }
+})
+
+test('project roles: missing file silently registers only codex', async ($, on) => {
+  const registered: string[] = []
+  const w = world(on)
+  on('process.run', () => runOk())
+  on('agent.register', (_$, e: any) => {
+    registered.push(e.name)
+    return { value: { agent: `codex-mod:${e.name}` } }
+  })
+  await startSession($)
+  expect(registered).toEqual(['codex'])
+  expect(w.reads).toContain('.claude/codex-mod.json')
+  expect(w.logs.filter(l => l.includes('.claude/codex-mod.json'))).toEqual([])
+})
+
+for (const [label, text, notifyThrows] of [['malformed JSON', '{', false], ['wrong shape', '{"roles":[]}', true]] as const) {
+  test(`project roles: ${label} logs once per read and notices once per session with toast fallback`, async ($, on) => {
+    const notices: string[] = []
+    const toasts: string[] = []
+    const w = world(on, { files: new Map([['.claude/codex-mod.json', text]]) })
+    let registrations = 0
+    on('process.run', () => runOk())
+    on('agent.register', (_$, e: any) => {
+      registrations++
+      if (registrations === 1) throw new Error('retry registration')
+      return { value: { agent: `codex-mod:${e.name}` } }
+    })
+    on('ui.notify', (_$, e: any) => {
+      notices.push(e.text)
+      if (notifyThrows) throw new Error('unavailable')
+      return { value: { isSent: false, reason: 'disabled' } }
+    })
+    on('ui.toast', (_$, e: any) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
+    await startSession($)
+    expect(w.logs.filter(l => l.includes('.claude/codex-mod.json')).length).toBe(1)
+    await step($)
+    expect(registrations).toBe(2)
+    expect(w.logs.filter(l => l.includes('.claude/codex-mod.json')).length).toBe(2)
+    expect(notices.length).toBe(1)
+    expect(toasts).toEqual(notices)
+    await step($, 'agent-codex')
+    expect(w.spawned.length).toBe(1)
+  })
+}
+
+test('options: leftover roles value is ignored with one warning', { options: { roles: ['old-role'] } }, async ($, on) => {
+  const w = await startProject($, on)
+  expect(parseConfig({ roles: ['old-role'] }).warnings).toEqual(['roles: removed in 1.2; declare roles in .claude/codex-mod.json'])
+  expect(w.logs.filter(l => l.includes('roles: removed'))).toEqual(['codex-mod: option roles: removed in 1.2; declare roles in .claude/codex-mod.json'])
+  await step($, 'agent-project')
+  expect(w.spawned.length).toBe(1)
+})
+
+for (const allowed of [false, true]) {
+  test(`project roles: registration gates full access (${allowed})`, { options: { allowProjectFullAccess: allowed } }, async ($, on) => {
+    const file = JSON.stringify({ roles: { implementer: { model: 'm', effort: 'low', sandbox: 'danger-full-access', description: 'Task.' } } })
+    const w = await startProject($, on, { files: new Map([['.claude/codex-mod.json', file]]) })
+    await step($, 'agent-project')
+    expect(w.spawned.length).toBe(allowed ? 1 : 0)
+    if (allowed) expect(argOf(w.spawned[0]!.argv, '--sandbox')).toBe('danger-full-access')
+    else expect(w.logs.some(l => l.includes('danger-full-access requires'))).toBe(true)
+  })
+}
+
+test('project roles: follow-ups prepend instructions once; file and cwd edits do not reload', async ($, on) => {
+  let conv: any[] = [user('codex-effort: high\nfirst')]
+  const w = await startProject($, on, { messages: () => conv })
+  await step($, 'agent-project')
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nfirst')
+  w.files.set('.claude/codex-mod.json', '{"roles":{}}')
+  w.location.cwd = '/tmp/elsewhere'
+  conv = [...conv, ...toolResult('SubagentHandback'), user('second')]
+  const second = await step($, 'agent-project', 0, 'turn-2')
+  expect(w.spawned[1]!.argv).toContain('resume')
+  expect(w.spawned[1]!.argv).toContain('model_reasoning_effort="high"')
+  expect(w.spawned[1]!.input).toBe('Keep the change bounded.\n\nsecond')
+  expect(w.spawned[1]!.cwd).toBe('/tmp/elsewhere')
+  expect(w.reads.filter(p => p === '.claude/codex-mod.json').length).toBe(1)
+  expect(handback(second.result)).not.toContain('Keep the change bounded.')
+  expect(w.store.get('agent:sess-1:agent-project')).toMatchObject({ lastTask: 'second', model: 'gpt-6.1-sol', effort: 'high' })
+  expect((w.store.get('agent:sess-1:agent-project') as any).instructions).toBe(undefined)
+  expect((w.store.get('agent:sess-1:agent-project') as any).description).toBe(undefined)
+})
+
+test('project roles: a removed role resumes from its persisted profile', async ($, on) => {
+  const store = new Map<string, unknown>([['agent:sess-1:agent-project', { ...PERSISTED, agentName: 'implementer', sandbox: 'read-only', updatedAt: 1_000_000 }]])
+  const w = world(on, { store, task: 'follow-up' })
+  await step($, 'agent-project')
+  expect(w.spawned[0]!.argv).toContain('resume')
+  expect(w.spawned[0]!.argv).toContain('sandbox_mode="read-only"')
+  expect(argOf(w.spawned[0]!.argv, '-m')).toBe('gpt-pinned')
+  expect(w.spawned[0]!.input).toBe('follow-up')
 })
 
 test('model catalog: listed models by priority with their efforts; profile checks', async () => {
@@ -1445,16 +1630,18 @@ test('agent registration refused at session start is retried once on the next ma
   let calls = 0
   on('agent.register', (_$, e: any) => {
     calls++
-    if (calls <= 4) throw new Error('session not bound')
+    if (calls === 1) throw new Error('session not bound')
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
-  expect(calls).toBe(4)
+  expect(calls).toBe(1)
+  w.files.set('.claude/codex-mod.json', PROJECT_ROLES)
   await step($)
-  expect(calls).toBe(8)
+  expect(calls).toBe(5)
   await step($)
-  expect(calls).toBe(8)
+  expect(calls).toBe(5)
+  expect(w.reads.filter(p => p === '.claude/codex-mod.json').length).toBe(2)
   expect(w.modelCalls).toEqual(['main', 'main'])
 })
 
@@ -1562,18 +1749,18 @@ for (const failure of [
 
     conv = [user('second agent')]
     // Rows without a signal would default to the tool without the session memo.
-    const second = await step($, 'agent-sol')
+    const second = await step($, 'agent-normal')
     expect(second.result.toolUses).toEqual([])
     expect(second.result.stopReason).toBe('end_turn')
     expect(firstLine(second.result.answer)).toBe('PONG')
-    expect(lastLine(second.result.answer)).toContain('sol · gpt-6.1-sol · medium')
+    expect(lastLine(second.result.answer)).toContain('codex · gpt-6.1-sol · medium')
     expect(w.spawned.length).toBe(2)
 
     // The same agent must use the tool if the host now explicitly offers it.
     opts.noApi = false
     opts.handback = true
     conv = [user('host enabled handback')]
-    const offered = await step($, 'agent-sol', 0, 'turn-2')
+    const offered = await step($, 'agent-normal', 0, 'turn-2')
     expect(offered.result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
     expect(handback(offered.result).startsWith('PONG')).toBe(true)
   })
@@ -1587,7 +1774,7 @@ test('auto session memo: reloads from the store and stays within its session', a
   expect(sameSession.result.toolUses).toEqual([])
   expect(firstLine(sameSession.result.answer)).toBe('PONG')
   opts.sessionId = 'sess-2'
-  const otherSession = await step($, 'agent-sol')
+  const otherSession = await step($, 'agent-normal')
   expect(otherSession.result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
 })
 
@@ -1604,7 +1791,7 @@ test('auto session memo: remembers a historical failure even after a tool signal
   expect(w.store.get('session:sess-1:handback')).toMatchObject({ handbackLock: 'text' })
   conv = [user('second agent')]
   opts.noApi = true
-  const second = await step($, 'agent-sol')
+  const second = await step($, 'agent-normal')
   expect(second.result.toolUses).toEqual([])
   expect(firstLine(second.result.answer)).toBe('PONG')
 })
@@ -1819,14 +2006,14 @@ const startSession = ($: any) => $.session.start?.({ cwd: '/tmp/project', surfac
 const CONTROL = /^\/home\/t\/\.cache\/codex-mod\/runs\/sess-1-(agent-[\w-]+)-(\d+)$/
 
 test('app-server: session start checks node, the runner and codex app-server; a launch runs the runner with the same profile', { options: { transport: 'app-server', extraConfig: ['tools.view_image=false'] } }, async ($, on) => {
-  const w = appWorld(on, { files: new Map([['/home/t/.codex/config.toml', CONFIG_TOML]]), pieces: [THREAD('t-60'), TURN('tu-1'), MESSAGE('PONG'), USAGE] })
+  const w = appWorld(on, { files: new Map([['/home/t/.codex/config.toml', CONFIG_TOML], ['.claude/codex-mod.json', PROJECT_ROLES]]), pieces: [THREAD('t-60'), TURN('tu-1'), MESSAGE('PONG'), USAGE] })
   await startSession($)
   expect(w.runs.map(r => (RUNNER_PATH.test(r[1] ?? '') ? ['node', 'RUNNER', ...r.slice(2)] : r).join(' '))).toEqual([
     'which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status',
     'which node', '/usr/local/bin/codex app-server --help', 'node RUNNER --version',
   ])
   expect(w.logs.some(l => l.includes('app-server transport ready'))).toBe(true)
-  const { result } = await step($, 'agent-app')
+  const { result } = await step($, 'agent-project')
   const argv = w.spawned[0]!.argv
   expect(argv[0]).toBe('/usr/local/bin/node')
   expect(argv[1]).toMatch(RUNNER_PATH)
@@ -1839,11 +2026,11 @@ test('app-server: session start checks node, the runner and codex app-server; a 
   expect(configs.some(c => c.startsWith('model_reasoning_effort'))).toBe(false)
   expect(argv.at(-2)).toBe('--control')
   expect(argv.at(-1)).toMatch(CONTROL)
-  expect(w.spawned[0]!.input).toBe('Reply with the single word PONG')
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nReply with the single word PONG')
   // the stale-dir guard removed the control dir before the launch
   expect(w.runs.some(r => r[0] === 'rm' && r[1] === '-rf' && r[2] === argv.at(-1))).toBe(true)
-  expect(handback(result)).toBe('PONG\n\nsol · gpt-6.1-sol · medium · workspace-write · app-server · 0 actions · 277 new tokens (21K cached, 46 out) · thread t-60')
-  expect(w.store.get('agent:sess-1:agent-app')).toMatchObject({ runSeq: 1, thread: 't-60' })
+  expect(handback(result)).toBe('PONG\n\nimplementer · gpt-6.1-sol · medium · workspace-write · app-server · 0 actions · 277 new tokens (21K cached, 46 out) · thread t-60')
+  expect(w.store.get('agent:sess-1:agent-project')).toMatchObject({ runSeq: 1, thread: 't-60' })
 })
 
 test('app-server: a failing check falls back to exec for the session, and the footer says why', { options: { transport: 'app-server', lean: false } }, async ($, on) => {
@@ -1945,13 +2132,15 @@ test('app-server mid-step: while a step waits on the runner, a new message is st
   let conv: any[] = [user('long task')]
   let w: ReturnType<typeof appWorld>
   const steered = () => w.writes.some(x => x.path.endsWith('/steer-000002.json'))
-  w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-65'), TURN('tu-1'), steered, ACK(2, 'accepted'), MESSAGE('done, steered'), USAGE] })
-  const pending = step($, 'agent-app-mid', 0)
+  w = appWorld(on, { files: new Map([['.claude/codex-mod.json', PROJECT_ROLES]]), messages: () => conv, pieces: [THREAD('t-65'), TURN('tu-1'), steered, ACK(2, 'accepted'), MESSAGE('done, steered'), USAGE] })
+  await startSession($)
+  const pending = step($, 'agent-project', 0)
   await new Promise<void>(r => setTimeout(r, 60))
   conv = [...conv, user('change of plan')]
   const { result } = await pending
   expect(w.timers.filter(ms => ms === 2000).length >= 1).toBe(true)
-  expect(w.writes.map(x => JSON.parse(x.text))).toEqual([{ text: 'change of plan' }])
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nlong task')
+  expect(w.writes.map(x => JSON.parse(x.text))).toEqual([{ text: 'Keep the change bounded.\n\nchange of plan' }])
   // the pull that was pending when the checks ran was read on, nothing lost; the
   // accepted steer is announced before Codex's answer
   expect(handback(result).startsWith(`${steerNote('accepted', 'change of plan')}\n\ndone, steered`)).toBe(true)
