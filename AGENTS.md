@@ -10,6 +10,7 @@ OpenAI Codex CLI, with Codex actions drawn as native rows and never executed by 
 - `scripts/codex-runner.mjs`: per-run Node sidecar for the opt-in `app-server` transport.
 - `tests/`: `codex.test.ts` (hooks, needs `claude-code/testing`), `runner.test.mjs` (Node only), `fixtures/`.
 - `.claude-plugin/plugin.json`: manifest and every user option. `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`.
+- `.claude/codex-mod.json`: this repo's own Codex roles (`implementer`, `implementer-high`, `auditor`).
 - `docs/decisions.md`: decision log. Read it before changing transport, safety or handback behaviour.
 
 ## Roles
