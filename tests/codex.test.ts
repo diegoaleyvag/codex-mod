@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -72,6 +72,24 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-fallback': 'codex-mod:codex',
   'agent-window': 'codex-mod:codex',
   'agent-guard-restart': 'codex-mod:sol',
+  'agent-drift': 'codex-mod:codex',
+  'agent-drift-ok': 'codex-mod:codex',
+  'agent-drift-version': 'codex-mod:codex',
+  'agent-exec-notimer': 'codex-mod:codex',
+  'agent-provider': 'codex-mod:codex',
+  'agent-app': 'codex-mod:sol',
+  'agent-app-fallback': 'codex-mod:codex',
+  'agent-app-lazy': 'codex-mod:codex',
+  'agent-app-steer': 'codex-mod:codex',
+  'agent-app-reject': 'codex-mod:codex',
+  'agent-app-unacked': 'codex-mod:codex',
+  'agent-app-mid': 'codex-mod:codex',
+  'agent-app-kill': 'codex-mod:codex',
+  'agent-app-kill-hard': 'codex-mod:codex',
+  'agent-app-fatal': 'codex-mod:codex',
+  'agent-app-drift': 'codex-mod:codex',
+  'agent-exec-note': 'codex-mod:codex',
+  'agent-app-plain-steer': 'codex-mod:codex',
 }
 
 type Spawned = { argv: readonly string[]; input?: string; cwd?: string; env?: Record<string, string> }
@@ -85,8 +103,11 @@ type WorldOpts = {
   task?: string
   reject?: boolean
   messages?: () => any
-  /** Exact pieces, in order; `'block'` waits until the child is killed (or 4 s). */
-  pieces?: readonly (Piece | 'block')[]
+  /**
+   * Exact pieces, in order; `'block'` waits until the child is killed (or 4 s);
+   * a function is polled every 10 ms until it is true (or 4 s), then the next piece comes.
+   */
+  pieces?: readonly (Piece | 'block' | (() => boolean))[]
   store?: Map<string, unknown>
   /** What `$.fs.read` finds, by absolute path (mutable between steps). */
   files?: Map<string, string>
@@ -118,6 +139,12 @@ function world(on: On, opts: WorldOpts = {}) {
   // every call that reached the engine's own tool path (permission + run)
   const core: { tool: string; id?: string; agentId?: string }[] = []
   const checks: { tool: string; agentId?: string }[] = []
+  // every `$.fs.write`, in order (steer and interrupt files of app-server runs)
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_$, e: any) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
   on('ui.log', (_$, e: any) => {
     logs.push(String(e.text ?? ''))
     return { value: undefined }
@@ -173,6 +200,10 @@ function world(on: On, opts: WorldOpts = {}) {
     try {
       if (opts.pieces) {
         for (const p of opts.pieces) {
+          if (typeof p === 'function') {
+            for (let i = 0; i < 400 && !p() && !next.signal.aborted; i++) await new Promise<void>(r => setTimeout(r, 10))
+            continue
+          }
           if (p === 'block') {
             await new Promise<void>(resolve => {
               next.signal.addEventListener('abort', () => resolve())
@@ -201,7 +232,7 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks }
+  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes }
 }
 
 /** A SessionMessage-shaped test row in the Messages API form. */
@@ -629,6 +660,24 @@ test('a follow-up folded into the turn mid-run runs (resumed) after the handback
   expect(s3.result.toolUses[0]!.name).toBe('Bash')
 })
 
+test('exec: a message queued mid-run is announced once, as text before the next step\'s calls, never as the answer', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const w = world(on, { messages: () => conv, pieces: [THREAD('t-13'), cmdDone('/bin/zsh -lc make'), cmdDone('/bin/zsh -lc lint'), MESSAGE('built')] })
+  await step($, 'agent-exec-note', 0)
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_n1'), user('also run the linter')]
+  const s2 = await step($, 'agent-exec-note', 1)
+  // the note is this step's text block, before its Bash call
+  expect(s2.chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual([steerNote('queued')])
+  expect(s2.result.toolUses.map((u: any) => u.name)).toEqual(['Bash'])
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_n2'), user('and the docs')]
+  const s3 = await step($, 'agent-exec-note', 2)
+  // a second queued message gets no second note; the answer is Codex's own
+  expect(handback(s3.result).startsWith('built\n\n')).toBe(true)
+  expect(handback(s3.result)).not.toContain('↪')
+  expect(w.store.get('agent:sess-1:agent-exec-note')).toMatchObject({ followUps: [{ text: 'also run the linter', count: 2 }, { text: 'and the docs', count: 3 }] })
+  expect(w.spawned.length).toBe(1)
+})
+
 // ---- safety: the engine never executes a Codex agent's Bash/Edit/Write ----
 
 test('safety: an action answer is used once; a replay of the same id is refused, never run', async ($, on) => {
@@ -981,7 +1030,8 @@ test('text route: a follow-up folded in mid-run runs in the same step after the 
   expect(w.spawned[1]!.input).toBe('also lint')
   expect(w.spawned[1]!.argv).toContain('t-31')
   expect(s2.chunks[0].kind).toBe('text')
-  expect(firstLine(s2.chunks[0].text)).toBe('built')
+  // the note about the queued message precedes the first answer, never replaces it
+  expect(s2.chunks[0].text.split('\n\n').slice(0, 2)).toEqual([steerNote('queued'), 'built'])
   expect(s2.result.toolUses[0]!.name).toBe('Bash')
 })
 
@@ -1368,4 +1418,380 @@ test('helpers: engine notices and reminder-only rows are never tasks', async () 
   const rd = readConversation(itemsFromApi([{ role: 'user', content: LIVE_TASK }, { role: 'user', content: [{ type: 'text', text: HANDBACK_ROW.text }] }]))
   expect(rd.signal).toBe('tool')
   expect(rd.latest?.count).toBe(1)
+})
+
+// ---- protocol drift, version, provider (both transports) --------------------
+
+test('drift: a run with no agent message and unknown lines fails as "protocol changed", naming up to 3 types', async ($, on) => {
+  world(on, { stdout: '{"type":"thread.started","thread_id":"t-50"}\n{"type":"item.weird"}\nnot json at all\n{"type":"thing.a"}\n{"type":"thing.b"}\n{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":0}}\n' })
+  const { result } = await step($, 'agent-drift')
+  expect(firstLine(handback(result))).toBe('codex failed: codex exec --json protocol changed (codex-cli unknown): 4 unknown events (item.weird, non-JSON, thing.a)')
+})
+
+test('drift: unknown lines beside an agent message change nothing', async ($, on) => {
+  world(on, { stdout: '{"type":"thread.started","thread_id":"t-51"}\n{"type":"item.weird"}\n{"type":"item.completed","item":{"type":"agent_message","text":"PONG"}}\n' })
+  const { result } = await step($, 'agent-drift-ok')
+  expect(handback(result)).toBe('PONG\n\ncodex · gpt-6.1-sol · medium · workspace-write · 0 actions · thread t-51')
+})
+
+test('version: session start reads codex --version; the drift reason names it; no warning at 0.163.0-alpha', async ($, on) => {
+  const notified: string[] = []
+  world(on, { stdout: '{"type":"brand.new"}\n' })
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : e.argv.includes('--version') ? 'codex-cli 0.163.0-alpha.10.2\n' : 'ok'))
+  on('ui.notify', (_$, e: any) => {
+    notified.push(e.text)
+    return { value: { isSent: true, channel: 'terminal_bell' as const } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(notified).toEqual([])
+  const { result } = await step($, 'agent-drift-version')
+  expect(firstLine(handback(result))).toBe('codex failed: codex exec --json protocol changed (codex-cli 0.163.0-alpha.10.2): 1 unknown event (brand.new)')
+})
+
+test('version: below 0.163.0 is warned about once (debug + notify), and Codex still runs', async ($, on) => {
+  const notified: string[] = []
+  const w = world(on)
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : e.argv.includes('--version') ? 'codex-cli 0.150.2' : 'ok'))
+  on('ui.notify', (_$, e: any) => {
+    notified.push(e.text)
+    return { value: { isSent: true, channel: 'terminal_bell' as const } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(notified).toEqual(['codex-mod: codex-cli 0.150.2 is older than 0.163.0, the version this plugin was verified on; runs may fail'])
+  expect(w.logs.some(l => l.includes('older than 0.163.0'))).toBe(true)
+  expect(w.logs.some(l => l.includes('Codex ready (/bin/codex)'))).toBe(true)
+})
+
+test('provider: a non-openai model_provider makes a failing login status a debug note, not the logged-out blocker', async ($, on) => {
+  const notified: string[] = []
+  const w = world(on, { files: new Map([['/home/t/.codex/config.toml', '# local\nmodel_provider = "ollama"\nmodel = "x"\n[model_providers.ollama]\nname = "Ollama"\n']]) })
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => ({ value: e.argv.includes('login') ? { exitCode: 1, stdout: '', stderr: 'Not logged in', isStdoutTruncated: false, isStderrTruncated: false } : runOk(e.argv[0] === 'which' ? '/bin/codex' : 'v').value }))
+  on('ui.notify', (_$, e: any) => {
+    notified.push(e.text)
+    return { value: { isSent: true, channel: 'terminal_bell' as const } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(notified).toEqual([])
+  expect(w.logs.some(l => l.includes('model_provider is ollama, so it is not treated as logged out'))).toBe(true)
+  const { result } = await step($, 'agent-provider')
+  expect(handback(result)).not.toContain('launch check')
+})
+
+test('provider: with openai (or none) the logged-out message suggests codex login and --device-auth', async ($, on) => {
+  const notified: string[] = []
+  world(on, { files: new Map([['/home/t/.codex/config.toml', 'model_provider = "openai"\n']]) })
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => ({ value: e.argv.includes('login') ? { exitCode: 1, stdout: '', stderr: 'Not logged in', isStdoutTruncated: false, isStderrTruncated: false } : runOk(e.argv[0] === 'which' ? '/bin/codex' : 'v').value }))
+  on('ui.notify', (_$, e: any) => {
+    notified.push(e.text)
+    return { value: { isSent: true, channel: 'terminal_bell' as const } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(notified).toEqual(['codex-mod: Codex is not logged in (Not logged in); run "codex login" or "codex login --device-auth"'])
+})
+
+test('helpers: runner lines, versions, model_provider, runner argv, footer with transport and steers', async () => {
+  expect(parseCodexLine('{"type":"codexmod.turn","turn_id":"tu-1"}')).toEqual({ kind: 'turn', id: 'tu-1' })
+  expect(parseCodexLine('{"type":"codexmod.steer","id":12,"status":"accepted"}')).toEqual({ kind: 'steer', id: '12', accepted: true })
+  expect(parseCodexLine('{"type":"codexmod.steer","id":"x","status":"rejected","reason":"turn finished"}')).toEqual({ kind: 'steer', id: 'x', accepted: false, reason: 'turn finished' })
+  expect(parseCodexLine('{"type":"codexmod.protocol","unknown_methods":["a/b"],"unknown_items":["c"]}')).toEqual({ kind: 'protocol', types: ['method a/b', 'item c'] })
+  expect(parseCodexLine('{"type":"codexmod.fatal","message":"boom"}')).toEqual({ kind: 'fatal', text: 'boom' })
+  expect(parseCodexLine('{"type":"codexmod.future"}')).toEqual({ kind: 'other' })
+  expect(parseCodexLine('{"type":"item.updated","item":{}}')).toEqual({ kind: 'other' })
+  expect(parseCodexLine('{"type":"turn.started"}')).toEqual({ kind: 'other' })
+  expect(parseCodexLine('{"type":"x.y"}')).toEqual({ kind: 'unknown', type: 'x.y' })
+  expect(parseCodexLine('{"no":"type"}')).toEqual({ kind: 'unknown', type: 'untyped' })
+  expect(parseCodexLine('garbage')).toEqual({ kind: 'unknown', type: 'non-JSON' })
+  expect(parseCodexVersion('codex-cli 0.163.0-alpha.10.2\n')).toBe('0.163.0-alpha.10.2')
+  expect(parseCodexVersion('codex-cli 0.170.1')).toBe('0.170.1')
+  expect(parseCodexVersion('ok')).toBe(undefined)
+  expect([codexTooOld('0.162.9'), codexTooOld('0.163.0-alpha.1'), codexTooOld('0.163.0'), codexTooOld('0.200.0'), codexTooOld('1.0.0')]).toEqual([true, false, false, false, false])
+  expect(modelProvider('model_provider = "ollama"')).toBe('ollama')
+  expect(modelProvider("model_provider='azure' # c")).toBe('azure')
+  expect(modelProvider('model = "x"\n[profiles.a]\nmodel_provider = "ollama"')).toBe(undefined)
+  expect(runnerArgv({ node: '/n', runner: '/r.mjs', codex: '/c', prof: { model: 'm', effort: 'low', sandbox: 'read-only' }, cwd: '/w', resume: 'th', lean: ['-c', 'features.apps=false', '-c', 'web_search="disabled"'], extra: ['k=v'], control: '/ctl' })).toEqual([
+    '/n', '/r.mjs', 'run', '--codex', '/c', '--cwd', '/w', '--model', 'm', '--effort', 'low', '--sandbox', 'read-only', '--thread', 'th',
+    '--config', 'features.apps=false', '--config', 'web_search="disabled"', '--config', 'k=v', '--control', '/ctl',
+  ])
+  expect(runnerArgv({ node: 'n', runner: 'r', codex: 'c', prof: { model: 'm', effort: 'e', sandbox: 's' }, cwd: '/w', lean: [], extra: [], control: '/ctl' })).not.toContain('--thread')
+  const p = { agent: 'codex', model: 'm', effort: 'low', sandbox: 'workspace-write', actions: 2 }
+  expect(footer({ ...p, transport: 'app-server', steers: 2 })).toBe('codex · m · low · workspace-write · app-server · 2 steers · 2 actions')
+  expect(footer({ ...p, transport: 'app-server', steers: 0 })).toBe('codex · m · low · workspace-write · app-server · 2 actions')
+  expect(footer({ ...p, transport: 'app-server', steers: 1 }, 'short')).toBe('codex · m · low')
+  expect(steerNote('accepted', 'codex-effort: high\n  fix the  tests\nplease')).toBe('↪ steer delivered to Codex mid-turn: "fix the tests please"')
+  const long = steerNote('accepted', 'x'.repeat(200))
+  expect(long).toBe(`↪ steer delivered to Codex mid-turn: "${'x'.repeat(77)}..."`)
+  expect(steerNote('finished')).toBe('↪ Codex had already finished; this message runs next, on the same thread')
+  expect(steerNote('queued')).toBe('↪ queued: runs after this turn (exec transport has no mid-turn steer)')
+  expect(parseConfig({})).toMatchObject({ transport: 'exec', nodeOverride: undefined })
+  expect(parseConfig({ transport: 'app-server', nodePath: '/opt/node' })).toMatchObject({ transport: 'app-server', nodeOverride: '/opt/node', warnings: [] })
+  const bad = parseConfig({ transport: 'websocket', nodePath: 3 })
+  expect(bad).toMatchObject({ transport: 'exec', nodeOverride: undefined })
+  expect(bad.warnings.some(w => w.startsWith('transport:'))).toBe(true)
+  expect(bad.warnings.some(w => w.startsWith('nodePath:'))).toBe(true)
+})
+
+test('exec runs never set the mid-step timer', async ($, on) => {
+  const w = world(on, { pieces: [THREAD('t-52'), out('{"type":"turn.started"}'), MESSAGE('PONG')] })
+  let timers = 0
+  on('clock.after', () => {
+    timers++
+    return { value: undefined }
+  })
+  await step($, 'agent-exec-notimer')
+  expect(timers).toBe(0)
+  expect(w.writes).toEqual([])
+})
+
+// ---- app-server transport ---------------------------------------------------
+
+const RUNNER_PATH = /\/scripts\/codex-runner\.mjs$/
+const TURN = (id: string) => out(JSON.stringify({ type: 'codexmod.turn', turn_id: id }))
+const ACK = (id: number, status: 'accepted' | 'rejected', reason?: string) => out(JSON.stringify({ type: 'codexmod.steer', id, status, ...(reason ? { reason } : {}) }))
+
+/**
+ * A world with transport app-server ready: node on PATH, the runner present
+ * and speaking protocol 1, `codex app-server --help` passing (or `help` exit);
+ * `$.clock.after` fires after a few real ms, whatever it asks.
+ */
+function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol?: string; node?: boolean } = {}) {
+  const w = world(on, opts)
+  const runs: string[][] = []
+  const timers: number[] = []
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => {
+    runs.push([...e.argv])
+    const a = e.argv as string[]
+    if (a[0] === 'which') return a[1] === 'node' && ready.node === false ? { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : runOk(`/usr/local/bin/${a[1]}\n`)
+    if (a.includes('app-server')) return { value: { exitCode: ready.help ?? 0, stdout: 'usage', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (RUNNER_PATH.test(a[1] ?? '') && a[2] === '--version') return runOk(`${ready.protocol ?? '1'}\n`)
+    return runOk(a.includes('--version') ? 'codex-cli 0.163.0' : 'ok')
+  })
+  on('fs.exists', (_$, e: any) => ({ value: RUNNER_PATH.test(e.path) }))
+  on('clock.after', async (_$, e: any) => {
+    timers.push(e.ms)
+    await new Promise<void>(r => setTimeout(r, 15))
+    return { value: undefined }
+  })
+  return { ...w, runs, timers }
+}
+
+const startSession = ($: any) => $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+const CONTROL = /^\/home\/t\/\.cache\/codex-mod\/runs\/sess-1-(agent-[\w-]+)-(\d+)$/
+
+test('app-server: session start checks node, the runner and codex app-server; a launch runs the runner with the same profile', { options: { transport: 'app-server', extraConfig: ['tools.view_image=false'] } }, async ($, on) => {
+  const w = appWorld(on, { files: new Map([['/home/t/.codex/config.toml', CONFIG_TOML]]), pieces: [THREAD('t-60'), TURN('tu-1'), MESSAGE('PONG'), USAGE] })
+  await startSession($)
+  expect(w.runs.map(r => (RUNNER_PATH.test(r[1] ?? '') ? ['node', 'RUNNER', ...r.slice(2)] : r).join(' '))).toEqual([
+    'which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status',
+    'which node', '/usr/local/bin/codex app-server --help', 'node RUNNER --version',
+  ])
+  expect(w.logs.some(l => l.includes('app-server transport ready'))).toBe(true)
+  const { result } = await step($, 'agent-app')
+  const argv = w.spawned[0]!.argv
+  expect(argv[0]).toBe('/usr/local/bin/node')
+  expect(argv[1]).toMatch(RUNNER_PATH)
+  expect(argv.slice(2, 13)).toEqual(['run', '--codex', '/usr/local/bin/codex', '--cwd', '/tmp/project', '--model', 'gpt-6.1-sol', '--effort', 'medium', '--sandbox', 'workspace-write'])
+  expect(argv).not.toContain('--thread')
+  const configs = argv.filter((_, i) => argv[i - 1] === '--config')
+  expect(configs).toContain('features.plugins=false')
+  expect(configs).toContain('mcp_servers.node_repl.enabled=false')
+  expect(configs.at(-1)).toBe('tools.view_image=false')
+  expect(configs.some(c => c.startsWith('model_reasoning_effort'))).toBe(false)
+  expect(argv.at(-2)).toBe('--control')
+  expect(argv.at(-1)).toMatch(CONTROL)
+  expect(w.spawned[0]!.input).toBe('Reply with the single word PONG')
+  // the stale-dir guard removed the control dir before the launch
+  expect(w.runs.some(r => r[0] === 'rm' && r[1] === '-rf' && r[2] === argv.at(-1))).toBe(true)
+  expect(handback(result)).toBe('PONG\n\nsol · gpt-6.1-sol · medium · workspace-write · app-server · 0 actions · 277 new tokens (21K cached, 46 out) · thread t-60')
+  expect(w.store.get('agent:sess-1:agent-app')).toMatchObject({ runSeq: 1, thread: 't-60' })
+})
+
+test('app-server: a failing check falls back to exec for the session, and the footer says why', { options: { transport: 'app-server', lean: false } }, async ($, on) => {
+  const w = appWorld(on, {}, { help: 2 })
+  await startSession($)
+  expect(w.logs.some(l => l.includes('app-server transport unavailable (codex app-server --help failed (exit 2)); runs use codex exec'))).toBe(true)
+  const { result } = await step($, 'agent-app-fallback')
+  expect(w.spawned[0]!.argv.slice(0, 3)).toEqual(['/usr/local/bin/codex', 'exec', '--json'])
+  expect(lastLine(handback(result))).toBe('codex · gpt-6.1-sol · medium · workspace-write · exec (app-server unavailable: codex app-server --help failed (exit 2)) · 0 actions · 1 new tokens (0 cached, 1 out) · thread t-1')
+})
+
+test('app-server: a runner speaking another protocol falls back to exec', { options: { transport: 'app-server' } }, async ($, on) => {
+  const w = appWorld(on, {}, { protocol: '2' })
+  await startSession($)
+  expect(w.logs.some(l => l.includes('runner protocol 2, expected 1'))).toBe(true)
+  await step($, 'agent-app-fallback')
+  expect(w.spawned[0]!.argv[1]).toBe('exec')
+})
+
+test('app-server: without a session start the first launch runs the checks (nodePath wins)', { options: { transport: 'app-server', nodePath: '/opt/node22/bin/node' } }, async ($, on) => {
+  const w = appWorld(on, { pieces: [THREAD('t-61'), TURN('tu-1'), MESSAGE('ok')] })
+  await step($, 'agent-app-lazy')
+  expect(w.runs.some(r => r[0] === 'which')).toBe(false)
+  expect(w.runs.some(r => r[0] === '/opt/node22/bin/node' && r[2] === '--version')).toBe(true)
+  expect(w.spawned[0]!.argv[0]).toBe('/opt/node22/bin/node')
+  expect(w.spawned[0]!.argv[1]).toMatch(RUNNER_PATH)
+})
+
+test('app-server steer: a message arriving mid-run is written as a steer file; accepted, it is that message\'s launch', { options: { transport: 'app-server' } }, async ($, on) => {
+  let conv: any[] = [user('build it')]
+  const w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-62'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), ACK(2, 'accepted'), MESSAGE('built, with tests'), USAGE] })
+  const s1 = await step($, 'agent-app-steer', 0)
+  expect(s1.result.toolUses[0]!.name).toBe('Bash')
+  await runCalls($, s1.chunks, 'agent-app-steer')
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_s'), user('codex-effort: high\nalso add tests')]
+  const s2 = await step($, 'agent-app-steer', 1)
+  const control = w.spawned[0]!.argv.at(-1)!
+  expect(w.writes).toEqual([{ path: `${control}/steer-000002.json`, text: JSON.stringify({ text: 'also add tests' }) }])
+  // the control dir was created private before any steer file went into it
+  expect(w.runs.some(r => r[0] === 'mkdir' && r.slice(1, 4).join(' ') === '-p -m 700' && r.includes('/home/t/.cache/codex-mod/runs') && r.at(-1) === control)).toBe(true)
+  // the note says what was steered (without the override line), before Codex's answer
+  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual(['↪ steer delivered to Codex mid-turn: "also add tests"', 'built, with tests'])
+  expect(lastLine(handback(s2.result))).toBe('codex · gpt-6.1-sol · medium · workspace-write · app-server · 1 steer · 1 action · 277 new tokens (21K cached, 46 out) · thread t-62')
+  expect(w.store.get('agent:sess-1:agent-app-steer')).toMatchObject({ userCount: 2, lastTask: 'codex-effort: high\nalso add tests', launchKey: '2:codex-effort: high\nalso add tests' })
+  // the handback's result ends the turn; the steered message never launches again
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  const s3 = await step($, 'agent-app-steer', 2)
+  expect(s3.result.stopReason).toBe('end_turn')
+  conv = [...conv, said('x'), meta(LIVE_NO_OUTPUT)]
+  await step($, 'agent-app-steer', 3)
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('app-server steer: a rejected steer runs after the handback, resuming the thread', { options: { transport: 'app-server' } }, async ($, on) => {
+  let conv: any[] = [user('first')]
+  const opts: WorldOpts = { messages: () => conv, pieces: [THREAD('t-63'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), ACK(2, 'rejected', 'turn finished'), MESSAGE('built')] }
+  const w = appWorld(on, opts)
+  const s1 = await step($, 'agent-app-reject', 0)
+  await runCalls($, s1.chunks, 'agent-app-reject')
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_r'), user('also lint')]
+  const s2 = await step($, 'agent-app-reject', 1)
+  expect(lastLine(handback(s2.result))).not.toContain('steer')
+  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual([steerNote('finished'), 'built'])
+  expect(w.logs.some(l => l.includes('steer 2 rejected (turn finished)'))).toBe(true)
+  opts.pieces = [THREAD('t-63'), TURN('tu-2'), MESSAGE('linted')]
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  const s3 = await step($, 'agent-app-reject', 2)
+  expect(w.spawned.length).toBe(2)
+  const argv = w.spawned[1]!.argv
+  expect(argOf(argv, '--thread')).toBe('t-63')
+  expect(w.spawned[1]!.input).toBe('also lint')
+  // each run gets its own control dir
+  expect(argv.at(-1)).not.toBe(w.spawned[0]!.argv.at(-1))
+  expect(argv.at(-1)!.endsWith('-2')).toBe(true)
+  expect(handback(s3.result).startsWith('linted')).toBe(true)
+})
+
+test('app-server steer: a steer the runner never acked runs after the handback', { options: { transport: 'app-server' } }, async ($, on) => {
+  let conv: any[] = [user('first')]
+  const opts: WorldOpts = { messages: () => conv, pieces: [THREAD('t-64'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), MESSAGE('built')] }
+  const w = appWorld(on, opts)
+  const s1 = await step($, 'agent-app-unacked', 0)
+  await runCalls($, s1.chunks, 'agent-app-unacked')
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_u'), user('and docs')]
+  const s2 = await step($, 'agent-app-unacked', 1)
+  expect(w.writes.length).toBe(1)
+  // never acked when the run ended: announced as running next, before the answer
+  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual([steerNote('finished'), 'built'])
+  expect(lastLine(handback(s2.result))).not.toContain('steer')
+  opts.pieces = [THREAD('t-64'), TURN('tu-2'), MESSAGE('documented')]
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  await step($, 'agent-app-unacked', 2)
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawned[1]!.input).toBe('and docs')
+})
+
+test('app-server mid-step: while a step waits on the runner, a new message is steered within that same step', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {
+  let conv: any[] = [user('long task')]
+  let w: ReturnType<typeof appWorld>
+  const steered = () => w.writes.some(x => x.path.endsWith('/steer-000002.json'))
+  w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-65'), TURN('tu-1'), steered, ACK(2, 'accepted'), MESSAGE('done, steered'), USAGE] })
+  const pending = step($, 'agent-app-mid', 0)
+  await new Promise<void>(r => setTimeout(r, 60))
+  conv = [...conv, user('change of plan')]
+  const { result } = await pending
+  expect(w.timers.filter(ms => ms === 2000).length >= 1).toBe(true)
+  expect(w.writes.map(x => JSON.parse(x.text))).toEqual([{ text: 'change of plan' }])
+  // the pull that was pending when the checks ran was read on, nothing lost; the
+  // accepted steer is announced before Codex's answer
+  expect(handback(result).startsWith(`${steerNote('accepted', 'change of plan')}\n\ndone, steered`)).toBe(true)
+  expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
+  expect(w.spawned.length).toBe(1)
+})
+
+test('app-server, nativeActions off: the accepted steer\'s note streams as text; the handback keeps Codex\'s answer', { timeoutMs: 15000, options: { transport: 'app-server', nativeActions: false } }, async ($, on) => {
+  let conv: any[] = [user('long task')]
+  let w: ReturnType<typeof appWorld>
+  const steered = () => w.writes.some(x => x.path.endsWith('/steer-000002.json'))
+  w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-69'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), steered, ACK(2, 'accepted'), MESSAGE('done'), USAGE] })
+  const pending = step($, 'agent-app-plain-steer', 0)
+  await new Promise<void>(r => setTimeout(r, 60))
+  conv = [...conv, user('codex-model: gpt-6-astra\nchange of plan, use the other parser')]
+  const { chunks, result } = await pending
+  expect(chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual(['$ make', `\n\n${steerNote('accepted', 'change of plan, use the other parser')}`])
+  expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
+  expect(handback(result).startsWith('done\n\n')).toBe(true)
+  expect(lastLine(handback(result))).toContain('app-server · 1 steer · 1 action')
+})
+
+test('app-server kill: a stopped agent\'s run is asked to stop (interrupt file) and read to its end', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {
+  let w: ReturnType<typeof appWorld>
+  const interrupted = () => w.writes.some(x => x.path.endsWith('/interrupt'))
+  w = appWorld(on, { pieces: [THREAD('t-66'), TURN('tu-1'), cmdDone('/bin/zsh -lc date'), interrupted, out('{"type":"turn.failed","error":{"message":"interrupted"}}')], code: 1 })
+  await step($, 'agent-app-kill', 0)
+  w.status.set('agent-app-kill', 'killed')
+  const s2 = await step($, 'agent-app-kill', 1)
+  expect(s2.result.stopReason).toBe('end_turn')
+  expect(w.writes.map(x => x.path)).toEqual([`${w.spawned[0]!.argv.at(-1)}/interrupt`])
+  expect(w.timers).toContain(1500)
+  // it ended on its own within the grace: nothing had to be killed
+  expect(w.kills.count).toBe(0)
+})
+
+test('app-server kill: a run that does not end within 1.5 s of the interrupt is killed', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {
+  const w = appWorld(on, { pieces: [THREAD('t-67'), TURN('tu-1'), cmdDone('/bin/zsh -lc date'), 'block', MESSAGE('never')] })
+  on('turn.complete', () => ({ text: '' }))
+  await step($, 'agent-app-kill-hard', 0)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'turn-1', agentId: 'agent-app-kill-hard', reason: 'aborted' } as any)
+  await new Promise<void>(r => setTimeout(() => r(), 300))
+  expect(w.writes.some(x => x.path.endsWith('/interrupt'))).toBe(true)
+  expect(w.kills.count).toBe(1)
+})
+
+test('app-server: a runner fatal line is the failure reason', { options: { transport: 'app-server' } }, async ($, on) => {
+  appWorld(on, { pieces: [out('{"type":"codexmod.fatal","message":"app-server protocol changed (codex-cli 0.170.0)"}'), { stream: 'stderr', text: 'Method not found\n' }], code: 1 })
+  const { result } = await step($, 'agent-app-fatal')
+  expect(firstLine(handback(result))).toBe('codex failed: app-server protocol changed (codex-cli 0.170.0)')
+  expect(handback(result)).toContain('Method not found')
+})
+
+test('app-server: runner drift evidence with no agent message fails as "protocol changed"', { options: { transport: 'app-server' } }, async ($, on) => {
+  appWorld(on, { pieces: [THREAD('t-68'), TURN('tu-1'), out('{"type":"codexmod.protocol","unknown_methods":["item/newThing"],"unknown_items":["hologram"]}')] })
+  const { result } = await step($, 'agent-app-drift')
+  expect(firstLine(handback(result))).toBe('codex failed: codex app-server protocol changed (codex-cli unknown): 2 unknown events (method item/newThing, item hologram)')
+})
+
+test('session start prunes app-server control dirs older than pruneDays', async ($, on) => {
+  const removed: string[] = []
+  world(on)
+  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('process.run', (_$, e: any) => {
+    if (e.argv[0] === 'rm') removed.push(e.argv[2])
+    return runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok')
+  })
+  const runs = '/home/t/.cache/codex-mod/runs'
+  on('fs.exists', (_$, e: any) => ({ value: e.path === runs }))
+  on('fs.list', () => ({ value: [
+    { name: 'old', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+    { name: 'new', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+    { name: 'stray.txt', kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false },
+  ] }))
+  on('fs.stat', (_$, e: any) => ({ value: { kind: 'dir' as const, size: 0, isLink: false, mtimeMs: e.path.endsWith('/old') ? 1_000_000 - 3 * 86_400_000 : 1_000_000 - 1000 } }))
+  await startSession($)
+  expect(removed).toEqual([`${runs}/old`])
 })

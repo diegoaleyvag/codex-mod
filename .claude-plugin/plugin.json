@@ -135,6 +135,22 @@
       "min": 1,
       "max": 100
     },
+    "transport": {
+      "type": "string",
+      "title": "Transport",
+      "description": "How Codex is run: exec (codex exec --json, the default) or app-server (experimental: a node sidecar drives codex app-server, so a message sent mid-run steers the running turn and a stop interrupts it). app-server falls back to exec when node, the sidecar or codex app-server is unavailable.",
+      "default": "exec",
+      "options": [
+        "exec",
+        "app-server"
+      ]
+    },
+    "nodePath": {
+      "type": "string",
+      "title": "Node binary (app-server)",
+      "description": "Absolute path of the node (18 or later) that runs the app-server sidecar. Empty: found on PATH, then in common install locations.",
+      "default": ""
+    },
     "pruneDays": {
       "type": "number",
       "title": "Keep agent records (days)",

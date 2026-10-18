@@ -40,23 +40,54 @@
 // exist only while this module is loaded; models and efforts are validated
 // against Codex's own model list (`<CODEX_HOME>/models_cache.json`, read only).
 //
+// Transport (userConfig `transport`): `exec` (the default) spawns `codex exec
+// --json` with the prompt on stdin. `app-server` (opt-in) spawns our sidecar
+// `scripts/codex-runner.mjs` with node instead: it owns one `codex app-server`
+// for the run (the hook cannot keep a child's stdin open) and prints the same
+// JSONL `codex exec --json` does, plus `codexmod.*` lines (turn id, steer
+// acks, protocol drift, fatal). Everything else (pump, actions, handback,
+// footer, record, launch guard) is shared. Session start checks node, `codex
+// app-server --help` and the runner; any failure falls back to exec for the
+// session, and the footer says why. The hook talks to a live runner through
+// files in its control dir (`<cache>/codex-mod/runs/<session>-<agent>-<n>/`,
+// created mode 0700 at launch since steer files carry prompt text, pruned
+// with the records): `steer-<id>.json` and `interrupt`.
+//
+// Steer (app-server only): a user/coordinator message that arrives while the
+// run is active is written as a steer file instead of being queued; an
+// accepted steer counts as that message's launch, a rejected one (or one never
+// acked) runs after the handback, as an exec follow-up does. Messages are
+// looked for at each step and, while a step waits on the runner, every 2 s.
+// What became of a mid-run message is shown as a `↪` note: a text line in the
+// run's queue (before the next step's calls, or streamed when nativeActions is
+// off), never in place of Codex's own final answer, which it precedes.
+//
 // Budget: a hook's budget (10 s of its own time per step) stops only while a
 // `$` call OF THAT STEP is in flight. So every step pulls the child's stream
 // itself (`run.child.next()`), and no pull is ever left pending across a step
-// boundary.
+// boundary. The 2 s check of an app-server run races the step's one pending
+// pull with a `$.clock.after` timer and waits on that same pull again; it is
+// skipped when `next.budget` runs low, and the pull always settles in the step.
 //
 // Kill behaviour: the child lives until its stream ends or is `return()`ed.
 // It is killed when `next.signal` of any step aborts (interrupt, stop), when a
 // step sees the agent is no longer running, when the agent's turn completes
 // while a run is still active, when `timeoutMinutes` elapses, and when the
-// module unloads (the engine kills every spawn of an unloaded module).
+// module unloads (the engine kills every spawn of an unloaded module). An
+// app-server run is first asked to stop (`interrupt` file) and given 1.5 s.
 //
 // Continuity: one record per agent `{ thread, model, effort, sandbox,
 // lastTask, agentName, handedBack, handback, lastAnswer, handbackLock,
-// userCount, launch-guard counters, updatedAt }`, kept in memory and
+// userCount, launch-guard counters, runSeq, updatedAt }`, kept in memory and
 // in `$.store` under `agent:<sessionId>:<agentId>`, so it survives a
 // hooks-worker restart, a hot reload and a `--resume`. Records not updated for
 // `pruneDays` are pruned at session start/end.
+//
+// Drift: lines of an unknown type (or not JSON) are counted; a run that ends
+// with no agent message and some of them fails as "protocol changed" with the
+// codex-cli version session start read (`codex --version`; below 0.163.0 is
+// warned about once). A non-openai `model_provider` in config.toml makes a
+// failing `codex login status` a debug note instead of the logged-out blocker.
 //
 // Lean launches (userConfig `lean`, default on): `-c` overrides that turn off
 // Codex plugins, apps, skills instructions, web search, multi-agent and the
@@ -146,6 +177,21 @@ export const CODEX_CANDIDATES = [
   '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
   '/Applications/Codex.app/Contents/Resources/codex',
 ]
+/** Where node is commonly installed, tried after PATH (app-server transport). */
+export const NODE_CANDIDATES = ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node']
+/** The sidecar, under the plugin root, and the protocol version its `--version` prints. */
+const RUNNER = 'scripts/codex-runner.mjs'
+const RUNNER_PROTOCOL = '1'
+/** The oldest codex-cli this module was verified on (a pre-release of it counts as it). */
+const MIN_CODEX = [0, 163, 0] as const
+/** The `type`s `codex exec --json` prints (codex-cli 0.163); any other counts as drift. */
+const EXEC_TYPES = ['thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'item.started', 'item.updated', 'item.completed', 'error']
+// While a step waits on an app-server run, new messages are looked for this
+// often, as long as the step's budget keeps MID_STEP_RESERVE_MS.
+const MID_STEP_MS = 2000
+const MID_STEP_RESERVE_MS = 4000
+// How long an interrupted app-server run gets to end before it is killed.
+const INTERRUPT_GRACE_MS = 1500
 
 // ---- roles -----------------------------------------------------------------
 
@@ -174,6 +220,7 @@ const PLACEHOLDER_PROMPT = 'You are a placeholder. The codex-mod plugin answers 
 
 export type HandbackMode = 'auto' | 'tool' | 'text'
 export type FooterMode = 'full' | 'short' | 'off'
+export type Transport = 'exec' | 'app-server'
 
 export type Config = {
   /** The userConfig override, if any. */
@@ -195,6 +242,10 @@ export type Config = {
   maxRunsPerWindow: number
   nativeActions: boolean
   ttlMs: number
+  /** What a run is launched with; `app-server` falls back to exec when its checks fail. */
+  transport: Transport
+  /** The userConfig node override (app-server transport), if any. */
+  nodeOverride?: string
   /** Option values that were refused (the default was used), for the debug log. */
   warnings: string[]
 }
@@ -253,6 +304,7 @@ export function parseConfig(raw: unknown): Config {
     return true
   })
   const codexPath = str('codexPath', '')
+  const nodePath = str('nodePath', '')
   return {
     codexOverride: codexPath === '' ? undefined : codexPath,
     codexPath: codexPath === '' ? undefined : codexPath,
@@ -273,6 +325,8 @@ export function parseConfig(raw: unknown): Config {
     maxRunsPerWindow: int('maxRunsPerWindow', 3, 1, 100),
     nativeActions: bool('nativeActions', true),
     ttlMs: int('pruneDays', 2, 1, 365) * DAY_MS,
+    transport: oneOf<Transport>('transport', 'exec', ['exec', 'app-server']),
+    nodeOverride: nodePath === '' ? undefined : nodePath,
     warnings,
   }
 }
@@ -301,6 +355,8 @@ export type AgentRecord = Profile & {
   guardTrip?: { key: string; reason: string }
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
+  // app-server runs launched so far: the <n> of each run's control dir
+  runSeq?: number
   updatedAt: number
 }
 
@@ -318,6 +374,13 @@ export type CodexEvent =
   | { kind: 'files'; changes: FileChange[] }
   | { kind: 'usage'; input: number; cached: number; output: number }
   | { kind: 'error'; text: string }
+  // runner-only lines (app-server transport)
+  | { kind: 'turn'; id: string }
+  | { kind: 'steer'; id: string; accepted: boolean; reason?: string }
+  | { kind: 'protocol'; types: string[] }
+  | { kind: 'fatal'; text: string }
+  // a line that is not JSON, or of a type `codex exec --json` does not print
+  | { kind: 'unknown'; type: string }
   | { kind: 'other' }
 
 /** One of Codex's actions as a built-in tool call, and the result it is answered with. */
@@ -335,14 +398,31 @@ const changesOf = (item: any): FileChange[] =>
     ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ path: c.path, kind: String(c.kind ?? 'update') }))
     : []
 
-/** Maps one JSONL line of `codex exec --json` (verified on codex-cli 0.163). */
+/**
+ * Maps one JSONL line of `codex exec --json` (verified on codex-cli 0.163), or
+ * a `codexmod.*` line of the app-server runner.
+ */
 export function parseCodexLine(line: string): CodexEvent {
   let ev: any
   try {
     ev = JSON.parse(line)
   } catch {
+    return { kind: 'unknown', type: 'non-JSON' }
+  }
+  const type = typeof ev?.type === 'string' ? ev.type : undefined
+  if (type?.startsWith('codexmod.')) {
+    if (type === 'codexmod.turn' && typeof ev.turn_id === 'string') return { kind: 'turn', id: ev.turn_id }
+    if (type === 'codexmod.steer' && (typeof ev.id === 'string' || typeof ev.id === 'number')) {
+      return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted', ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
+    }
+    if (type === 'codexmod.protocol') {
+      const names = (v: unknown, tag: string) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').map(x => `${tag} ${x}`) : [])
+      return { kind: 'protocol', types: [...names(ev.unknown_methods, 'method'), ...names(ev.unknown_items, 'item')] }
+    }
+    if (type === 'codexmod.fatal') return { kind: 'fatal', text: String(ev.message ?? 'runner failed') }
     return { kind: 'other' }
   }
+  if (type === undefined || !EXEC_TYPES.includes(type)) return { kind: 'unknown', type: type ?? 'untyped' }
   const item = ev?.item
   if (ev?.type === 'thread.started' && typeof ev.thread_id === 'string') return { kind: 'thread', id: ev.thread_id }
   if (ev?.type === 'item.completed' && item?.type === 'agent_message' && typeof item.text === 'string') {
@@ -522,11 +602,17 @@ export function compact(n: number): string {
   return `${(n / 1000000).toFixed(1).replace(/\.0$/, '')}M`
 }
 
-/** The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`. */
-export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string }, mode: FooterMode = 'full'): string {
+/**
+ * The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`;
+ * an app-server run adds `app-server` (and `N steers`) after the sandbox, a fallback run why it is exec.
+ */
+export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number }, mode: FooterMode = 'full'): string {
   if (mode === 'off') return ''
   if (mode === 'short') return [p.agent, p.model, p.effort].join(' · ')
-  const parts = [p.agent, p.model, p.effort, p.sandbox, `${p.actions} action${p.actions === 1 ? '' : 's'}`]
+  const parts = [p.agent, p.model, p.effort, p.sandbox]
+  if (p.transport !== undefined) parts.push(p.transport)
+  if (p.steers !== undefined && p.steers > 0) parts.push(`${p.steers} steer${p.steers === 1 ? '' : 's'}`)
+  parts.push(`${p.actions} action${p.actions === 1 ? '' : 's'}`)
   if (p.usage !== undefined) {
     const fresh = Math.max(0, p.usage.input - p.usage.cached)
     parts.push(`${compact(fresh)} new tokens (${compact(p.usage.cached)} cached, ${compact(p.usage.output)} out)`)
@@ -797,8 +883,7 @@ export async function leanArgs($: EngineInterface): Promise<string[]> {
  */
 export async function shadowHome($: EngineInterface): Promise<string> {
   const real = (await codexHome($)).replace(/\/$/, '')
-  const cache = ((await $.env.get('XDG_CACHE_HOME')) || `${await homeDir($)}/.cache`).replace(/\/$/, '')
-  const shadow = `${cache}/codex-mod/home`
+  const shadow = `${await cacheDir($)}/home`
   if (shadow === real || shadow.startsWith(`${real}/`)) throw new Error(`shadow folder ${shadow} would be inside the real Codex home`)
   const ok = async (argv: string[]) => {
     const r = await $.process.run(argv, { timeoutMs: 10000 })
@@ -839,12 +924,77 @@ export function launchArgv(p: {
   ]
 }
 
+/**
+ * The argv of one app-server launch (pure): node running the runner, the same
+ * profile and overrides as `launchArgv` (`--config` for each `-c`), the prompt on stdin.
+ */
+export function runnerArgv(p: {
+  node: string
+  runner: string
+  codex: string
+  prof: Profile
+  cwd: string
+  resume?: string
+  lean: string[]
+  extra: readonly string[]
+  control: string
+}): string[] {
+  const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra]
+  return [
+    p.node, p.runner, 'run', '--codex', p.codex, '--cwd', p.cwd,
+    '--model', p.prof.model, '--effort', p.prof.effort, '--sandbox', p.prof.sandbox,
+    ...(p.resume ? ['--thread', p.resume] : []),
+    ...overrides.flatMap(kv => ['--config', kv]),
+    '--control', p.control,
+  ]
+}
+
+/** `codex-cli 0.163.0-alpha.10.2` -> `0.163.0-alpha.10.2`; undefined when no version is in the text. */
+export function parseCodexVersion(text: string): string | undefined {
+  return /(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/.exec(text)?.[1]
+}
+
+/** True when `version` is below MIN_CODEX (its pre-release tag is ignored: 0.163.0-alpha counts as 0.163.0). */
+export function codexTooOld(version: string): boolean {
+  const n = version.split('-')[0]!.split('.').map(Number)
+  for (let i = 0; i < MIN_CODEX.length; i++) {
+    if ((n[i] ?? 0) !== MIN_CODEX[i]) return (n[i] ?? 0) < MIN_CODEX[i]!
+  }
+  return false
+}
+
+/** The top-level `model_provider` of a Codex config.toml (before any table), undefined when unset. */
+export function modelProvider(toml: string): string | undefined {
+  for (const line of toml.split('\n')) {
+    if (/^\s*\[/.test(line)) return undefined
+    const m = /^\s*model_provider\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))\s*(?:#.*)?$/.exec(line)
+    if (m) return m[1] ?? m[2] ?? m[3]
+  }
+  return undefined
+}
+
+/** The plugin's cache folder (XDG_CACHE_HOME, else ~/.cache), `<cache>/codex-mod`. */
+const cacheDir = async ($: EngineInterface): Promise<string> =>
+  `${((await $.env.get('XDG_CACHE_HOME')) || `${await homeDir($)}/.cache`).replace(/\/$/, '')}/codex-mod`
+
+/** Where app-server runs keep their control dirs. */
+const runsDir = async ($: EngineInterface): Promise<string> => `${await cacheDir($)}/runs`
+
 // ---- state -----------------------------------------------------------------
 
 /** The `$.store` key of an agent's record. */
 export const recordKey = (sessionId: string, agentId: string): string => `${STORE_PREFIX}${sessionId}:${agentId}`
 
-type Queued = { kind: 'text'; text: string } | { kind: 'action'; action: Action }
+// `note`: a `↪` line of ours about a mid-run message; shown like a message, but
+// never standing in for Codex's final answer.
+type Queued = { kind: 'text' | 'note'; text: string } | { kind: 'action'; action: Action }
+
+/** The `↪` line shown for a mid-run message: what codex-mod did with it. */
+export function steerNote(what: 'accepted' | 'finished' | 'queued', text = ''): string {
+  if (what === 'accepted') return `↪ steer delivered to Codex mid-turn: "${oneLine(parseOverrides(text).rest, 80)}"`
+  if (what === 'finished') return '↪ Codex had already finished; this message runs next, on the same thread'
+  return '↪ queued: runs after this turn (exec transport has no mid-turn steer)'
+}
 
 /** One Codex child and what has been read from it so far. */
 type Run = {
@@ -877,7 +1027,28 @@ type Run = {
   carry?: string
   // follow-up user messages folded into the turn while this run was active
   followUps: FollowUp[]
+  // what launched it; app-server runs have a control dir
+  transport: Transport
+  control?: string
+  // the footer's word for the transport (app-server, or why it is exec)
+  transportNote?: string
+  // the runner's turn id, once the turn started (app-server)
+  turnId?: string
+  // messages written as steer files and not acked yet; accepted steers
+  pendingSteers: FollowUp[]
+  steers: number
+  // the exec run's "queued" note was shown (once per run)
+  queuedNoted?: boolean
+  // the one pull in flight, shared by the step and an interrupt's drain
+  pull?: Promise<IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>>
+  // drift evidence: unknown lines, their first types; the runner's fatal line
+  unknown: number
+  unknownTypes: string[]
+  fatal?: string
 }
+
+/** What session start found for the app-server transport: the launch, or why runs fall back to exec. */
+type AppServer = { node: string; runner: string } | { why: string }
 
 // agentId -> profile name (undefined: not ours). An agent's type never changes.
 const known = new Map<string, string | undefined>()
@@ -896,6 +1067,14 @@ let catalog: ModelInfo[] | null | undefined
 let cfg: Config = parseConfig({})
 // False after a session start whose agent registration failed: retried once on the next main-loop step.
 let agentsReady = true
+// The app-server transport as checked (session start, else the first launch); undefined: not checked.
+let appServer: AppServer | undefined
+// The codex-cli version session start read; undefined: unknown.
+let codexVersion: string | undefined
+// The old-version warning is shown once per module load.
+let versionWarned = false
+// A step's signal -> what is left of its budget (read live from its `next.budget`).
+const budgets = new WeakMap<AbortSignal, () => number>()
 
 /** True when the loop is an agent this module answers (known from its first step). */
 const isCodexAgent = (agentId: unknown): boolean => typeof agentId === 'string' && known.get(agentId) !== undefined
@@ -930,6 +1109,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     for (const w of config.warnings) $.ui.log(`codex-mod: option ${w}`, { to: 'debug' })
     await pruneRecords($, config.ttlMs)
+    await pruneRuns($, config.ttlMs)
     await loadCatalog($, true)
     config.codexPath = config.codexOverride ?? (await findCodex($))
     preflight = await checkCodex($, config.codexPath ?? 'codex')
@@ -941,6 +1121,14 @@ export const register: Register = (on, options) => {
       const sent = await $.ui.notify(text).catch(() => ({ isSent: false as const }))
       if (!sent.isSent) $.ui.toast(text, { timeoutMs: 10000 })
     }
+    if (codexVersion !== undefined && codexTooOld(codexVersion) && !versionWarned) {
+      versionWarned = true
+      const text = `codex-mod: codex-cli ${codexVersion} is older than ${MIN_CODEX.join('.')}, the version this plugin was verified on; runs may fail`
+      $.ui.log(text, { to: 'debug' })
+      await $.ui.notify(text).catch(() => undefined)
+    }
+    appServer = undefined
+    if (config.transport === 'app-server') appServer = await checkAppServer($, config)
     agentsReady = await registerAgents($, config)
     return next(e)
   })
@@ -949,6 +1137,7 @@ export const register: Register = (on, options) => {
   // its agent's turn (turn.complete below); a /clear also ends the session.
   on('session.end', async ($, e, next) => {
     await pruneRecords($, config.ttlMs)
+    await pruneRuns($, config.ttlMs)
     return next(e)
   })
 
@@ -977,7 +1166,7 @@ export const register: Register = (on, options) => {
     const run = e.agentId === undefined ? undefined : runs.get(e.agentId)
     if (run !== undefined) {
       $.ui.log(`codex-mod: agent ${run.agentId} turn ended (${e.reason}) while Codex ran; killing it`, { to: 'debug' })
-      await killRun(run)
+      await stopRun($, run)
     }
     return next(e)
   })
@@ -1005,6 +1194,7 @@ export const register: Register = (on, options) => {
     if (profileOf(name) === undefined) {
       return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not defined by this version of the plugin`, handbackFor(e.agentId, undefined))
     }
+    budgets.set(next.signal, () => next.budget.remainingMs)
     return yield* answerWithCodex($, e, next.signal, config, name)
   }).catch(async function* ($, e, next) {
     if (next.called) return yield* next(e)
@@ -1052,16 +1242,96 @@ export async function findCodex($: EngineInterface): Promise<string | undefined>
   return undefined
 }
 
-/** Runs `codex --version` and `codex login status`; the problem, if any. */
+/**
+ * Runs `codex --version` (the version is kept for drift reports) and `codex
+ * login status`; the problem, if any. A failing login status is no problem
+ * when config.toml names a model_provider other than openai (a debug note).
+ */
 export async function checkCodex($: EngineInterface, codex: string): Promise<string | undefined> {
   try {
     const v = await $.process.run([codex, '--version'], { timeoutMs: 15000 })
     if (v.exitCode !== 0) return `Codex at ${codex} failed --version (exit ${v.exitCode}): ${v.stderr.trim().slice(-200)}`
+    codexVersion = parseCodexVersion(v.stdout)
     const l = await $.process.run([codex, 'login', 'status'], { timeoutMs: 15000 })
-    if (l.exitCode !== 0) return `Codex is not logged in (${(l.stderr || l.stdout).trim().slice(-200)}); run "codex login"`
+    if (l.exitCode !== 0) {
+      const why = (l.stderr || l.stdout).trim().slice(-200)
+      const provider = await $.fs.read(`${await codexHome($)}/config.toml`).then(t => modelProvider(String(t)), () => undefined)
+      if (provider !== undefined && provider !== 'openai') {
+        $.ui.log(`codex-mod: codex login status failed (${why}); model_provider is ${provider}, so it is not treated as logged out`, { to: 'debug' })
+        return undefined
+      }
+      return `Codex is not logged in (${why}); run "codex login" or "codex login --device-auth"`
+    }
     return undefined
   } catch (err) {
     return `Codex not found or not runnable at ${codex}: ${errText(err)}; install it or set the codexPath option`
+  }
+}
+
+/** The nodePath option, else node on PATH (`which node`), else the first common install location that exists. */
+async function findNode($: EngineInterface, override: string | undefined): Promise<string | undefined> {
+  if (override !== undefined) return override
+  try {
+    const r = await $.process.run(['which', 'node'], { timeoutMs: 10000 })
+    const path = r.stdout.trim().split('\n')[0]?.trim()
+    if (r.exitCode === 0 && path) return path
+  } catch {
+    // no `which`, or PATH is not the shell's: try the usual places
+  }
+  for (const path of NODE_CANDIDATES) {
+    if (await $.fs.exists(path).catch(() => false)) return path
+  }
+  return undefined
+}
+
+/**
+ * Checks the app-server transport: node, the runner (present, speaking our
+ * protocol) and `codex app-server --help`. The launch, or why runs fall back
+ * to exec (logged).
+ */
+async function checkAppServer($: EngineInterface, config: Config): Promise<AppServer> {
+  const codex = config.codexPath ?? 'codex'
+  const result = await (async (): Promise<AppServer> => {
+    try {
+      const node = await findNode($, config.nodeOverride)
+      if (node === undefined) return { why: 'node not found; set the nodePath option' }
+      const runner = `${$.plugin.root.replace(/\/$/, '')}/${RUNNER}`
+      if (!(await $.fs.exists(runner))) return { why: `${RUNNER} missing from the plugin` }
+      const h = await $.process.run([codex, 'app-server', '--help'], { timeoutMs: 15000 })
+      if (h.exitCode !== 0) return { why: `codex app-server --help failed (exit ${h.exitCode})` }
+      const v = await $.process.run([node, runner, '--version'], { timeoutMs: 15000 })
+      const said = v.stdout.trim().split('\n')[0]?.trim() ?? ''
+      if (v.exitCode !== 0) return { why: `runner did not start with ${node} (exit ${v.exitCode}): ${oneLine(v.stderr, 80)}` }
+      if (said !== RUNNER_PROTOCOL) return { why: `runner protocol ${oneLine(said, 20) || 'unknown'}, expected ${RUNNER_PROTOCOL}` }
+      return { node, runner }
+    } catch (err) {
+      return { why: oneLine(errText(err), 120) }
+    }
+  })()
+  $.ui.log('why' in result ? `codex-mod: app-server transport unavailable (${result.why}); runs use codex exec` : `codex-mod: app-server transport ready (${result.node} ${result.runner})`, { to: 'debug' })
+  return result
+}
+
+/** The transport of a launch: exec, app-server (checked once), or exec with why app-server is not used. */
+async function transportFor($: EngineInterface, config: Config): Promise<{ transport: 'exec'; note?: string } | { transport: 'app-server'; node: string; runner: string }> {
+  if (config.transport === 'exec') return { transport: 'exec' }
+  if (appServer === undefined) appServer = await checkAppServer($, config)
+  return 'why' in appServer ? { transport: 'exec', note: `exec (app-server unavailable: ${appServer.why})` } : { transport: 'app-server', ...appServer }
+}
+
+/** Deletes app-server control dirs not touched for `ttlMs`. */
+async function pruneRuns($: EngineInterface, ttlMs: number): Promise<void> {
+  try {
+    const dir = await runsDir($)
+    if (!(await $.fs.exists(dir))) return
+    const now = await $.clock.now()
+    for (const ent of await $.fs.list(dir)) {
+      if (ent.kind !== 'dir') continue
+      const st = await $.fs.stat(`${dir}/${ent.name}`)
+      if (!(now - st.mtimeMs < ttlMs)) await $.process.run(['rm', '-rf', `${dir}/${ent.name}`], { timeoutMs: 10000 })
+    }
+  } catch (err) {
+    $.ui.log(`codex-mod: run dir prune failed: ${errText(err)}`, { to: 'debug' })
   }
 }
 
@@ -1250,7 +1520,7 @@ async function* answerWithCodex(
     const info = await $.agent.list().then(l => l.find(a => a.id === agentId), () => undefined)
     if (info !== undefined && ['completed', 'failed', 'killed'].includes(info.status)) {
       $.ui.log(`codex-mod: agent ${agentId} is ${info.status}; killing Codex`, { to: 'debug' })
-      await killRun(active)
+      await stopRun($, active)
       yield STOP
       return finish(e)
     }
@@ -1364,7 +1634,14 @@ async function* redeliver($: EngineInterface, e: TurnStepInput, agentId: string,
   return yield* finalBlocks(e, rec.lastAnswer, '', handback)
 }
 
-/** A user message folded into the turn while a run is active is kept for after it. */
+/** The file id of a steer: the message count, zero-padded so the runner's name order is arrival order. */
+const steerId = (count: number) => String(count).padStart(6, '0')
+
+/**
+ * A user message folded into the turn while a run is active: steered into an
+ * app-server run (a steer file in its control dir, acked on its stdout), else
+ * kept for after the run. Never rejects.
+ */
 async function noteFollowUp($: EngineInterface, run: Run): Promise<void> {
   const conv = await conversation($, run.agentId).catch(() => undefined)
   if (conv === undefined) return
@@ -1373,8 +1650,25 @@ async function noteFollowUp($: EngineInterface, run: Run): Promise<void> {
   const rec = records.get(run.agentId)
   const seen = rec?.userCount
   if (seen !== undefined ? latest.count <= seen : latest.text === rec?.lastTask) return
-  if (run.followUps.some(f => f.count === latest.count) || followUpsOf(rec).some(f => f.count === latest.count)) return
+  const same = (f: FollowUp) => f.count === latest.count
+  if (run.followUps.some(same) || run.pendingSteers.some(same) || followUpsOf(rec).some(same)) return
+  // override lines cannot change a running turn's model: the rest is steered
+  const text = parseOverrides(latest.text).rest.trim()
+  if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
+    try {
+      await $.fs.write(`${run.control}/steer-${steerId(latest.count)}.json`, JSON.stringify({ text }))
+      run.pendingSteers.push(latest)
+      $.ui.log(`codex-mod: agent ${run.agentId}: message received mid-run; steered into the running turn`, { to: 'debug' })
+      return
+    } catch (err) {
+      $.ui.log(`codex-mod: agent ${run.agentId}: steer not written (${errText(err)}); it runs after this one`, { to: 'debug' })
+    }
+  }
   run.followUps.push(latest)
+  if (run.transport !== 'app-server') {
+    if (!run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote('queued') })
+    run.queuedNoted = true
+  } else run.queue.push({ kind: 'note', text: steerNote('finished') })
   $.ui.log(`codex-mod: agent ${run.agentId}: follow-up received mid-run; it runs after this one`, { to: 'debug' })
 }
 
@@ -1458,8 +1752,26 @@ async function* startRun(
       return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: rec.thread }, config.footer), handback)
     }
   }
-  const argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
-  $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
+  const via = await transportFor($, config)
+  let argv: string[]
+  let control: string | undefined
+  if (via.transport === 'app-server') {
+    // a fresh control dir per run: no file of an earlier run may steer this one
+    rec.runSeq = (rec.runSeq ?? 0) + 1
+    await saveRecord($, agentId, rec)
+    const safe = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_')
+    const runs = await runsDir($)
+    control = `${runs}/${safe(await sessionId($))}-${safe(agentId)}-${rec.runSeq}`
+    await $.process.run(['rm', '-rf', control], { timeoutMs: 10000 }).catch(() => undefined)
+    // created private (0700) here, before any steer file (prompt text) is written
+    // into it: `$.fs.write` would create missing directories with the default mode
+    await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control })
+    $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
+  } else {
+    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
+    $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
+  }
 
   const run: Run = {
     agentId,
@@ -1484,6 +1796,13 @@ async function* startRun(
     handback,
     carry,
     followUps: [],
+    transport: via.transport,
+    control,
+    transportNote: via.transport === 'app-server' ? 'app-server' : via.note,
+    pendingSteers: [],
+    steers: 0,
+    unknown: 0,
+    unknownTypes: [],
   }
   if (config.timeoutMs > 0) {
     try {
@@ -1506,7 +1825,7 @@ function dropAnswers(agentId: string): void {
 }
 
 /** Kills a run's child (idempotent) and forgets it. */
-async function killRun(run: Run): Promise<void> {
+async function killRun(run: Run, interrupted = false): Promise<void> {
   if (runs.get(run.agentId) === run) runs.delete(run.agentId)
   dropAnswers(run.agentId)
   try {
@@ -1514,12 +1833,105 @@ async function killRun(run: Run): Promise<void> {
   } catch {
     // already fired
   }
-  if (run.killed) return
+  if (run.killed && !interrupted) return
   run.killed = true
   try {
     await run.child.return(undefined as unknown as ProcessSpawnResult)
   } catch {
     // already ended
+  }
+}
+
+/**
+ * Kills a run as `killRun` does; an app-server run is first asked to stop (its
+ * turn interrupted) and read for up to INTERRUPT_GRACE_MS within this call.
+ */
+async function stopRun($: EngineInterface, run: Run): Promise<void> {
+  if (run.killed || run.transport !== 'app-server' || run.control === undefined || run.ended) return killRun(run)
+  // marked killed first: the step pulling meanwhile ends, and no second stop starts
+  run.killed = true
+  if (runs.get(run.agentId) === run) runs.delete(run.agentId)
+  await interruptRun($, run)
+  return killRun(run, true)
+}
+
+/** The run's one pull in flight, started if none is: a step and an interrupt's drain share it. */
+function pullOnce(run: Run): Promise<IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>> {
+  if (run.pull === undefined) {
+    const p = run.child.next()
+    run.pull = p
+    const clear = () => {
+      if (run.pull === p) run.pull = undefined
+    }
+    p.then(clear, clear)
+  }
+  return run.pull
+}
+
+/** A `$.clock.after` wait as a promise and its timer; no timer when one cannot be set. */
+function lateAfter($: EngineInterface, ms: number): { done: Promise<'late'>; timer?: Timer } {
+  let timer: Timer | undefined
+  const done = new Promise<'late'>(resolve => {
+    try {
+      timer = $.clock.after(ms, () => resolve('late'))
+    } catch {
+      // no timer: the caller waits without one
+    }
+  })
+  return { done, timer }
+}
+
+const cancel = (timer: Timer | undefined) => {
+  try {
+    timer?.cancel()
+  } catch {
+    // already fired
+  }
+}
+
+/** Writes the run's `interrupt` file, then reads the run until it ends or INTERRUPT_GRACE_MS passes. */
+async function interruptRun($: EngineInterface, run: Run): Promise<void> {
+  try {
+    await $.fs.write(`${run.control}/interrupt`, 'interrupt\n')
+  } catch (err) {
+    $.ui.log(`codex-mod: agent ${run.agentId}: interrupt not written (${errText(err)}); killing the runner`, { to: 'debug' })
+    return
+  }
+  const t = lateAfter($, INTERRUPT_GRACE_MS)
+  if (t.timer === undefined) return
+  try {
+    for (;;) {
+      const r = await Promise.race([pullOnce(run), t.done])
+      if (r === 'late' || r.done) break
+    }
+  } catch {
+    // the stream closed
+  } finally {
+    cancel(t.timer)
+  }
+}
+
+/**
+ * The next piece of an app-server run, read in THIS step. While it is late,
+ * every MID_STEP_MS the conversation is checked for a message to steer in and
+ * the same pull is waited on again, so it settles before the step returns.
+ * No check when the step's budget is low (or no timer can be set).
+ */
+async function pullWatching($: EngineInterface, run: Run, signal: AbortSignal): Promise<IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>> {
+  const pending = pullOnce(run)
+  for (;;) {
+    const left = budgets.get(signal)?.() ?? Number.POSITIVE_INFINITY
+    if (left < MID_STEP_RESERVE_MS || signal.aborted || run.killed) return await pending
+    const t = lateAfter($, MID_STEP_MS)
+    if (t.timer === undefined) return await pending
+    let r: IteratorResult<ProcessSpawnChunk, ProcessSpawnResult> | 'late'
+    try {
+      r = await Promise.race([pending, t.done])
+    } finally {
+      cancel(t.timer)
+    }
+    if (r !== 'late') return r
+    await noteFollowUp($, run)
   }
 }
 
@@ -1571,7 +1983,39 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
     run.texts.push(ev.text)
     run.queue.push({ kind: 'text', text: ev.text })
   } else if (ev.kind === 'error') run.errors.push(ev.text)
-  else if (ev.kind === 'usage') {
+  else if (ev.kind === 'turn') run.turnId = ev.id
+  else if (ev.kind === 'steer') {
+    const i = run.pendingSteers.findIndex(f => String(f.count) === ev.id || steerId(f.count) === ev.id)
+    if (i < 0) return
+    const [s] = run.pendingSteers.splice(i, 1)
+    if (ev.accepted) {
+      run.steers++
+      // the steered message had its launch: it never also runs after the handback
+      const rec = records.get(run.agentId)
+      if (rec !== undefined) {
+        if (rec.userCount === undefined || s!.count > rec.userCount) {
+          rec.userCount = s!.count
+          rec.lastTask = s!.text
+        }
+        rec.launchKey = `${s!.count}:${s!.text}`
+        rec.launchesSinceNew = 1
+        await saveRecord($, run.agentId, rec)
+      }
+      run.queue.push({ kind: 'note', text: steerNote('accepted', s!.text) })
+      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} accepted`, { to: 'debug' })
+    } else {
+      run.followUps.push(s!)
+      run.queue.push({ kind: 'note', text: steerNote('finished') })
+      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} rejected (${ev.reason ?? 'no reason'}); it runs after this one`, { to: 'debug' })
+    }
+  } else if (ev.kind === 'protocol') {
+    run.unknown += ev.types.length
+    for (const t of ev.types) if (run.unknownTypes.length < 3 && !run.unknownTypes.includes(t)) run.unknownTypes.push(t)
+  } else if (ev.kind === 'fatal') run.fatal = ev.text
+  else if (ev.kind === 'unknown') {
+    run.unknown++
+    if (run.unknownTypes.length < 3 && !run.unknownTypes.includes(ev.type)) run.unknownTypes.push(ev.type)
+  } else if (ev.kind === 'usage') {
     const u = run.usage ?? { input: 0, cached: 0, output: 0 }
     run.usage = { input: u.input + ev.input, cached: u.cached + ev.cached, output: u.output + ev.output }
   } else if (ev.kind === 'command') {
@@ -1597,6 +2041,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
 
 const interval = (run: Run) => (run.actionSteps >= SLOW_AFTER ? Math.max(SLOW_MS, cfg.intervalMs) : cfg.intervalMs)
 const hasAction = (run: Run) => run.queue.some(q => q.kind === 'action')
+const hasNote = (run: Run) => run.queue.some(q => q.kind === 'note')
 const timeoutText = () => `timeout after ${Math.round(cfg.timeoutMs / 60000)} min (timeoutMinutes); Codex was stopped`
 
 /**
@@ -1605,7 +2050,7 @@ const timeoutText = () => `timeout after ${Math.round(cfg.timeoutMs / 60000)} mi
  * nativeActions off, everything streams as text into this one step instead.
  */
 async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
-  const onAbort = () => void killRun(run)
+  const onAbort = () => void stopRun($, run)
   signal.addEventListener?.('abort', onAbort, { once: true })
   let failure: { reason: string; detail?: string } | undefined
   // text streamed in this step so far (nativeActions off)
@@ -1628,12 +2073,12 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
       }
       if (signal.aborted || run.killed) throw new Error('aborted')
       if (!cfg.nativeActions) {
-        // every message and action as it comes; the final answer is held back
-        while (run.queue.length > 0 && (hasAction(run) || run.ended)) {
+        // every message, note and action as it comes; the final answer is held back
+        while (run.queue.length > 0 && (hasAction(run) || hasNote(run) || run.ended)) {
           const q = run.queue[0]!
-          if (q.kind === 'text' && run.ended && !run.queue.some(x => x.kind === 'action')) break
+          if (q.kind !== 'action' && run.ended && !hasAction(run)) break
           run.queue.shift()
-          if (q.kind === 'text') {
+          if (q.kind !== 'action') {
             yield* say(q.text)
           } else {
             yield* say(actionLine(q.action))
@@ -1642,7 +2087,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
       } else if (hasAction(run)) {
         if (run.actionSteps >= MAX_ACTION_STEPS) {
           // past the cap actions are counted only; messages stay for the answer
-          run.queue = run.queue.filter(q => q.kind === 'text')
+          run.queue = run.queue.filter(q => q.kind !== 'action')
         } else {
           const wait = interval(run) - ((await $.clock.now()) - run.lastEmit)
           if (wait > 0) await $.clock.sleep(wait, { signal })
@@ -1654,7 +2099,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
       if (run.ended) break
       let r: IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>
       try {
-        r = await run.child.next()
+        r = run.transport === 'app-server' ? await pullWatching($, run, signal) : await run.child.next()
       } catch (err) {
         if (run.timedOut) continue
         if (signal.aborted || run.killed) throw err
@@ -1711,7 +2156,7 @@ async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepC
     run.carry = undefined
   }
   for (const q of taken) {
-    if (q.kind === 'text') {
+    if (q.kind !== 'action') {
       const prev = blocks.at(-1)
       if (prev !== undefined && 'text' in prev) prev.text += `\n\n${q.text}`
       else blocks.push({ text: q.text })
@@ -1742,6 +2187,12 @@ async function* complete(
     // already fired
   }
   const tail = run.stderrTail.trim().split('\n').slice(-5).join('\n')
+  // a steer the runner never acked (it ended first) runs after this run, as a follow-up
+  if (run.pendingSteers.length > 0) {
+    run.followUps.push(...run.pendingSteers)
+    run.pendingSteers = []
+    run.queue.push({ kind: 'note', text: steerNote('finished') })
+  }
   let reason = failure?.reason
   let detail = failure?.detail ?? ''
   if (failure === undefined) {
@@ -1751,7 +2202,10 @@ async function* complete(
     } catch (err) {
       reason = `stream closed (${errText(err)})`
     }
-    if (ended !== undefined && ended.code !== 0) {
+    if (ended !== undefined && run.fatal !== undefined) {
+      reason = oneLine(run.fatal, 300)
+      detail = tail
+    } else if (ended !== undefined && ended.code !== 0) {
       const how = ended.signal ? `signal ${ended.signal}` : `exit ${ended.code}`
       reason = run.errors.length > 0 ? `${how}: ${oneLine(run.errors.join('; '))}` : how
       detail = tail || (run.errors.length > 0 ? '' : 'no output')
@@ -1759,15 +2213,18 @@ async function* complete(
       reason = oneLine(run.errors.join('; '))
       detail = tail
     } else if (ended !== undefined && run.texts.length === 0) {
-      reason = 'no agent message'
+      reason = driftText(run) ?? 'no agent message'
       detail = tail
     }
   }
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
-  // the answer: the messages not shown yet (those after the last action), else the last one
-  const unseen = run.queue.filter((q): q is { kind: 'text'; text: string } => q.kind === 'text').map(q => q.text)
+  // the answer: the messages not shown yet (those after the last action), else the last
+  // one; the notes not shown yet go before it, so a note never stands in for the answer
+  const unseen = run.queue.filter(q => q.kind === 'text').map(q => q.text)
+  const notes = run.queue.filter(q => q.kind === 'note').map(q => q.text)
   run.queue = []
-  const answer = unseen.length > 0 ? unseen.join('\n\n') : streamed !== undefined && !run.handback ? '' : (run.texts.at(-1) ?? '')
+  const said = unseen.length > 0 ? unseen.join('\n\n') : streamed !== undefined && !run.handback ? '' : (run.texts.at(-1) ?? '')
+  const answer = [...notes, said].filter(Boolean).join('\n\n')
   const body = reason === undefined ? answer : [`codex failed: ${reason}`, detail, answer].filter(Boolean).join('\n')
   const rec = records.get(run.agentId)
   if (rec !== undefined) {
@@ -1775,7 +2232,7 @@ async function* complete(
     const queued = [...followUpsOf(rec), ...run.followUps]
     rec.followUps = queued.length > 0 ? queued : undefined
   }
-  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread }, cfg.footer)
+  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, steers: run.steers }, cfg.footer)
   const shown = [run.carry, body].filter(Boolean).join('\n\n')
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile
@@ -1793,6 +2250,13 @@ async function* complete(
   }
   if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed })
   return yield* handBack($, e, shown, foot, run.handback)
+}
+
+/** Why a run with no agent message failed when it printed lines we do not know: the protocol changed. */
+function driftText(run: Run): string | undefined {
+  if (run.unknown === 0) return undefined
+  const what = run.transport === 'app-server' ? 'codex app-server' : 'codex exec --json'
+  return `${what} protocol changed (codex-cli ${codexVersion ?? 'unknown'}): ${run.unknown} unknown event${run.unknown === 1 ? '' : 's'} (${run.unknownTypes.join(', ')})`
 }
 
 /** Re-yields a step's chunks after text already streamed at index 0 (block indexes shifted by one). */
