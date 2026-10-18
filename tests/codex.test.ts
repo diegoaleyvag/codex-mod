@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -90,6 +90,10 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-app-drift': 'codex-mod:codex',
   'agent-exec-note': 'codex-mod:codex',
   'agent-app-plain-steer': 'codex-mod:codex',
+  'agent-app-deliver': 'codex-mod:codex',
+  'agent-exec-deliver': 'codex-mod:codex',
+  'agent-api-deliver': 'codex-mod:codex',
+  'agent-peer-ignored': 'codex-mod:codex',
 }
 
 type Spawned = { argv: readonly string[]; input?: string; cwd?: string; env?: Record<string, string> }
@@ -1095,6 +1099,119 @@ test('the coordinator framing is stripped: Codex gets the message body only', as
   expect(stripCoordinator('The coordinator sent a message while you were working:\nbody only')).toBe('body only')
 })
 
+// A coordinator's mid-run SendMessage as the engine renders it (codex-cli 2.1.299 transcript, row
+// `attachment` of type `queued_command`): a reminder block with an id on both tags.
+const DELIVERED = (text: string, id = 'ce76432e300b552c', address = true) =>
+  `<system-reminder id="${id}">\nThe coordinator sent a message while you were working:\n${text}\n${address ? '\nAddress this before completing your current task.\n' : ''}</system-reminder id="${id}">`
+const PEER = '<system-reminder id="p1">\nAnother Claude session sent a message while you were working:\nhello from a peer\n</system-reminder id="p1">'
+const PLUGIN = '<system-reminder id="p2">\nThe loop plugin sent a message while you were working:\ntick\n</system-reminder id="p2">'
+
+test('coordinator delivery rendered as a reminder block is a message in the API form, in either placement; peers and plugins are not', async () => {
+  expect(coordinatorPayload(DELIVERED('do X'))).toBe('do X')
+  expect(coordinatorPayload(DELIVERED('do X', 'z', false))).toBe('do X')
+  expect(coordinatorPayload(`<system-reminder>\nunrelated\n</system-reminder>\n${DELIVERED('two\nlines')}`)).toBe('two\nlines')
+  expect(coordinatorPayload(PEER)).toBe(undefined)
+  expect(coordinatorPayload(PLUGIN)).toBe(undefined)
+  expect(coordinatorPayload('The coordinator sent a message while you were working:\nbare')).toBe(undefined)
+  expect(cleanText(PEER)).toBe('')
+  // placement 1: the block beside the tool_result blocks of the same user message
+  const same = itemsFromApi([
+    { role: 'user', content: [{ type: 'text', text: 'first' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }, { type: 'text', text: DELIVERED('also lint') }] },
+  ])
+  const r1 = readConversation(same)
+  expect(r1.latest).toEqual({ text: 'also lint', count: 2 })
+  expect(r1.textAfterResults).toBe(true)
+  // placement 2: its own meta user message; seen again on a later step it keeps its count
+  const own = [
+    ...same.slice(0, 3),
+    { role: 'user' as const, kind: 'text' as const, text: DELIVERED('also lint', 'q', false) },
+    { role: 'assistant' as const, kind: 'use' as const, id: 'b', tool: 'Bash' },
+    { role: 'user' as const, kind: 'result' as const, id: 'b', text: 'ok', isError: false },
+  ]
+  expect(readConversation(own.slice(0, 4)).latest).toEqual({ text: 'also lint', count: 2 })
+  expect(readConversation(own).latest).toEqual({ text: 'also lint', count: 2 })
+  expect(readConversation(own).textAfterResults).toBe(false)
+  // a peer's or a plugin's delivery is engine prose: a nudge, never a task
+  const peer = readConversation([...same.slice(0, 3), { role: 'user', kind: 'text', text: PEER }, { role: 'user', kind: 'text', text: PLUGIN }])
+  expect(peer.latest).toEqual({ text: 'first', count: 1 })
+  expect(peer.nudged).toBe(true)
+})
+
+test('exec: a delivery in the API form (beside the tool results) is a follow-up; a peer\'s message is not', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const w = world(on, { messages: () => conv, pieces: [THREAD('t-14'), cmdDone('/bin/zsh -lc make'), cmdDone('/bin/zsh -lc lint'), MESSAGE('built')] })
+  await step($, 'agent-api-deliver', 0)
+  conv = [...conv, { role: 'user', text: PEER, toolUses: [], toolResults: [{ tool_use_id: 'toolu_codexmod_d1', text: 'ok', isError: false }] }]
+  await step($, 'agent-api-deliver', 1)
+  expect(w.logs.some(l => l.includes('follow-up received mid-run'))).toBe(false)
+  conv = [...conv, { role: 'user', text: DELIVERED('also lint'), toolUses: [], toolResults: [{ tool_use_id: 'toolu_codexmod_d2', text: 'ok', isError: false }] }]
+  const s3 = await step($, 'agent-api-deliver', 2)
+  expect(w.logs.some(l => l.includes('follow-up received mid-run'))).toBe(true)
+  expect(handback(s3.result).split('\n\n').slice(0, 2)).toEqual([steerNote('queued'), 'built'])
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  await step($, 'agent-api-deliver', 3)
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawned[1]!.argv.slice(1, 3)).toEqual(['exec', 'resume'])
+  expect(w.spawned[1]!.input).toBe('also lint')
+})
+
+// The row the engine appends for that delivery, as `session.append` carries it (the kit puts the pinned fields back).
+const deliveryRow = (agentId: string, uuid: string, text: string) => ({
+  message: { type: 'attachment' as const, name: 'queued_command', role: 'user' as const, isMeta: true as const, content: [{ type: 'text', text: DELIVERED(text) }] },
+  door: 'attachment' as const,
+  origin: { kind: 'coordinator' as const },
+  uuid,
+  agentId,
+})
+
+test('exec: a coordinator delivery appended as an attachment (not in the API form) is taken at the next step, queued, and runs after the handback once', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const w = world(on, { messages: () => conv, pieces: [THREAD('t-15'), cmdDone('/bin/zsh -lc make'), cmdDone('/bin/zsh -lc lint'), MESSAGE('built')] })
+  await step($, 'agent-exec-deliver', 0)
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e1')]
+  await $.session.append(deliveryRow('agent-exec-deliver', 'row-1', 'also lint'))
+  await $.session.append(deliveryRow('agent-other', 'row-2', 'not for us'))
+  expect(w.logs.some(l => l.includes('coordinator message delivered mid-run (attachment queued_command, row row-1)'))).toBe(true)
+  const s2 = await step($, 'agent-exec-deliver', 1)
+  expect(s2.chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual([steerNote('queued')])
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e2')]
+  const s3 = await step($, 'agent-exec-deliver', 2)
+  expect(handback(s3.result).startsWith('built\n\n')).toBe(true)
+  expect(w.store.get('agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, followUps: [{ text: 'also lint', count: 1, uuid: 'row-1' }] })
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  const s4 = await step($, 'agent-exec-deliver', 3)
+  expect(w.spawned.length).toBe(2)
+  expect(w.spawned[1]!.argv.slice(1, 3)).toEqual(['exec', 'resume'])
+  expect(w.spawned[1]!.input).toBe('also lint')
+  expect(s4.result.toolUses[0]!.name).toBe('Bash')
+  // the transcript's task stays the record's: after this run the first message is not new again
+  expect(w.store.get('agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, launchKey: '1:row-1:also lint' })
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e3')]
+  const s5 = await step($, 'agent-exec-deliver', 4)
+  expect(s5.result.toolUses[0]!.name).toBe('Bash')
+  conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e4')]
+  const s6 = await step($, 'agent-exec-deliver', 5)
+  expect(s6.result.toolUses[0]!.name).toBe('SubagentHandback')
+  expect(handback(s6.result)).not.toContain('↪')
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb2')]
+  const s7 = await step($, 'agent-exec-deliver', 6)
+  expect(s7.result.stopReason).toBe('end_turn')
+  expect(w.spawned.length).toBe(2)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('a delivery to an agent that is not ours is forgotten when its turn ends', async ($, on) => {
+  const w = world(on)
+  on('turn.complete', () => ({ text: '' }))
+  await step($, 'agent-gp')
+  await $.session.append(deliveryRow('agent-gp', 'row-9', 'for the model'))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'turn-1', agentId: 'agent-gp', reason: 'end_turn' } as any)
+  expect(w.modelCalls).toEqual(['agent-gp'])
+  expect(w.spawned.length).toBe(0)
+})
+
 // ---- options ----------------------------------------------------------------
 
 test('timeoutMinutes: a run past its time is stopped and reported as "codex failed: timeout"', { timeoutMs: 15000, options: { timeoutMinutes: 1 } }, async ($, on) => {
@@ -1737,6 +1854,31 @@ test('app-server, nativeActions off: the accepted steer\'s note streams as text;
   expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
   expect(handback(result).startsWith('done\n\n')).toBe(true)
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 1 action')
+})
+
+test('app-server: a coordinator delivery appended as an attachment mid-step is steered within that step; the first message is not relaunched', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {
+  let conv: any[] = [user('long task')]
+  let w: ReturnType<typeof appWorld>
+  const steered = () => w.writes.some(x => x.path.endsWith('/steer-000001-row-7.json'))
+  w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-70'), TURN('tu-1'), steered, out('{"type":"codexmod.steer","id":"000001-row-7","status":"accepted"}'), MESSAGE('steered, done'), USAGE] })
+  const pending = step($, 'agent-app-deliver', 0)
+  await new Promise<void>(r => setTimeout(r, 60))
+  await $.session.append(deliveryRow('agent-app-deliver', 'row-7', 'codex-effort: high\nchange of plan'))
+  const { result } = await pending
+  const control = w.spawned[0]!.argv.at(-1)!
+  expect(w.writes).toEqual([{ path: `${control}/steer-000001-row-7.json`, text: JSON.stringify({ text: 'change of plan' }) }])
+  expect(handback(result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted', 'change of plan'), 'steered, done'])
+  expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
+  expect(w.store.get('agent:sess-1:agent-app-deliver')).toMatchObject({ lastTask: 'long task', userCount: 1, launchKey: '1:codex-effort: high\nchange of plan' })
+  expect((w.store.get('agent:sess-1:agent-app-deliver') as any).followUps).toBe(undefined)
+  // the handback's result ends the turn; nothing launches again
+  conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
+  const s2 = await step($, 'agent-app-deliver', 1)
+  expect(s2.result.stopReason).toBe('end_turn')
+  conv = [...conv, said('x'), meta(LIVE_NO_OUTPUT)]
+  await step($, 'agent-app-deliver', 2)
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
 })
 
 test('app-server kill: a stopped agent\'s run is asked to stop (interrupt file) and read to its end', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {

@@ -58,6 +58,13 @@
 // accepted steer counts as that message's launch, a rejected one (or one never
 // acked) runs after the handback, as an exec follow-up does. Messages are
 // looked for at each step and, while a step waits on the runner, every 2 s.
+// A coordinator's SendMessage into a running turn is no user row: the engine
+// appends it as a `queued_command` attachment rendered as a reminder block
+// ("The coordinator sent a message while you were working: ...") and promotes
+// it to a system turn, so `$.session.messages` never shows it. The
+// `session.append` hook records those deliveries per agent (in memory) and the
+// next look for messages takes them; a delivery that does reach the API form
+// as a user text block (bare or wrapped) is read there as a message instead.
 // What became of a mid-run message is shown as a `↪` note: a text line in the
 // run's queue (before the next step's calls, or streamed when nativeActions is
 // off), never in place of Codex's own final answer, which it precedes.
@@ -117,7 +124,9 @@ const FALLBACK_MODEL = 'gpt-6.1-sol'
 const FALLBACK_EFFORT = 'medium'
 const SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access']
 const OVERRIDE = /^\s*codex-(model|effort):[ \t]*(\S+)[ \t]*\n/i
-const REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+// A reminder block; an attachment's rendering puts an id on BOTH tags (`<system-reminder id="x">...</system-reminder id="x">`).
+const REMINDER = /<system-reminder(?:\s[^>]*)?>[\s\S]*?<\/system-reminder(?:\s[^>]*)?>/g
+const REMINDER_WRAP = /^<system-reminder(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/system-reminder(?:\s[^>]*)?>$/
 // A compaction summary or continuation notice standing as the newest user row.
 const COMPACTION = /^\s*This session is being continued from a previous conversation|<\/?compact[-_]summary>/i
 // The engine's framing of a message the coordinator sent mid-run.
@@ -360,8 +369,13 @@ export type AgentRecord = Profile & {
   updatedAt: number
 }
 
-/** A user message folded in mid-run: its text and the conversation's genuine message count when it came. */
-export type FollowUp = { text: string; count: number }
+/**
+ * A user message folded in mid-run: its text and the conversation's genuine
+ * message count when it came. A coordinator delivery the transcript carries as
+ * an attachment, not a user row (see `deliveries`), also has the row's `uuid`
+ * and shares the count of the message it interrupted.
+ */
+export type FollowUp = { text: string; count: number; uuid?: string }
 
 export type FileChange = { path: string; kind: string }
 
@@ -455,6 +469,22 @@ export function parseCodexLine(line: string): CodexEvent {
 export function stripCoordinator(text: string): string {
   const m = COORDINATOR.exec(text)
   return m ? m[1]!.trim() : text
+}
+
+/**
+ * The coordinator's message when `text` holds the engine's delivery of one
+ * sent mid-run as a reminder block (an attachment's rendering, alone or among
+ * other blocks); undefined for anything else, a peer session's or a plugin's
+ * "sent a message while you were working" included. A bare delivery (no
+ * wrapper) is `cleanText`'s to unwrap.
+ */
+export function coordinatorPayload(text: string): string | undefined {
+  for (const block of text.match(REMINDER) ?? []) {
+    const inner = REMINDER_WRAP.exec(block.trim())?.[1] ?? ''
+    const m = COORDINATOR.exec(inner)
+    if (m) return m[1]!.trim()
+  }
+  return undefined
 }
 
 /** Drops engine notice lines (`[handback-send-enforce] ...`, `[Your previous response ...]`) from both edges. */
@@ -566,7 +596,8 @@ export function readConversation(items: readonly ConvItem[]): Reading {
       enforce = true
     }
     else if (HANDBACK_MENTION.test(it.text)) signal = 'tool'
-    const text = cleanText(it.text)
+    // a coordinator's delivery rendered as a reminder block is a message, not engine prose
+    const text = coordinatorPayload(it.text) ?? cleanText(it.text)
     if (text === '') {
       if (sawAssistant) nudged = true
       continue
@@ -1056,6 +1087,13 @@ const known = new Map<string, string | undefined>()
 const records = new Map<string, AgentRecord>()
 // agentId -> the active Codex run.
 const runs = new Map<string, Run>()
+// agentId -> coordinator messages delivered mid-run that the transcript keeps
+// as attachments (door `attachment`, a `queued_command` rendered as a reminder
+// block, role system), which `$.session.messages` does not carry as user rows:
+// `session.append` records them here, the next look for messages takes them.
+// In memory only: a hooks-worker restart loses one not taken yet.
+const deliveries = new Map<string, { uuid: string; text: string }[]>()
+const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
 const answers = new Map<string, { agentId: string; tool: string; result: Record<string, unknown> }>()
 let seq = 0
@@ -1160,6 +1198,24 @@ export const register: Register = (on, options) => {
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
   }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
 
+  // A coordinator's message delivered into an agent's running turn is an
+  // attachment row (`queued_command`), promoted to a system turn in the
+  // request, so the conversation read never shows it: it is recorded here, as
+  // the row is appended, for the next look for messages. Always relayed as is.
+  on('session.append', async ($, e, next) => {
+    // only the doors a delivery comes in by: a prompt row the API form carries is read there
+    if (e.agentId !== undefined && (e.door === 'attachment' || e.door === 'delivery')) {
+      const text = coordinatorPayload(rowText(e.message.content))
+      if (text !== undefined && text !== '') {
+        const list = deliveries.get(e.agentId) ?? []
+        if (!list.some(d => d.uuid === e.uuid)) list.push({ uuid: e.uuid, text })
+        deliveries.set(e.agentId, list.slice(-MAX_DELIVERIES))
+        $.ui.log(`codex-mod: agent ${e.agentId}: coordinator message delivered mid-run (${e.door}${e.message.name ? ` ${e.message.name}` : ''}, row ${e.uuid})`, { to: 'debug' })
+      }
+    }
+    return next(e)
+  }).catch(($, e, next) => (next.called ? next(e) : next(e)))
+
   // A turn that ends while its Codex run is still active (interrupted, an
   // error, maxTurns reached) kills the child.
   on('turn.complete', async ($, e, next) => {
@@ -1168,6 +1224,8 @@ export const register: Register = (on, options) => {
       $.ui.log(`codex-mod: agent ${run.agentId} turn ended (${e.reason}) while Codex ran; killing it`, { to: 'debug' })
       await stopRun($, run)
     }
+    // deliveries to an agent that is not ours are nobody's
+    if (e.agentId !== undefined && known.has(e.agentId) && known.get(e.agentId) === undefined) deliveries.delete(e.agentId)
     return next(e)
   })
 
@@ -1427,6 +1485,28 @@ async function conversation($: EngineInterface, agentId: string): Promise<{ item
 const followUpsOf = (rec: AgentRecord | undefined): FollowUp[] =>
   (rec?.followUps ?? []).map(f => (typeof f === 'string' ? { text: f, count: rec?.userCount ?? 0 } : f))
 
+/** The text of a row's blocks: API text blocks, or an attachment's recorded rendering (`{ content }`). */
+const rowText = (content: unknown): string =>
+  typeof content === 'string' ? content : Array.isArray(content) ? content.map(b => (typeof b?.text === 'string' ? b.text : typeof b?.content === 'string' ? b.content : '')).join('\n') : ''
+
+/**
+ * The coordinator deliveries recorded for the agent, taken (each once) as
+ * follow-ups under `count`, the count of the message they interrupted; one
+ * whose text the transcript shows as the newest message anyway is dropped.
+ */
+function takeDeliveries(agentId: string, count: number, shown?: string): FollowUp[] {
+  const list = deliveries.get(agentId)
+  if (list === undefined || list.length === 0) return []
+  deliveries.delete(agentId)
+  return list.filter(d => d.text !== shown).map(d => ({ text: d.text, count, uuid: d.uuid }))
+}
+
+/** Two follow-ups are the same message: by row for a delivery, by count for a transcript message. */
+const sameFollowUp = (a: FollowUp) => (b: FollowUp) => (a.uuid !== undefined || b.uuid !== undefined ? a.uuid === b.uuid : a.count === b.count)
+
+/** The file id of a steer: the message count, zero-padded so the runner's name order is arrival order; a delivery adds its row id. */
+const steerFileId = (f: FollowUp) => (f.uuid === undefined ? steerId(f.count) : `${steerId(f.count)}-${f.uuid.replace(/[^A-Za-z0-9_-]/g, '_')}`)
+
 // ---- records ---------------------------------------------------------------
 
 async function sessionId($: EngineInterface): Promise<string> {
@@ -1533,6 +1613,12 @@ async function* answerWithCodex(
   const rec = await loadRecord($, agentId)
   if (rec !== undefined) {
     rec.followUps = followUpsOf(rec)
+    // a coordinator delivery that came after the run ended runs as a follow-up
+    const arrived = takeDeliveries(agentId, rd.latest?.count ?? rec.userCount ?? 0, rd.latest?.text).filter(d => !rec.followUps!.some(sameFollowUp(d)))
+    if (arrived.length > 0) {
+      rec.followUps.push(...arrived)
+      await saveRecord($, agentId, rec)
+    }
     if (rec.followUps.length === 0) rec.followUps = undefined
     // the latest signal wins; an enforce nudge makes it the tool until the engine says otherwise
     if (rd.signal !== undefined && rec.handbackLock !== rd.signal) {
@@ -1559,7 +1645,7 @@ async function* answerWithCodex(
     const queued = rec?.handedBack ? rec.followUps?.shift() : undefined
     if (queued !== undefined && rec !== undefined) {
       if (rec.followUps?.length === 0) rec.followUps = undefined
-      return yield* startRun($, e, signal, config, name, rec, queued.text, handback, queued.count)
+      return yield* startRun($, e, signal, config, name, rec, queued.text, handback, queued.count, undefined, queued.uuid)
     }
     if (rec?.handedBack || rd.results.some(r => r.tool === HANDBACK_TOOL) || !lostAction) {
       if (rec?.handedBack) {
@@ -1589,7 +1675,7 @@ async function* answerWithCodex(
     const base = fallback()
     // a queued follow-up that is this very message runs now, not again later
     if (base.followUps !== undefined) {
-      base.followUps = base.followUps.filter(f => f.count !== latest.count)
+      base.followUps = base.followUps.filter(f => f.uuid !== undefined || f.count !== latest.count)
       if (base.followUps.length === 0) base.followUps = undefined
     }
     return yield* startRun($, e, signal, config, name, base, latest.text, handback, latest.count)
@@ -1646,25 +1732,39 @@ async function noteFollowUp($: EngineInterface, run: Run): Promise<void> {
   const conv = await conversation($, run.agentId).catch(() => undefined)
   if (conv === undefined) return
   const latest = readConversation(conv.items).latest
-  if (latest === undefined || isCompactionText(latest.text)) return
   const rec = records.get(run.agentId)
-  const seen = rec?.userCount
-  if (seen !== undefined ? latest.count <= seen : latest.text === rec?.lastTask) return
-  const same = (f: FollowUp) => f.count === latest.count
-  if (run.followUps.some(same) || run.pendingSteers.some(same) || followUpsOf(rec).some(same)) return
+  const fresh: FollowUp[] = []
+  let shown: string | undefined
+  if (latest !== undefined && !isCompactionText(latest.text)) {
+    const seen = rec?.userCount
+    if (seen !== undefined ? latest.count > seen : latest.text !== rec?.lastTask) {
+      fresh.push(latest)
+      shown = latest.text
+    }
+  }
+  fresh.push(...takeDeliveries(run.agentId, latest?.count ?? rec?.userCount ?? 0, shown))
+  for (const f of fresh) {
+    const same = sameFollowUp(f)
+    if (run.followUps.some(same) || run.pendingSteers.some(same) || followUpsOf(rec).some(same)) continue
+    await foldIn($, run, f)
+  }
+}
+
+/** Steers one follow-up into an app-server run (a steer file), else keeps it for after the run, with its `↪` note. */
+async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> {
   // override lines cannot change a running turn's model: the rest is steered
-  const text = parseOverrides(latest.text).rest.trim()
+  const text = parseOverrides(f.text).rest.trim()
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
     try {
-      await $.fs.write(`${run.control}/steer-${steerId(latest.count)}.json`, JSON.stringify({ text }))
-      run.pendingSteers.push(latest)
+      await $.fs.write(`${run.control}/steer-${steerFileId(f)}.json`, JSON.stringify({ text }))
+      run.pendingSteers.push(f)
       $.ui.log(`codex-mod: agent ${run.agentId}: message received mid-run; steered into the running turn`, { to: 'debug' })
       return
     } catch (err) {
       $.ui.log(`codex-mod: agent ${run.agentId}: steer not written (${errText(err)}); it runs after this one`, { to: 'debug' })
     }
   }
-  run.followUps.push(latest)
+  run.followUps.push(f)
   if (run.transport !== 'app-server') {
     if (!run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote('queued') })
     run.queuedNoted = true
@@ -1684,12 +1784,16 @@ async function* startRun(
   handback: boolean,
   count: number,
   carry?: string,
+  // the row id of a coordinator delivery: the transcript's newest user message
+  // stays the record's task, so that message is not judged new after this run
+  delivery?: string,
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const agentId = e.agentId!
   await loadCatalog($)
   const list = catalog ?? undefined
   const o = parseOverrides(rawTask)
   const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
+  const lastTask = delivery !== undefined && base.lastTask !== undefined ? base.lastTask : rawTask
   const rec: AgentRecord = {
     ...base,
     agentName: name,
@@ -1697,7 +1801,7 @@ async function* startRun(
     effort: o.effort ?? (base.effort || list?.find(m => m.slug === model)?.defaultEffort || FALLBACK_EFFORT),
     sandbox: base.sandbox,
     thread: base.thread,
-    lastTask: rawTask,
+    lastTask,
     userCount: count,
     handedBack: false,
     handback,
@@ -1709,7 +1813,7 @@ async function* startRun(
   const invalid = checkProfile(list, prof.model, prof.effort)
   if (invalid !== undefined) {
     // nothing runs; the record keeps the last profile that could
-    await saveRecord($, agentId, { ...base, agentName: name, lastTask: rawTask, userCount: count, handedBack: false, handback, redeliveries: 0 })
+    await saveRecord($, agentId, { ...base, agentName: name, lastTask, userCount: count, handedBack: false, handback, redeliveries: 0 })
     const body = [carry, `codex failed: ${invalid}`].filter(Boolean).join('\n\n')
     return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: base.thread }, config.footer), handback)
   }
@@ -1719,7 +1823,7 @@ async function* startRun(
   // trip is kept in the record (a worker restart does not reset it) and that
   // message is never launched again.
   const now = await $.clock.now().catch(() => Date.now())
-  const key = `${count}:${rawTask}`
+  const key = `${count}:${delivery !== undefined ? `${delivery}:` : ''}${rawTask}`
   const recent = (base.launches ?? []).filter(t => now - t < WINDOW_MS)
   const trip =
     base.guardTrip?.key === key ? base.guardTrip.reason
@@ -1985,7 +2089,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
   } else if (ev.kind === 'error') run.errors.push(ev.text)
   else if (ev.kind === 'turn') run.turnId = ev.id
   else if (ev.kind === 'steer') {
-    const i = run.pendingSteers.findIndex(f => String(f.count) === ev.id || steerId(f.count) === ev.id)
+    const i = run.pendingSteers.findIndex(f => (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
     if (i < 0) return
     const [s] = run.pendingSteers.splice(i, 1)
     if (ev.accepted) {
@@ -2243,10 +2347,10 @@ async function* complete(
     const carry = [shown, foot].filter(Boolean).join('\n\n')
     if (streamed !== undefined) {
       // nativeActions off: the stream so far stands; the next run continues it
-      const rest = startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry)
+      const rest = startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry, next.uuid)
       return yield* prefixed(streamed, rest)
     }
-    return yield* startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry)
+    return yield* startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry, next.uuid)
   }
   if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed })
   return yield* handBack($, e, shown, foot, run.handback)
