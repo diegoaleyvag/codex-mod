@@ -1,0 +1,15 @@
+{
+  "name": "codex-mod",
+  "description": "Marketplace for codex-mod: Claude Code subagents answered by the local OpenAI Codex CLI.",
+  "owner": {
+    "name": "Diego Leyva",
+    "url": "https://github.com/diegoaleyvag"
+  },
+  "plugins": [
+    {
+      "name": "codex-mod",
+      "source": "./",
+      "description": "Subagent types codex-mod:codex, sol, sol-high and astra-audit answered by the local OpenAI Codex CLI."
+    }
+  ]
+}

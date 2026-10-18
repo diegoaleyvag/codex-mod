@@ -1,0 +1,147 @@
+{
+  "name": "codex-mod",
+  "version": "1.0.0",
+  "description": "Subagent types codex-mod:codex, sol, sol-high and astra-audit answered by the local OpenAI Codex CLI (codex exec) instead of an Anthropic model.",
+  "author": {
+    "name": "Diego Leyva",
+    "url": "https://github.com/diegoaleyvag"
+  },
+  "homepage": "https://github.com/diegoaleyvag/codex-mod",
+  "repository": "https://github.com/diegoaleyvag/codex-mod",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "openai",
+    "subagent",
+    "mod"
+  ],
+  "userConfig": {
+    "codexPath": {
+      "type": "string",
+      "title": "Codex binary",
+      "description": "Absolute path of the codex executable. Empty: found on PATH, then in common install locations.",
+      "default": ""
+    },
+    "defaultModel": {
+      "type": "string",
+      "title": "Default model (codex agent)",
+      "description": "Model of the generic codex-mod:codex agent. Empty: the first model Codex lists.",
+      "default": ""
+    },
+    "defaultEffort": {
+      "type": "string",
+      "title": "Default reasoning effort (codex agent)",
+      "description": "Reasoning effort of the generic codex-mod:codex agent; must be one the model supports.",
+      "default": "medium"
+    },
+    "defaultSandbox": {
+      "type": "string",
+      "title": "Default sandbox (codex agent)",
+      "description": "codex exec --sandbox of the generic codex-mod:codex agent.",
+      "default": "workspace-write",
+      "options": [
+        "read-only",
+        "workspace-write",
+        "danger-full-access"
+      ]
+    },
+    "roles": {
+      "type": "string",
+      "title": "Role agents",
+      "description": "Which role agents to register besides codex: sol, sol-high, astra-audit.",
+      "multiple": true,
+      "default": [
+        "sol",
+        "sol-high",
+        "astra-audit"
+      ]
+    },
+    "lean": {
+      "type": "boolean",
+      "title": "Lean Codex launches",
+      "description": "Turn off Codex plugins, apps, skills instructions, web search, multi-agent and the MCP servers of the Codex config for each launch (about half the input tokens per model call).",
+      "default": true
+    },
+    "globalRules": {
+      "type": "boolean",
+      "title": "Load global Codex rules",
+      "description": "Off (experimental): run Codex with a plugin-owned CODEX_HOME that links only auth.json, config.toml and models_cache.json, so the user-level AGENTS.md is not loaded.",
+      "default": true
+    },
+    "extraConfig": {
+      "type": "string",
+      "title": "Extra Codex config",
+      "description": "Advanced: raw key=value overrides passed as -c to every launch (model, model_reasoning_effort and sandbox_mode are refused).",
+      "multiple": true,
+      "default": []
+    },
+    "handbackMode": {
+      "type": "string",
+      "title": "Handback mode",
+      "description": "How the final answer reaches the caller: auto (SubagentHandback by default; plain text only after the tool answers that it is not active for the agent), tool, or text.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "tool",
+        "text"
+      ]
+    },
+    "footer": {
+      "type": "string",
+      "title": "Footer",
+      "description": "The line after each answer: full (agent, model, effort, sandbox, actions, Codex tokens, thread), short (agent, model, effort) or off.",
+      "default": "full",
+      "options": [
+        "full",
+        "short",
+        "off"
+      ]
+    },
+    "nativeActions": {
+      "type": "boolean",
+      "title": "Native action rows",
+      "description": "Show Codex's commands and file changes as Bash/Edit/Write rows (never executed). Off: plain text lines in one step.",
+      "default": true
+    },
+    "progressIntervalMs": {
+      "type": "number",
+      "title": "Progress interval (ms)",
+      "description": "At most one action step per interval (0 to 60000).",
+      "default": 1000,
+      "min": 0,
+      "max": 60000
+    },
+    "maxActionsPerStep": {
+      "type": "number",
+      "title": "Actions per step",
+      "description": "The most Codex actions shown in one step (1 to 50).",
+      "default": 10,
+      "min": 1,
+      "max": 50
+    },
+    "timeoutMinutes": {
+      "type": "number",
+      "title": "Run timeout (minutes)",
+      "description": "Stop a Codex run after this many minutes and report codex failed: timeout. 0: no timeout.",
+      "default": 0,
+      "min": 0,
+      "max": 1440
+    },
+    "maxRunsPerWindow": {
+      "type": "number",
+      "title": "Launch guard (runs per 10 min)",
+      "description": "The most Codex launches per agent in 10 minutes (1 to 100); beyond it the agent hands back codex failed: launch guard tripped. A message never gets more than one launch.",
+      "default": 3,
+      "min": 1,
+      "max": 100
+    },
+    "pruneDays": {
+      "type": "number",
+      "title": "Keep agent records (days)",
+      "description": "Agent records (thread, model, effort) not used for this many days are deleted (1 to 365).",
+      "default": 2,
+      "min": 1,
+      "max": 365
+    }
+  }
+}
