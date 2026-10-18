@@ -8,6 +8,9 @@
 
 ### Added
 
+- Codex reasoning summaries as best-effort live thinking, completed web searches as guarded WebSearch rows, and MCP/dynamic tool results and plan updates as display-only `codex_tool`/`codex_plan` rows. All new rows are counted in the footer and degrade to text with `nativeActions: false`.
+- App-server commentary between rows, proposed plan text, and notes for Codex agent activity, context compaction, review mode, sleep and image generation. Raw reasoning is never shown; the final answer still uses the handback.
+
 - Project roles in `.claude/codex-mod.json`, loaded at session start, with validated profiles, descriptions and optional role instructions prepended to every Codex task and live steer.
 - `projectRoles` (default `true`) to enable project role loading and `allowProjectFullAccess` (default `false`) as the user-level opt-in for repository-declared `danger-full-access` roles.
 

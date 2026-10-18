@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -107,6 +107,8 @@ type Piece = { stream: 'stdout' | 'stderr'; text: string }
 type WorldOpts = {
   /** `$.agent.list` rejects. */
   listThrows?: boolean
+  /** Full registered tool names are chosen by the host. */
+  toolNamespace?: string
   stdout?: string
   stderr?: string
   code?: number
@@ -154,6 +156,11 @@ function world(on: On, opts: WorldOpts = {}) {
   const checks: { tool: string; agentId?: string }[] = []
   // every `$.fs.write`, in order (steer and interrupt files of app-server runs)
   const writes: { path: string; text: string }[] = []
+  const toolSpecs: any[] = []
+  on('tool.register', (_$, e: any) => {
+    toolSpecs.push(e)
+    return { value: { tool: `mcp__${opts.toolNamespace ?? 'codex-mod'}__${e.name}` } }
+  })
   on('fs.write', (_$, e: any) => {
     writes.push({ path: e.path, text: e.text })
     return { value: undefined }
@@ -248,7 +255,7 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, reads, location }
+  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, reads, location, toolSpecs }
 }
 
 /** A SessionMessage-shaped test row in the Messages API form. */
@@ -927,7 +934,19 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
-  expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan'])
+  expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
+  expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
+  expect(w.toolSpecs[1].inputSchema.properties.steps.items.properties.status.enum).toEqual(['pending', 'in_progress', 'completed'])
+  // The host spreads arguments beside its envelope fields, so both schemas
+  // must keep these keys out of their top-level inputs.
+  const envelopeKeys = ['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent', 'input', 'ceiling']
+  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps']])
+  for (const spec of w.toolSpecs) {
+    expect(spec.inputSchema.additionalProperties).toBe(false)
+    expect(Object.keys(spec.inputSchema.properties).some(key => envelopeKeys.includes(key))).toBe(false)
+  }
   expect(registered[0].description).toContain('gpt-6.1-sol (low|medium|high|xhigh|max|ultra), gpt-6-luna (low|medium|high|xhigh|max)')
   expect(registered[0].description).not.toContain('gpt-hidden')
   expect(registered[1].description).toContain('Bounded implementation. Runs OpenAI Codex gpt-6.1-sol at medium reasoning in a workspace-write sandbox (declared by this project). Start the prompt')
@@ -2151,12 +2170,18 @@ test('app-server mid-step: while a step waits on the runner, a new message is st
 test('app-server, nativeActions off: the accepted steer\'s note streams as text; the handback keeps Codex\'s answer', { timeoutMs: 15000, options: { transport: 'app-server', nativeActions: false } }, async ($, on) => {
   let conv: any[] = [user('long task')]
   let w: ReturnType<typeof appWorld>
-  const steered = () => w.writes.some(x => x.path.endsWith('/steer-000002.json'))
+  let delivered = false
+  const steered = () => {
+    // Deliver only after the fake child reaches its wait: a wall-clock delay
+    // can otherwise replace the initial task before the hook has read it.
+    if (!delivered) {
+      delivered = true
+      conv = [...conv, user('codex-model: gpt-6-astra\nchange of plan, use the other parser')]
+    }
+    return w.writes.some(x => x.path.endsWith('/steer-000002.json'))
+  }
   w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-69'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), steered, ACK(2, 'accepted'), MESSAGE('done'), USAGE] })
-  const pending = step($, 'agent-app-plain-steer', 0)
-  await new Promise<void>(r => setTimeout(r, 60))
-  conv = [...conv, user('codex-model: gpt-6-astra\nchange of plan, use the other parser')]
-  const { chunks, result } = await pending
+  const { chunks, result } = await step($, 'agent-app-plain-steer', 0)
   expect(chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual(['$ make', `\n\n${steerNote('accepted', 'change of plan, use the other parser')}`])
   expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
   expect(handback(result).startsWith('done\n\n')).toBe(true)
@@ -2243,4 +2268,230 @@ test('session start prunes app-server control dirs older than pruneDays', async 
   on('fs.stat', (_$, e: any) => ({ value: { kind: 'dir' as const, size: 0, isLink: false, mtimeMs: e.path.endsWith('/old') ? 1_000_000 - 3 * 86_400_000 : 1_000_000 - 1000 } }))
   await startSession($)
   expect(removed).toEqual([`${runs}/old`])
+})
+
+// ---- Phase 3 item rendering and display-only guards ------------------------
+
+const itemLine = (item: Record<string, unknown>, type = 'item.completed') => JSON.stringify({ type, item })
+const itemPiece = (item: Record<string, unknown>, type = 'item.completed') => out(itemLine(item, type))
+const webItem = { type: 'web_search', query: 'example docs', action: { type: 'search', query: 'example docs' }, results: [{ type: 'text_result', title: 'Example docs', url: 'https://example.test/docs', snippet: 'A reference.' }] }
+const mcpItem = { type: 'mcp_tool_call', server: 'docs', tool: 'lookup', arguments: { topic: 'options' }, result: { content: [{ type: 'text', text: 'Found options.' }] }, error: null, status: 'completed' }
+const planItem = { type: 'plan_update', explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'inProgress' }, { step: 'Report', status: 'pending' }] }
+
+test('phase 3 parser: real-shaped exec lines, repeated id keys, completed searches only', async () => {
+  expect(parseCodexLine('{"type":"item.started","item":{"id":"item_1","type":"web_search","id":"exec-1","query":"","action":{"type":"other"}}}')).toEqual({ kind: 'other' })
+  const event: any = parseCodexLine('{"type":"item.completed","item":{"id":"item_1","type":"web_search","id":"exec-1","query":"example docs","action":{"type":"search","query":"example docs"},"results":[{"type":"text_result","title":"Docs","url":"https://example.test","snippet":"Reference"}]}}')
+  expect(event.kind).toBe('action')
+  expect(event.action.tool).toBe('WebSearch')
+  expect(event.action.input).toEqual({ query: 'example docs' })
+  expect(event.action.result.results[0].content).toEqual([{ title: 'Docs', url: 'https://example.test', snippet: 'Reference' }])
+  for (const [action, query] of [
+    [{ type: 'openPage', url: 'https://example.test' }, 'https://example.test'],
+    [{ type: 'findInPage', pattern: 'flags', url: 'https://example.test' }, 'flags in https://example.test'],
+  ] as const) {
+    const ev: any = parseCodexLine(itemLine({ type: 'web_search', action, query: '', results: { unexpected: true } }))
+    expect(ev.action.input).toEqual({ query })
+    expect(ev.action.result.results).toEqual(['Searched by Codex'])
+  }
+  const encoded: any = parseCodexLine(itemLine({ ...webItem, results: JSON.stringify(webItem.results) }))
+  expect(encoded.action.result.results[0].content[0].title).toBe('Example docs')
+})
+
+test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, plans and notes', async () => {
+  expect(parseCodexLine(itemLine({ type: 'reasoning', text: 'Check evidence.', content: ['PRIVATE'] }))).toEqual({ kind: 'thinking', text: 'Check evidence.' })
+  expect(parseCodexLine(itemLine({ type: 'reasoning', summary: ['Public summary'], content: ['PRIVATE'] }))).toEqual({ kind: 'thinking', text: 'Public summary' })
+  expect(parseCodexLine(itemLine({ type: 'reasoning', content: ['PRIVATE'] }))).toEqual({ kind: 'other' })
+  expect(parseCodexLine(itemLine({ type: 'reasoning', summary: [], text: 'PRIVATE' }))).toEqual({ kind: 'other' })
+  expect(parseCodexLine(itemLine(mcpItem))).toMatchObject({ kind: 'action', display: 'codex_tool', action: { input: { server: 'docs', name: 'lookup', arguments: { topic: 'options' } }, result: { content: [{ type: 'text', text: 'Found options.' }], is_error: false } } })
+  expect(parseCodexLine(itemLine({ ...mcpItem, status: 'failed', result: null, error: { message: 'Unavailable' } }))).toMatchObject({ action: { isError: true, result: { content: [{ type: 'text', text: 'Unavailable' }], is_error: true } } })
+  expect(parseCodexLine(itemLine({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: [1], success: false, content_items: [{ type: 'inputText', text: 'Failed' }, { type: 'inputImage', imageUrl: 'PRIVATE_IMAGE' }] }))).toMatchObject({ display: 'codex_tool', action: { input: { server: 'local', name: 'inspect', arguments: [1] }, isError: true, result: { content: [{ type: 'text', text: 'Failed' }], is_error: true } } })
+  for (const type of ['item.started', 'item.updated', 'item.completed']) {
+    expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type))).toMatchObject({ display: 'codex_plan', action: { input: { steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] } } })
+  }
+  expect(parseCodexLine(itemLine(planItem, 'item.updated'))).toMatchObject({ display: 'codex_plan', action: { input: { explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] } } })
+  expect(parseCodexLine(itemLine({ type: 'proposed_plan', text: 'Do the work.' }))).toEqual({ kind: 'interim', text: 'Proposed plan:\nDo the work.' })
+  expect(parseCodexLine(itemLine({ type: 'note', text: 'Codex compacted context', dim: true }))).toEqual({ kind: 'note', text: '↪ Codex compacted context', dim: true })
+  expect(parseCodexLine(itemLine({ type: 'agent_message', phase: 'commentary', text: 'Working.' }))).toEqual({ kind: 'interim', text: 'Working.' })
+  expect(parseCodexLine(itemLine({ type: 'agent_message', text: 'Exec answer.' }))).toEqual({ kind: 'message', text: 'Exec answer.' })
+  expect(parseCodexLine(itemLine({ type: 'error', message: 'Configuration notice' }))).toEqual({ kind: 'other' })
+})
+
+test('phase 3 parser: collaboration notes are one line and wait calls disappear', async () => {
+  const spawn = { type: 'collab_tool_call', tool: 'spawn_agent', prompt: 'Inspect tests.\nReport back.', receiver_thread_ids: ['child-1'] }
+  expect(parseCodexLine(itemLine(spawn))).toEqual({ kind: 'note', text: '↪ Codex spawned an agent: Inspect tests. Report back.' })
+  expect(parseCodexLine(itemLine({ ...spawn, tool: 'send_input' }))).toEqual({ kind: 'note', text: '↪ Codex messaged child-1' })
+  expect(parseCodexLine(itemLine({ ...spawn, tool: 'sendMessage' }))).toEqual({ kind: 'note', text: '↪ Codex messaged child-1' })
+  expect(parseCodexLine(itemLine({ ...spawn, tool: 'wait' }))).toEqual({ kind: 'other' })
+})
+
+test('phase 3 steps use returned registered names; own calls are answered and counted, never executed', async ($, on) => {
+  const events = [
+    { type: 'reasoning', text: 'Check the evidence.', content: ['PRIVATE'] },
+    { type: 'agent_message', phase: 'commentary', text: 'Checking sources.' },
+    webItem, mcpItem, planItem,
+    { type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: {}, success: false, content_items: [{ type: 'inputText', text: 'Inspection failed.' }] },
+    { type: 'proposed_plan', text: '1. Verify' },
+    { type: 'collab_tool_call', tool: 'spawn_agent', prompt: 'Inspect\ntests', receiver_thread_ids: ['child-1'] },
+    { type: 'collab_tool_call', tool: 'send_input', receiver_thread_ids: ['child-1'] },
+    { type: 'collab_tool_call', tool: 'wait', receiver_thread_ids: ['child-1'] },
+    { type: 'note', text: 'Codex agent reviewer finished' },
+    { type: 'note', text: 'Codex compacted context', dim: true },
+    { type: 'agent_message', phase: 'final_answer', text: 'Verified.' },
+  ]
+  const w = world(on, { toolNamespace: 'runtime', pieces: [THREAD('phase3'), out(events.map(i => itemLine(i)).join('\n'))] })
+  const registered: any[] = []
+  on('agent.register', (_$, e: any) => {
+    registered.push(e)
+    return { value: { agent: `codex-mod:${e.name}` } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(registered.length).toBe(1)
+  expect(registered[0].tools).toEqual(['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan'])
+  const first = await step($, 'agent-progress')
+  expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
+  expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__codex_tool'])
+  expect(callsOf(first.chunks)[1].input).toEqual({ server: 'docs', name: 'lookup', arguments: { topic: 'options' } })
+  expect(callsOf(first.chunks)[3].input).toEqual({ server: 'local', name: 'inspect', arguments: {} })
+  const results: any[] = await runCalls($, first.chunks, 'agent-progress')
+  expect(results[0].result.results[0].content[0].url).toBe('https://example.test/docs')
+  expect(results[1].result.content).toEqual([{ type: 'text', text: 'Found options.' }])
+  expect(results[2].result.content[0].text).toBe('Plan updated by Codex')
+  expect(results[3]).toMatchObject({ isError: true, result: { is_error: true, content: [{ type: 'text', text: 'Inspection failed.' }] } })
+  const second = await step($, 'agent-progress', 1)
+  const texts = second.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  expect(texts).toContain('Proposed plan:\n1. Verify')
+  expect(texts).toContain('↪ Codex compacted context')
+  expect(handback(second.result)).toContain('Verified.')
+  expect(handback(second.result)).toContain('↪ Codex spawned an agent: Inspect tests')
+  expect(handback(second.result)).toContain('↪ Codex messaged child-1')
+  expect(handback(second.result)).toContain('↪ Codex agent reviewer finished')
+  expect(handback(second.result)).toContain('4 actions')
+  expect(handback(second.result)).not.toContain('Checking sources.')
+  expect(handback(second.result)).not.toContain('Proposed plan:')
+  expect(JSON.stringify([first, second])).not.toContain('PRIVATE')
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+})
+
+test('phase 3 reasoning shares paced action steps and the final step, never creating a step', { options: { progressIntervalMs: 250, maxActionsPerStep: 1 } }, async ($, on) => {
+  const items = [{ type: 'reasoning', text: 'First summary' }, webItem, { type: 'reasoning', text: 'Second summary' }, webItem, { type: 'reasoning', text: 'Final summary' }, { type: 'agent_message', text: 'Done' }]
+  const w = world(on, { pieces: [out(items.map(i => itemLine(i)).join('\n'))] })
+  for (let i = 0; i < 2; i++) {
+    const s = await step($, 'agent-throttle', i)
+    expect(s.chunks[0]).toMatchObject({ kind: 'thinking', text: i === 0 ? 'First summary' : 'Second summary' })
+    expect(callsOf(s.chunks).map(c => c.name)).toEqual(['WebSearch'])
+    await runCalls($, s.chunks, 'agent-throttle')
+  }
+  const final = await step($, 'agent-throttle', 2)
+  expect(final.chunks[0]).toMatchObject({ kind: 'thinking', text: 'Final summary' })
+  expect(callsOf(final.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  expect(w.sleeps).toEqual([250])
+  expect(w.core).toEqual([])
+})
+
+test('phase 3 reasoning and commentary alone finish without manufacturing a final answer', async ($, on) => {
+  world(on, { pieces: [itemPiece({ type: 'reasoning', text: 'Summary' }), itemPiece({ type: 'agent_message', phase: 'commentary', text: 'Still working' })] })
+  const s = await step($, 'agent-progress')
+  expect(s.chunks[0]).toMatchObject({ kind: 'thinking', text: 'Summary' })
+  expect(s.chunks[1]).toMatchObject({ kind: 'text', text: 'Still working' })
+  expect(handback(s.result)).toContain('codex failed: no agent message')
+  expect(handback(s.result)).not.toContain('Still working')
+})
+
+test('phase 3 nativeActions false degrades new items into text in one step', { options: { nativeActions: false, handbackMode: 'text' } }, async ($, on) => {
+  const w = world(on, { pieces: [
+    itemPiece({ type: 'reasoning', text: 'Check evidence', content: ['PRIVATE'] }),
+    itemPiece({ type: 'agent_message', phase: 'commentary', text: 'Working.' }),
+    itemPiece(webItem), itemPiece(mcpItem), itemPiece(planItem),
+    itemPiece({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: {}, success: true, content_items: [] }),
+    itemPiece({ type: 'proposed_plan', text: 'Verify it.' }),
+    itemPiece({ type: 'note', text: 'Codex compacted context', dim: true }), MESSAGE('Done.'),
+  ] })
+  const s = await step($, 'agent-plain')
+  expect(callsOf(s.chunks)).toEqual([])
+  expect(s.chunks.some(c => c.kind === 'thinking')).toBe(false)
+  expect(s.result.answer).toContain('Check evidence')
+  expect(s.result.answer).toContain('Searched by Codex: example docs')
+  expect(s.result.answer).toContain('Codex called docs.lookup')
+  expect(s.result.answer).toContain('Codex called local.inspect')
+  expect(s.result.answer).toContain('Codex updated plan: [completed] Inspect; [in_progress] Test; [pending] Report')
+  expect(s.result.answer).toContain('Proposed plan:\nVerify it.')
+  expect(s.result.answer).toContain('↪ Codex compacted context')
+  expect(s.result.answer).toContain('Done.')
+  expect(s.result.answer).toContain('4 actions')
+  expect(s.result.answer).not.toContain('PRIVATE')
+  expect(w.core).toEqual([])
+})
+
+test('phase 3 safety: WebSearch and registered display tools refuse foreign ids, owners and replay; tool.check always denies', async ($, on) => {
+  const w = world(on, { pieces: [out([webItem, mcpItem, planItem].map(i => itemLine(i)).join('\n')), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  for (const c of callsOf(s.chunks)) {
+    for (const agentId of [undefined, 'agent-gp', 'agent-progress']) {
+      const foreign: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: 'foreign', ...(agentId ? { agentId } : {}) } as any)
+      if (c.name === 'WebSearch' && agentId !== 'agent-progress') continue // other models keep their real search tool
+      expect(foreign.deny).toContain('not executed')
+      const check: any = await $.tool.check({ tool: c.name, input: c.input, tool_use_id: 'foreign', ...(agentId ? { agentId } : {}) } as any)
+      expect(check.decision).toBe('deny')
+    }
+    const stolen: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id } as any)
+    expect(stolen.deny).toContain('not executed')
+    const backstop: any = await $.tool.check({ tool: c.name, input: c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+    expect(backstop.decision).toBe('deny')
+    const own: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+    expect(own.result).toBeDefined()
+    const replay: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+    expect(replay.deny).toContain('not executed')
+  }
+  expect(w.core.map(c => c.tool)).toEqual(['WebSearch', 'WebSearch'])
+  expect(w.checks).toEqual([])
+})
+
+test('phase 3 safety: every guard exception denies, including main-model registered calls', async () => {
+  const guards = new Map<string, { handler: any; catcher: any }>()
+  codexRegister(((name: string, ...args: any[]) => {
+    const entry = { handler: args.at(-1), catcher: undefined as any }
+    guards.set(name, entry)
+    return { catch: (handler: any) => { entry.catcher = handler } }
+  }) as any, {})
+  const $ = { agent: { list: async () => { throw new Error('Cannot resolve agent') } } }
+  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan']) {
+    for (const name of ['tool.call', 'tool.check']) {
+      const guard = guards.get(name)!
+      const e = { tool, agentId: 'unresolved-phase3-agent', tool_use_id: 'foreign' }
+      let reachedNext = false
+      const next: any = () => { reachedNext = true; throw new Error('Must not run') }
+      next.called = false
+      // Simulate an engine timeout/re-entry: the .catch must cover every protected tool.
+      const result = guard.catcher($, e, next)
+      expect(name === 'tool.call' ? result.deny : result.decision).toBe(name === 'tool.call' ? 'codex-mod: not executed' : 'deny')
+      expect(reachedNext).toBe(false)
+      if (!tool.startsWith('mcp__')) {
+        let failed = false
+        try { await guard.handler($, e, next) } catch { failed = true }
+        expect(failed).toBe(true)
+      } else {
+        const main = { tool, tool_use_id: 'foreign' }
+        const denied = guard.catcher($, main, next)
+        expect(name === 'tool.call' ? denied.deny : denied.decision).toBe(name === 'tool.call' ? 'codex-mod: not executed' : 'deny')
+      }
+    }
+  }
+})
+
+test('phase 3 display inputs keep nested arguments out of the host envelope and answer by dispatch name', async ($, on) => {
+  const arguments_ = { tool: 'Bash', tool_use_id: 'foreign', agentId: 'agent-gp', requestMeta: { spoofed: 'yes' }, input: {}, consent: 'spoofed', ceiling: 'allow' }
+  const w = world(on, { pieces: [itemPiece({ ...mcpItem, arguments: arguments_ }), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  const [call] = callsOf(s.chunks)
+  expect(call.input).toEqual({ server: 'docs', name: 'lookup', arguments: arguments_ })
+  const envelope = { tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' }
+  expect(envelope.tool).toBe('mcp__codex-mod__codex_tool')
+  expect(envelope.tool_use_id).toBe(call.id)
+  expect(envelope.agentId).toBe('agent-progress')
+  const [result] = await runCalls($, s.chunks, 'agent-progress')
+  expect(result.result.content).toEqual([{ type: 'text', text: 'Found options.' }])
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
 })

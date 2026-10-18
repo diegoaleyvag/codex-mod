@@ -23,8 +23,8 @@
 // poll up to 10 times, then deleted with a rejected ack.
 //
 // Output (JSONL): exec-compatible `thread.started`, `item.started|completed`
-// (file_change, command_execution, agent_message), `turn.completed` (usage of
-// this turn only), `turn.failed`, `error`; plus runner-only `codexmod.turn`,
+// (including reasoning, web_search, mcp_tool_call, plan_update, proposed_plan
+// and note), `turn.completed` (usage of this turn only), `turn.failed`, `error`; plus runner-only `codexmod.turn`,
 // `codexmod.steer`, `codexmod.protocol` (drift evidence) and `codexmod.fatal`.
 // Exit code: 0 when the turn completed, 1 otherwise. Never writes outside the
 // control dir; never prints credentials.
@@ -58,10 +58,11 @@ const KNOWN_METHODS = new Set([
   'model/safetyBuffering/updated', 'skills/changed', 'app/list/updated', 'remoteControl/status/changed',
   ...OPT_OUT,
 ])
+const DEFERRED_ITEMS = ['userMessage', 'hookPrompt', 'functionCallOutput', 'imageView']
 const KNOWN_ITEMS = new Set([
-  'userMessage', 'hookPrompt', 'agentMessage', 'functionCallOutput', 'plan', 'reasoning', 'commandExecution',
+  ...DEFERRED_ITEMS, 'agentMessage', 'plan', 'reasoning', 'commandExecution',
   'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch',
-  'imageView', 'imageGeneration', 'enteredReviewMode', 'exitedReviewMode', 'contextCompaction', 'sleep',
+  'imageGeneration', 'enteredReviewMode', 'exitedReviewMode', 'contextCompaction', 'sleep',
 ])
 
 // --- output ---------------------------------------------------------------
@@ -156,6 +157,36 @@ function makeControlDir(dir) {
     try {
       chmodSync(d, 0o700)
     } catch {}
+  }
+}
+
+/** Completed items only: started searches and calls do not carry usable results. */
+function completedItem(item, changesOf) {
+  switch (item?.type) {
+    case 'fileChange': return { type: 'file_change', changes: changesOf(item), status: item.status }
+    case 'commandExecution': return { type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? '', exit_code: item.exitCode ?? null }
+    case 'agentMessage': return { type: 'agent_message', text: item.text ?? '', ...(item.phase != null ? { phase: item.phase } : {}) }
+    // Only the public summary crosses the pipe; never reasoning.content.
+    case 'reasoning': return { type: 'reasoning', text: (Array.isArray(item.summary) ? item.summary : []).filter(s => typeof s === 'string').join('\n\n') }
+    case 'webSearch': return { type: 'web_search', query: item.query, action: item.action, results: item.results }
+    case 'mcpToolCall': return { type: 'mcp_tool_call', server: item.server, tool: item.tool, arguments: item.arguments, result: item.result, error: item.error, status: item.status }
+    case 'dynamicToolCall': return { type: 'dynamic_tool_call', namespace: item.namespace, tool: item.tool, arguments: item.arguments, content_items: item.contentItems, success: item.success, status: item.status }
+    case 'plan': return { type: 'proposed_plan', text: item.text }
+    case 'collabAgentToolCall': return { type: 'collab_tool_call', tool: item.tool.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`), receiver_thread_ids: item.receiverThreadIds, prompt: item.prompt, agents_states: item.agentsStates, status: item.status }
+    case 'subAgentActivity': {
+      const agent = String(item.agentPath || item.agentThreadId).replace(/\s+/g, ' ')
+      const text = item.kind === 'completed' ? `Codex agent ${agent} finished`
+        : item.kind === 'interacted' ? `Codex messaged ${agent}`
+        : item.kind === 'interrupted' ? `Codex interrupted agent ${agent}` : `Codex agent ${agent} started`
+      return { type: 'note', text }
+    }
+    case 'contextCompaction': return { type: 'note', text: 'Codex compacted context', dim: true }
+    case 'enteredReviewMode': return { type: 'note', text: 'Codex entered review mode', dim: true }
+    case 'exitedReviewMode': return { type: 'note', text: 'Codex exited review mode', dim: true }
+    case 'sleep': return { type: 'note', text: `Codex slept for ${item.durationMs} ms`, dim: true }
+    case 'imageGeneration': return { type: 'note', text: `Codex image generation: ${item.status}${item.savedPath ? ` (${item.savedPath})` : ''}`, dim: true }
+    // imageView is deliberately deferred; the known-item list still exempts it from drift.
+    default: return undefined
   }
 }
 
@@ -410,17 +441,13 @@ async function main() {
       case 'item/started':
         if (item?.type === 'fileChange') emit({ type: 'item.started', item: { type: 'file_change', changes: changesOf(item) } })
         break
-      case 'item/completed':
-        if (item?.type === 'fileChange') {
-          emit({ type: 'item.completed', item: { type: 'file_change', changes: changesOf(item), status: item.status } })
-        } else if (item?.type === 'commandExecution') {
-          emit({
-            type: 'item.completed',
-            item: { type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? '', exit_code: item.exitCode ?? null },
-          })
-        } else if (item?.type === 'agentMessage') {
-          emit({ type: 'item.completed', item: { type: 'agent_message', text: item.text ?? '' } })
-        }
+      case 'item/completed': {
+        const translated = completedItem(item, changesOf)
+        if (translated) emit({ type: 'item.completed', item: translated })
+        break
+      }
+      case 'turn/plan/updated':
+        emit({ type: 'item.updated', item: { type: 'plan_update', explanation: p.explanation, steps: p.plan } })
         break
       case 'error':
         if (p.willRetry === false) emit({ type: 'error', message: p.error?.message ?? 'error' })

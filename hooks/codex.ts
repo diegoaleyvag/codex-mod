@@ -16,9 +16,10 @@
 //   - those calls are NEVER executed: they carry a tool_use id with the prefix
 //     `toolu_codexmod_`, and this module's `tool.call` hook answers each one
 //     from the result Codex reported without calling `next`, so neither the
-//     permission path nor the tool runs. Any Bash/Edit/Write of a Codex agent
+//     permission path nor the tool runs. Any Bash/Edit/Write/WebSearch of a Codex agent
 //     (or of an agent whose type cannot be resolved) without a stored answer is
-//     refused, the hook's `.catch` refuses when the hook itself fails, and
+//     refused. Registered display tools refuse other callers too. The hook's
+//     `.catch` refuses when the hook itself fails, and
 //     `tool.check` denies such a call should it ever be reached;
 //   - when Codex ends, the step hands the answer back ONCE: as the
 //     `SubagentHandback` call when the conversation mentions the tool or the
@@ -163,8 +164,11 @@ const HANDBACK_TOOL = 'SubagentHandback'
 /** Every tool_use id this module mints starts with it. */
 export const ID_PREFIX = 'toolu_codexmod_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write'] as const
-type NativeTool = (typeof NATIVE_TOOLS)[number]
+export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch'] as const
+type DisplayTool = 'codex_tool' | 'codex_plan'
+const displayTools: Partial<Record<DisplayTool, string>> = {}
+const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan'])
+const dimNotes = new Set<string>()
 export const NOT_EXECUTED = 'codex-mod: not executed'
 // Feature flags a lean launch turns off (`-c features.<name>=false`; an
 // unknown name is ignored by Codex).
@@ -419,6 +423,9 @@ export type FileChange = { path: string; kind: string }
 /** What one `codex exec --json` line means to us. */
 export type CodexEvent =
   | { kind: 'message'; text: string }
+  | { kind: 'thinking' | 'interim'; text: string }
+  | { kind: 'note'; text: string; dim?: true }
+  | { kind: 'action'; action: Action; display?: DisplayTool }
   | { kind: 'thread'; id: string }
   | { kind: 'command'; command: string; output: string; exitCode: number | null }
   | { kind: 'fileStart'; changes: FileChange[] }
@@ -435,7 +442,7 @@ export type CodexEvent =
   | { kind: 'other' }
 
 /** One of Codex's actions as a built-in tool call, and the result it is answered with. */
-export type Action = { tool: NativeTool; input: Record<string, unknown>; result: Record<string, unknown> }
+export type Action = { tool: string; input: Record<string, unknown>; result: Record<string, unknown>; isError?: true }
 
 type Usage = { input: number; cached: number; output: number }
 
@@ -477,7 +484,7 @@ export function parseCodexLine(line: string): CodexEvent {
   const item = ev?.item
   if (ev?.type === 'thread.started' && typeof ev.thread_id === 'string') return { kind: 'thread', id: ev.thread_id }
   if (ev?.type === 'item.completed' && item?.type === 'agent_message' && typeof item.text === 'string') {
-    return { kind: 'message', text: item.text }
+    return { kind: item.phase === 'commentary' ? 'interim' : 'message', text: item.text }
   }
   if (ev?.type === 'item.completed' && item?.type === 'command_execution') {
     return {
@@ -489,6 +496,47 @@ export function parseCodexLine(line: string): CodexEvent {
   }
   if (ev?.type === 'item.started' && item?.type === 'file_change') return { kind: 'fileStart', changes: changesOf(item) }
   if (ev?.type === 'item.completed' && item?.type === 'file_change') return { kind: 'files', changes: changesOf(item) }
+  if (ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'item.updated') {
+    if (item?.type === 'todo_list' || item?.type === 'plan_update') {
+      const steps = item.type === 'todo_list'
+        ? (Array.isArray(item.items) ? item.items : []).map((s: any) => ({ step: String(s?.text ?? ''), status: s?.completed ? 'completed' : 'pending' }))
+        : (Array.isArray(item.steps) ? item.steps : []).map((s: any) => ({ step: String(s?.step ?? ''), status: s?.status === 'inProgress' ? 'in_progress' : ['pending', 'in_progress', 'completed'].includes(s?.status) ? s.status : 'pending' }))
+      const input = { ...(typeof item.explanation === 'string' ? { explanation: item.explanation } : {}), steps }
+      return { kind: 'action', display: 'codex_plan', action: { tool: 'codex_plan', input, result: { content: [{ type: 'text', text: 'Plan updated by Codex' }] } } }
+    }
+  }
+  // Only completed items have reliable queries and tool results. JSON.parse
+  // deliberately accepts exec's repeated id keys; rendering never keys on id.
+  if (ev.type === 'item.completed') {
+    if (item?.type === 'reasoning') {
+      const text = Array.isArray(item.summary) ? item.summary.filter((s: unknown) => typeof s === 'string').join('\n\n') : typeof item.text === 'string' ? item.text : ''
+      return text.trim() ? { kind: 'thinking', text } : { kind: 'other' }
+    }
+    if (item?.type === 'web_search') return { kind: 'action', action: webAction(item) }
+    if (item?.type === 'mcp_tool_call' || item?.type === 'dynamic_tool_call') {
+      const failed = item.error != null || item.status === 'failed' || item.success === false || item.result?.is_error === true || item.result?.isError === true
+      const text = typeof item.error?.message === 'string' ? item.error.message : resultText(item.result?.content ?? item.content_items) || (failed ? 'Codex tool call failed (no text output)' : 'Called by Codex (no text output)')
+      return {
+        kind: 'action', display: 'codex_tool', action: {
+          tool: 'codex_tool', input: { server: String(item.server ?? item.namespace ?? 'dynamic'), name: String(item.tool ?? ''), arguments: item.arguments ?? {} },
+          result: { content: [{ type: 'text', text }], is_error: failed }, ...(failed ? { isError: true as const } : {}),
+        },
+      }
+    }
+    if (item?.type === 'proposed_plan' && typeof item.text === 'string') return { kind: 'interim', text: `Proposed plan:\n${item.text}` }
+    if (item?.type === 'note' && typeof item.text === 'string') return { kind: 'note', text: `↪ ${oneLine(item.text, 300)}`, ...(item.dim === true ? { dim: true as const } : {}) }
+    if (item?.type === 'collab_tool_call') {
+      const tool = String(item.tool ?? '').replace(/_/g, '').toLowerCase()
+      if (tool === 'wait' || tool === 'waitagent') return { kind: 'other' }
+      const agents = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.join(', ') : 'agent'
+      const text = tool === 'spawnagent' ? `Codex spawned an agent: ${oneLine(String(item.prompt ?? ''))}`
+        : ['sendinput', 'sendmessage', 'followuptask'].includes(tool) ? `Codex messaged ${agents}`
+        : tool === 'closeagent' ? `Codex closed agent ${agents}`
+        : tool === 'resumeagent' ? `Codex resumed agent ${agents}`
+        : tool === 'interruptagent' ? `Codex interrupted agent ${agents}` : 'Codex listed agents'
+      return { kind: 'note', text: `↪ ${oneLine(text, 300)}` }
+    }
+  }
   if (ev?.type === 'turn.completed' && ev.usage) {
     return {
       kind: 'usage',
@@ -500,6 +548,30 @@ export function parseCodexLine(line: string): CodexEvent {
   if (ev?.type === 'turn.failed') return { kind: 'error', text: String(ev.error?.message ?? 'turn failed') }
   if (ev?.type === 'error') return { kind: 'error', text: String(ev.message ?? 'error') }
   return { kind: 'other' }
+}
+
+/** Text content only: image/audio payloads and raw reasoning are never displayed. */
+function resultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map(c => typeof c?.text === 'string' && ['text', 'inputText'].includes(c.type) ? c.text : '').filter(Boolean).join('\n')
+}
+
+function webAction(item: any): Action {
+  const a = item.action
+  const query = a?.type === 'openPage' ? String(a.url ?? '')
+    : a?.type === 'findInPage' ? `${String(a.pattern ?? '')} in ${String(a.url ?? '')}`
+    : String(item.query || a?.query || (Array.isArray(a?.queries) ? a.queries.join(', ') : ''))
+  let results = item.results
+  if (typeof results === 'string') {
+    try { results = JSON.parse(results) } catch { results = [] }
+  }
+  const sources = (Array.isArray(results) ? results : []).filter(r => typeof r?.title === 'string' && typeof r?.url === 'string')
+    .map(r => ({ title: r.title, url: r.url, ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}) }))
+  return {
+    tool: 'WebSearch', input: { query },
+    result: { query, results: sources.length ? [{ tool_use_id: '', content: sources }] : ['Searched by Codex'], durationSeconds: 0 },
+  }
 }
 
 /** A coordinator's mid-run message without the engine's framing; other text unchanged. */
@@ -917,6 +989,9 @@ export function fileAction(change: FileChange, rel: string, before: string | und
 /** One action as a plain text line (nativeActions off). */
 export function actionLine(a: Action): string {
   if (a.tool === 'Edit') return `Edited ${String(a.input.file_path)}`
+  if (a.tool === 'WebSearch') return `Searched by Codex: ${oneLine(String(a.input.query), 300)}`
+  if ('server' in a.input) return `Codex called ${oneLine(String(a.input.server))}.${oneLine(String(a.input.name))}`
+  if ('steps' in a.input) return `Codex updated plan: ${(a.input.steps as { step: string; status: string }[]).map(s => `[${s.status}] ${oneLine(s.step)}`).join('; ')}`
   if (a.tool === 'Write') return `${a.result.type === 'create' ? 'Created' : 'Wrote'} ${String(a.input.file_path)}`
   const cmd = String(a.input.command)
   if (cmd.startsWith('# codex apply_patch: ')) return `${String(a.input.description)}: ${cmd.slice('# codex apply_patch: '.length).replace(/^\S+\s+/, '')}`
@@ -1071,7 +1146,7 @@ const sessionHandbackKey = (sessionId: string): string => `${SESSION_PREFIX}${se
 
 // `note`: a `↪` line of ours about a mid-run message; shown like a message, but
 // never standing in for Codex's final answer.
-type Queued = { kind: 'text' | 'note'; text: string } | { kind: 'action'; action: Action }
+type Queued = { kind: 'text' | 'note' | 'interim' | 'thinking'; text: string; dim?: true } | { kind: 'action'; action: Action }
 
 /** The `↪` line shown for a mid-run message: what codex-mod did with it. */
 export function steerNote(what: 'accepted' | 'finished' | 'queued', text = ''): string {
@@ -1148,7 +1223,7 @@ const runs = new Map<string, Run>()
 const deliveries = new Map<string, { uuid: string; text: string }[]>()
 const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
-const answers = new Map<string, { agentId: string; tool: string; result: Record<string, unknown> }>()
+const answers = new Map<string, { agentId: string; tool: string; result: Record<string, unknown>; isError?: true }>()
 let seq = 0
 // Set by session.start when Codex is missing or logged out.
 let preflight: string | undefined
@@ -1174,22 +1249,24 @@ const budgets = new WeakMap<AbortSignal, () => number>()
 const isCodexAgent = (agentId: unknown): boolean => typeof agentId === 'string' && known.get(agentId) !== undefined
 const hasPrefix = (id: unknown): boolean => typeof id === 'string' && id.startsWith(ID_PREFIX)
 const isNative = (tool: unknown): boolean => (NATIVE_TOOLS as readonly unknown[]).includes(tool)
-/** A Bash/Edit/Write call this module must answer or refuse: never one the engine may run. */
+const isDisplay = (tool: unknown): boolean => typeof tool === 'string' && displayNames.has(tool)
+/** A display call this module must answer or refuse: never one the engine may run. */
 const guarded = (e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): boolean =>
-  isNative(e.tool) && (hasPrefix(e.tool_use_id) || isCodexAgent(e.agentId))
-/** A Bash/Edit/Write call of a subagent whose type is not resolved yet. */
+  isDisplay(e.tool) || (isNative(e.tool) && (hasPrefix(e.tool_use_id) || isCodexAgent(e.agentId)))
+/** A built-in display call of a subagent whose type is not resolved yet. */
 const unresolved = (e: { tool?: unknown; agentId?: unknown }): boolean =>
   isNative(e.tool) && typeof e.agentId === 'string' && !known.has(e.agentId)
 
 /** The answer to a guarded call: the stored result of our own action, else a refusal. Never runs anything. */
-export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): { result: Record<string, unknown> } | { deny: string } {
+export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): { result: Record<string, unknown>; isError?: true } | { deny: string } {
   const id = typeof e.tool_use_id === 'string' ? e.tool_use_id : ''
   const held = hasPrefix(id) ? answers.get(id) : undefined
+  // e.tool is the dispatch name, distinct from codex_tool's input.name.
   if (held === undefined || held.agentId !== e.agentId || held.tool !== e.tool || !isCodexAgent(e.agentId)) {
-    return { deny: `${NOT_EXECUTED} (a ${String(e.tool)} call of a Codex agent is only ever a record of what Codex did)` }
+    return { deny: `${NOT_EXECUTED} (${String(e.tool)} is display-only for Codex agents; only a stored Codex result can answer this call)` }
   }
   answers.delete(id)
-  return { result: held.result }
+  return { result: held.result, ...(held.isError ? { isError: true as const } : {}) }
 }
 
 /** The profile of an agent type name; undefined for a name this module does not define. */
@@ -1232,6 +1309,7 @@ export const register: Register = (on, options) => {
     }
     appServer = undefined
     if (config.transport === 'app-server') appServer = await checkAppServer($, config)
+    await registerDisplayTools($)
     agentsReady = await registerAgents($, config)
     return next(e)
   })
@@ -1244,12 +1322,12 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // GUARD 1. Bash/Edit/Write calls of a Codex agent, or carrying our id
+  // GUARD 1. Built-in display calls of a Codex agent, or carrying our id
   // prefix, are answered here and never reach `next` (no permission path, no
   // tool run): our own action calls get the result Codex reported, anything
   // else is refused. A subagent not seen yet (after a worker restart, say) has
   // its type resolved first; if that fails, `.catch` refuses the call.
-  on('tool.call', { tool: ['Bash', 'Edit', 'Write'] }, async ($, e, next) => {
+  on('tool.call', async ($, e, next) => {
     if (guarded(e)) return answerGuarded(e) as never
     if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e) as never
     return next(e)
@@ -1258,10 +1336,15 @@ export const register: Register = (on, options) => {
   // GUARD 2. `tool.check` runs inside `tool.call`'s `next`, which guard 1
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
-  on('tool.check', { tool: ['Bash', 'Edit', 'Write'] }, async ($, e, next) => {
+  on('tool.check', async ($, e, next) => {
     if (unresolved(e)) await agentName($, e.agentId!)
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
   }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
+
+  on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
+    if (!dimNotes.has(e.props.text)) return next(e)
+    return $.ui.resolve(e).Text({ dimColor: true, children: e.props.text })
+  }).catch(($, e, next) => next(e))
 
   // A coordinator's message delivered into an agent's running turn is an
   // attachment row (`queued_command`), promoted to a system turn in the
@@ -1493,8 +1576,36 @@ async function loadProjectRoles($: EngineInterface, config: Config): Promise<voi
   }
 }
 
+/**
+ * The API owns full names. These tools have no executor, only the guards above.
+ * Inputs must not shadow the host's flat envelope (tool, tool_use_id,
+ * agentId, requestMeta, consent) or tool-check fields.
+ */
+async function registerDisplayTools($: EngineInterface): Promise<void> {
+  for (const name of ['codex_tool', 'codex_plan'] as const) {
+    if (displayTools[name]) continue
+    const tool = name === 'codex_tool'
+    const registered = await $.tool.register({
+      name,
+      description: `Display-only ${tool ? 'tool result' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: tool ? { server: { type: 'string' }, name: { type: 'string' }, arguments: {} } : {
+          explanation: { type: 'string' },
+          steps: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { step: { type: 'string' }, status: { enum: ['pending', 'in_progress', 'completed'] } }, required: ['step', 'status'] } },
+        },
+        required: tool ? ['server', 'name', 'arguments'] : ['steps'],
+      },
+    })
+    displayTools[name] = registered.tool
+    displayNames.add(registered.tool)
+  }
+}
+
 /** Registers the generic agent and each project role whose model Codex lists. */
 async function registerAgents($: EngineInterface, config: Config): Promise<boolean> {
+  // without the display tools their rows degrade to text; the agents must still register
+  await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
   await loadProjectRoles($, config)
   let failed = false
   const list = catalog ?? undefined
@@ -1517,7 +1628,7 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
         prompt: PLACEHOLDER_PROMPT,
         // the tools Codex's actions are drawn as must be the agent's own, or
         // the engine refuses them before the tool.call guard answers them
-        tools: ['Read', 'Bash', 'Edit', 'Write'],
+        tools: ['Read', ...NATIVE_TOOLS, ...Object.values(displayTools)],
         model: 'haiku',
         effort: 'low',
         maxTurns: 400,
@@ -2201,6 +2312,22 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
   } else if (ev.kind === 'message') {
     run.texts.push(ev.text)
     run.queue.push({ kind: 'text', text: ev.text })
+  } else if (ev.kind === 'thinking' || ev.kind === 'interim' || ev.kind === 'note') {
+    run.queue.push(ev)
+    if (ev.kind === 'note' && ev.dim) dimNotes.add(ev.text)
+  } else if (ev.kind === 'action') {
+    run.actions++
+    if (ev.display) {
+      await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
+      const tool = displayTools[ev.display]
+      // no registered display tool: the action is shown as its text line, never as a row
+      if (tool === undefined) {
+        run.queue.push({ kind: 'note', text: actionLine(ev.action) })
+        return
+      }
+      ev.action.tool = tool
+    }
+    run.queue.push({ kind: 'action', action: ev.action })
   } else if (ev.kind === 'error') run.errors.push(ev.text)
   else if (ev.kind === 'turn') run.turnId = ev.id
   else if (ev.kind === 'steer') {
@@ -2260,7 +2387,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
 
 const interval = (run: Run) => (run.actionSteps >= SLOW_AFTER ? Math.max(SLOW_MS, cfg.intervalMs) : cfg.intervalMs)
 const hasAction = (run: Run) => run.queue.some(q => q.kind === 'action')
-const hasNote = (run: Run) => run.queue.some(q => q.kind === 'note')
+const hasNote = (run: Run) => run.queue.some(q => q.kind === 'note' || q.kind === 'interim' || q.kind === 'thinking')
 const timeoutText = () => `timeout after ${Math.round(cfg.timeoutMs / 60000)} min (timeoutMinutes); Codex was stopped`
 
 /**
@@ -2350,7 +2477,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
   return yield* complete($, e, signal, run, failure, streamed.used ? streamed.answer : undefined)
 }
 
-type Block = { text: string } | { tool: string; id: string; input: Record<string, unknown> }
+type Block = { text: string; dim?: true } | { thinking: string } | { tool: string; id: string; input: Record<string, unknown> }
 
 const mintId = (e: TurnStepInput) => `${ID_PREFIX}${e.turnId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}_${e.index}_${++seq}`
 
@@ -2375,13 +2502,18 @@ async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepC
     run.carry = undefined
   }
   for (const q of taken) {
-    if (q.kind !== 'action') {
+    if (q.kind === 'thinking') {
+      blocks.push({ thinking: q.text })
+    } else if (q.kind !== 'action') {
       const prev = blocks.at(-1)
-      if (prev !== undefined && 'text' in prev) prev.text += `\n\n${q.text}`
-      else blocks.push({ text: q.text })
+      if (!q.dim && prev !== undefined && 'text' in prev && !prev.dim) prev.text += `\n\n${q.text}`
+      else blocks.push({ text: q.text, ...(q.dim ? { dim: true as const } : {}) })
     } else {
       const id = mintId(e)
-      answers.set(id, { agentId: run.agentId, tool: q.action.tool, result: q.action.result })
+      if (q.action.tool === 'WebSearch' && Array.isArray(q.action.result.results)) {
+        for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
+      }
+      answers.set(id, { agentId: run.agentId, tool: q.action.tool, result: q.action.result, ...(q.action.isError ? { isError: true as const } : {}) })
       blocks.push({ tool: q.action.tool, id, input: q.action.input })
     }
   }
@@ -2437,10 +2569,17 @@ async function* complete(
     }
   }
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
+  // Commentary, proposed plans and summaries are emitted before the handback,
+  // never used as a substitute for a missing final message.
   // the answer: the messages not shown yet (those after the last action), else the last
   // one; the notes not shown yet go before it, so a note never stands in for the answer
   const unseen = run.queue.filter(q => q.kind === 'text').map(q => q.text)
-  const notes = run.queue.filter(q => q.kind === 'note').map(q => q.text)
+  const notes = run.queue.filter(q => q.kind === 'note' && !q.dim).map(q => q.text)
+  const leading: Block[] = []
+  for (const q of run.queue) {
+    if (q.kind === 'thinking') leading.push(cfg.nativeActions ? { thinking: q.text } : { text: q.text })
+    else if (q.kind === 'interim' || (q.kind === 'note' && q.dim)) leading.push({ text: q.text })
+  }
   run.queue = []
   const said = unseen.length > 0 ? unseen.join('\n\n') : streamed !== undefined && !run.handback ? '' : (run.texts.at(-1) ?? '')
   const answer = [...notes, said].filter(Boolean).join('\n\n')
@@ -2467,8 +2606,8 @@ async function* complete(
     }
     return yield* startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry, next.uuid)
   }
-  if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed })
-  return yield* handBack($, e, shown, foot, run.handback)
+  if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed }, leading)
+  return yield* handBack($, e, shown, foot, run.handback, undefined, leading)
 }
 
 /** Why a run with no agent message failed when it printed lines we do not know: the protocol changed. */
@@ -2484,7 +2623,7 @@ async function* prefixed(streamed: string, inner: AsyncGenerator<TurnStepChunk, 
     const r = await inner.next()
     if (r.done) return { ...r.value, answer: streamed + r.value.answer }
     const c = r.value
-    yield c.kind === 'text' || c.kind === 'tool' || c.kind === 'input' ? ({ ...c, index: c.index + 1 } as TurnStepChunk) : c
+    yield c.kind === 'text' || c.kind === 'thinking' || c.kind === 'tool' || c.kind === 'input' ? ({ ...c, index: c.index + 1 } as TurnStepChunk) : c
   }
 }
 
@@ -2505,6 +2644,7 @@ async function* handBack(
   foot: string,
   handback: boolean,
   after?: { index: number; answer: string },
+  leading: Block[] = [],
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const rec = records.get(e.agentId!)
   if (rec !== undefined) {
@@ -2513,7 +2653,7 @@ async function* handBack(
     rec.lastAnswer = [after?.answer, body, foot].filter(Boolean).join('\n\n')
     await saveRecord($, e.agentId!, rec)
   }
-  return yield* finalBlocks(e, body, foot, handback, after)
+  return yield* finalBlocks(e, body, foot, handback, after, leading)
 }
 
 /** A failure before any run: `body`, the agent's name as the footer (no `$` call, so `.catch` can use it). */
@@ -2521,10 +2661,10 @@ const failStep = (e: TurnStepInput, name: string, body: string, handback: boolea
   finalBlocks(e, body, cfg.footer === 'off' ? '' : name, handback)
 
 /** The final blocks of a run: the SubagentHandback call, or the final text. */
-async function* finalBlocks(e: TurnStepInput, body: string, foot: string, handback: boolean, after?: { index: number; answer: string }): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+async function* finalBlocks(e: TurnStepInput, body: string, foot: string, handback: boolean, after?: { index: number; answer: string }, leading: Block[] = []): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const message = [body, foot].filter(Boolean).join('\n\n')
   const blocks: Block[] = handback ? [{ tool: HANDBACK_TOOL, id: mintId(e), input: { message } }] : message === '' ? [] : [{ text: message }]
-  return yield* emit(e, blocks, after)
+  return yield* emit(e, [...leading, ...blocks], after)
 }
 
 // Ends the step as a model whose response is `blocks`: text chunks, and per
@@ -2539,7 +2679,9 @@ async function* emit(e: TurnStepInput, blocks: Block[], after?: { index: number;
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i]!
     const index = base + i
-    if ('text' in b) {
+    if ('thinking' in b) {
+      yield { kind: 'thinking', index, text: b.thinking }
+    } else if ('text' in b) {
       yield { kind: 'text', index, text: b.text }
       answer += b.text
     } else {

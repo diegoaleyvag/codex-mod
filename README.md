@@ -31,6 +31,12 @@ Codex events --> native Bash / Edit / Write rows (answered by a tool.call hook,
 - **Resume.** Each agent keeps its Codex thread, so follow-ups continue the same conversation.
 - **Transport.** By default Codex runs through `codex exec --json`. The opt-in `app-server` transport adds mid-turn messages and stop (see [Transports](#transports)).
 
+### What Codex work looks like
+
+Commands and file changes appear as Bash/Edit/Write rows; finished searches appear as WebSearch rows. MCP and dynamic tool results use the display-only `codex_tool`, and plan updates use `codex_plan`. These rows show work Codex already did and never execute a Claude tool or change Claude's task list.
+
+Reasoning summaries appear as best-effort live thinking (not saved in the transcript). App-server commentary and proposed plans appear between rows, with short notes for agent activity, compaction, review, sleep and image generation. The final answer still arrives through the handback. Image viewing is deferred. `nativeActions: false` shows plain text lines instead. See the [Codex UI map](docs/codex-ui-map.md) for transport coverage and rendering limits.
+
 ## Requirements
 
 - Claude Code with plugin hooks-module (mod) support. Verified on Claude Code Desktop, CLI 2.1.299 to 2.1.302.
@@ -203,14 +209,14 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - The plugin relies on early-access APIs (`turn.step`, `tool.call`, `$.agent.register`, `SubagentHandback`) that may change.
 - Installing or editing the plugin takes effect in a new session.
 - In `workspace-write`, Codex usually cannot commit inside a git worktree or use the network; let the caller commit and push.
-- Only finished actions and Codex's messages are shown, not its reasoning. Codex reports file changes without a diff, so Edit rows are reconstructed from file text seen before and after.
+- Only finished actions, messages and available reasoning summaries are shown; raw reasoning is never shown. Codex reports file changes without a diff, so Edit rows are reconstructed from file text seen before and after.
 - With `app-server`, a steer is applied at Codex's next step boundary, not instantly.
 - A run does not survive a restart of the plugin worker: the agent reports `codex failed: run lost`, and a follow-up resumes its thread.
 
 ## Safety model
 
 - Codex's actions are never executed by Claude. The native rows are answered from what Codex already did, without reaching the permission system or the tool.
-- Any other Bash, Edit or Write call from a codex-mod agent, or from a subagent whose type cannot be resolved, is refused. A failing guard refuses too, and a `tool.check` hook denies such a call as a backstop. No option turns this off.
+- Any other Bash, Edit, Write or WebSearch call from a codex-mod agent, or from a subagent whose type cannot be resolved, is refused. A failing guard refuses too, and a `tool.check` hook denies such a call as a backstop. The registered `codex_tool` and `codex_plan` tools also refuse calls from the main model or any call without a stored Codex result. No option turns this off.
 - Launch guard: at most one launch per new message and `maxRunsPerWindow` launches per agent in 10 minutes. Beyond that the agent hands back `codex failed: launch guard tripped`. Counters live in the stored record, so a restart does not reset them.
 - Engine notices (reminders, nudges) are never treated as tasks; they re-deliver the last answer without a Codex run.
 - Codex itself runs under the sandbox of the chosen agent. Prefer `read-only` or `workspace-write`; `danger-full-access` requires `defaultSandbox` for the generic agent or the user-level `allowProjectFullAccess` opt-in for project roles.
@@ -233,7 +239,7 @@ Good first contributions:
 
 - Windows: the `app-server` runner relies on POSIX signals and file modes and has not been tried on Windows; test it and report or fix what breaks.
 - Linux: CI runs the runner tests on Ubuntu, but the plugin itself has only been verified on macOS (Claude Code Desktop); try it on Linux and report.
-- More native action types: only command executions and file changes are drawn as rows; other Codex items appear as text.
+- More Codex item coverage: image viewing remains deferred; see the [Codex UI map](docs/codex-ui-map.md).
 
 ## Disclaimer
 

@@ -318,3 +318,68 @@ test('parent death triggers the same interrupt path', async () => {
   assert.ok(methods.includes('turn/interrupt'))
   rmSync(dir, { recursive: true, force: true })
 })
+
+
+test('phase 3 translates each completed app-server item and plan notification, without raw reasoning', async t => {
+  const r = start('phase3')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const lines = r.lines()
+    const items = lines.filter(l => l.type === 'item.completed').map(l => l.item)
+    await t.test('reasoning contains summary text only, including an empty summary', () => {
+      assert.deepEqual(items.filter(i => i.type === 'reasoning'), [
+        { type: 'reasoning', text: 'Check the available evidence.\n\nThen verify the change.' }, { type: 'reasoning', text: '' },
+      ])
+      assert.ok(!JSON.stringify(lines).includes('PRIVATE_RAW_REASONING'))
+    })
+    await t.test('commentary preserves its phase', () => {
+      assert.deepEqual(items.find(i => i.phase === 'commentary'), { type: 'agent_message', text: 'Checking the sources.', phase: 'commentary' })
+    })
+    await t.test('search, openPage and findInPage preserve results and actions, once each', () => {
+      const web = items.filter(i => i.type === 'web_search')
+      assert.equal(web.length, 3)
+      assert.equal(web[0].results[0].url, 'https://example.test/docs')
+      assert.deepEqual(web.map(i => i.action.type), ['search', 'openPage', 'findInPage'])
+      assert.equal(lines.filter(l => l.type === 'item.started').length, 1) // existing file change only
+    })
+    await t.test('MCP results and errors stay exec-compatible', () => {
+      const mcp = items.filter(i => i.type === 'mcp_tool_call')
+      assert.equal(mcp.length, 2)
+      assert.deepEqual(mcp[0], { type: 'mcp_tool_call', server: 'docs', tool: 'lookup', arguments: { topic: 'options' }, status: 'completed', result: { content: [{ type: 'text', text: 'Found options.' }], structuredContent: null }, error: null })
+      assert.deepEqual(mcp[1].error, { message: 'No such topic' })
+    })
+    await t.test('dynamic calls use a new exec-like shape, preserving text and failure', () => {
+      const dyn = items.filter(i => i.type === 'dynamic_tool_call')
+      assert.equal(dyn.length, 2)
+      assert.equal(dyn[0].namespace, 'local')
+      assert.equal(dyn[0].content_items[0].text, 'Inspected a.')
+      assert.equal(dyn[1].success, false)
+    })
+    await t.test('plan updates and proposed plans are distinct', () => {
+      assert.deepEqual(items.find(i => i.type === 'proposed_plan'), { type: 'proposed_plan', text: '1. Inspect\n2. Verify' })
+      assert.deepEqual(lines.find(l => l.item?.type === 'plan_update'), { type: 'item.updated', item: { type: 'plan_update', explanation: 'Verify the work', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'inProgress' }, { step: 'Report', status: 'pending' }] } })
+    })
+    await t.test('collaboration calls use exec fields and activity becomes a note', () => {
+      const collab = items.filter(i => i.type === 'collab_tool_call')
+      assert.deepEqual(collab.map(i => i.tool), ['spawn_agent', 'send_input', 'wait'])
+      assert.deepEqual(collab[0].receiver_thread_ids, ['child-1'])
+      assert.equal(collab[0].prompt, 'Inspect the tests.\nReport findings.')
+      assert.ok(items.some(i => i.type === 'note' && i.text === 'Codex agent /root/reviewer finished'))
+    })
+    await t.test('miscellaneous items produce one dim note each; imageView is deferred', () => {
+      assert.deepEqual(items.filter(i => i.type === 'note' && i.dim).map(i => i.text), [
+        'Codex compacted context', 'Codex entered review mode', 'Codex exited review mode', 'Codex slept for 125 ms', 'Codex image generation: completed (/tmp/generated.png)',
+      ])
+      assert.ok(!items.some(i => /image.?view/i.test(i.type)))
+      assert.ok(!lines.some(l => l.type === 'codexmod.protocol'))
+    })
+  } finally { r.cleanup() }
+})
+
+test('phase 3 handled items do not conceal unknown-item drift', async () => {
+  const r = start('phase3-drift')
+  try {
+    assert.equal((await r.exit).code, 0)
+    assert.deepEqual(r.lines().find(l => l.type === 'codexmod.protocol'), { type: 'codexmod.protocol', unknown_methods: [], unknown_items: ['futureWidget'] })
+  } finally { r.cleanup() }
+})

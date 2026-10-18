@@ -2,7 +2,7 @@
 // through `--codex <this file>` (a .mjs --codex is run with process.execPath).
 // FAKE_SCENARIO picks the behaviour, FAKE_LOG is a JSONL file where every
 // client message is recorded so tests can assert what the runner sent.
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
@@ -95,6 +95,15 @@ createInterface({ input: process.stdin }).on('line', line => {
         return
       }
       work()
+      if (scenario.startsWith('phase3')) {
+        const items = JSON.parse(readFileSync(new URL('./phase3-app-items.json', import.meta.url), 'utf8'))
+        for (const item of items) {
+          note('item/started', { threadId: THREAD, turnId: TURN, item })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+        }
+        note('turn/plan/updated', { threadId: THREAD, turnId: TURN, explanation: 'Verify the work', plan: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'inProgress' }, { step: 'Report', status: 'pending' }] })
+        if (scenario === 'phase3-drift') note('item/completed', { threadId: THREAD, turnId: TURN, item: { type: 'futureWidget', id: 'new' } })
+      }
       if (['steer', 'steer-reject', 'hang', 'deaf'].includes(scenario)) return // wait for steer / interrupt
       if (scenario === 'slow') return setTimeout(finishNormally, 1500)
       return setTimeout(finishNormally, 50)

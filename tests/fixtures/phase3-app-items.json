@@ -1,0 +1,23 @@
+[
+  {"type":"reasoning","id":"r1","summary":["Check the available evidence.","Then verify the change."],"content":["PRIVATE_RAW_REASONING"]},
+  {"type":"reasoning","id":"r2","summary":[],"content":["PRIVATE_RAW_REASONING"]},
+  {"type":"agentMessage","id":"a1","text":"Checking the sources.","phase":"commentary"},
+  {"type":"webSearch","id":"w1","query":"example docs","action":{"type":"search","query":"example docs","queries":null},"results":[{"type":"text_result","title":"Example docs","url":"https://example.test/docs","snippet":"A reference."}]},
+  {"type":"webSearch","id":"w2","query":"","action":{"type":"openPage","url":"https://example.test/docs"},"results":null},
+  {"type":"webSearch","id":"w3","query":"","action":{"type":"findInPage","url":"https://example.test/docs","pattern":"options"},"results":[]},
+  {"type":"mcpToolCall","id":"m1","server":"docs","tool":"lookup","arguments":{"topic":"options"},"status":"completed","result":{"content":[{"type":"text","text":"Found options."}],"structuredContent":null},"error":null},
+  {"type":"mcpToolCall","id":"m2","server":"docs","tool":"missing","arguments":{},"status":"failed","result":null,"error":{"message":"No such topic"}},
+  {"type":"dynamicToolCall","id":"d1","namespace":"local","tool":"inspect","arguments":{"key":"a"},"status":"completed","contentItems":[{"type":"inputText","text":"Inspected a."},{"type":"inputImage","imageUrl":"data:image/png;base64,PRIVATE_IMAGE"}],"success":true},
+  {"type":"dynamicToolCall","id":"d2","namespace":null,"tool":"inspect","arguments":{},"status":"failed","contentItems":[{"type":"inputText","text":"Inspection failed."}],"success":false},
+  {"type":"plan","id":"p1","text":"1. Inspect\n2. Verify"},
+  {"type":"collabAgentToolCall","id":"c1","tool":"spawnAgent","status":"completed","senderThreadId":"thr-1","receiverThreadIds":["child-1"],"prompt":"Inspect the tests.\nReport findings.","model":null,"reasoningEffort":null,"agentsStates":{"child-1":{"status":"running","message":null}}},
+  {"type":"collabAgentToolCall","id":"c2","tool":"sendInput","status":"completed","senderThreadId":"thr-1","receiverThreadIds":["child-1"],"prompt":"Check safety.","agentsStates":{}},
+  {"type":"collabAgentToolCall","id":"c3","tool":"wait","status":"completed","senderThreadId":"thr-1","receiverThreadIds":["child-1"],"prompt":null,"agentsStates":{}},
+  {"type":"subAgentActivity","id":"s1","kind":"completed","agentThreadId":"child-1","agentPath":"/root/reviewer","model":null,"reasoningEffort":null},
+  {"type":"contextCompaction","id":"x1"},
+  {"type":"enteredReviewMode","id":"x2","review":"Inspect changes"},
+  {"type":"exitedReviewMode","id":"x3","review":"No findings"},
+  {"type":"sleep","id":"x4","durationMs":125},
+  {"type":"imageGeneration","id":"x5","status":"completed","revisedPrompt":null,"result":"PRIVATE_IMAGE","failure":null,"savedPath":"/tmp/generated.png"},
+  {"type":"imageView","id":"x6","path":"/tmp/generated.png"}
+]
