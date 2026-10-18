@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -115,10 +115,11 @@ type WorldOpts = {
   store?: Map<string, unknown>
   /** What `$.fs.read` finds, by absolute path (mutable between steps). */
   files?: Map<string, string>
-  /** False: the agent's conversation lacks the host's SubagentHandback reminder (no auto mode). */
+  /** False: the agent's conversation lacks the host's SubagentHandback reminder. */
   handback?: boolean
   /** `$.session.messages({ as: "api" })` is denied (rows only). */
   noApi?: boolean
+  sessionId?: string
 }
 
 /** The meta row the host puts in an agent's conversation when its report goes through SubagentHandback. */
@@ -159,7 +160,7 @@ function world(on: On, opts: WorldOpts = {}) {
     return { value: Object.entries(AGENT_TYPES).map(([id, type]) => ({ id, type, description: id, status: status.get(id) ?? ('running' as const) })) }
   })
   on('session.cwd', () => ({ value: '/tmp/project' }))
-  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
   on('clock.now', () => ({ value: clock.now }))
   on('clock.sleep', (_$, e: any) => {
     sleeps.push(e.ms)
@@ -539,13 +540,17 @@ test('session.start prunes records older than two days', async ($, on) => {
     ['agent:s:old', { ...PERSISTED, updatedAt: 1_000_000 - 3 * 86_400_000 }],
     ['agent:s:new', { ...PERSISTED, updatedAt: 1_000_000 - 3_600_000 }],
     ['agent:s:junk', 'x'],
+    ['session:old:handback', { handbackLock: 'text', updatedAt: 1_000_000 - 3 * 86_400_000 }],
+    ['session:new:handback', { handbackLock: 'text', updatedAt: 1_000_000 - 3_600_000 }],
+    ['session:junk:handback', { handbackLock: 'tool', updatedAt: 1_000_000 }],
+    ['session:s:other', 1],
     ['other', 1],
   ])
   const w = world(on, { store })
   on('process.run', () => ({ value: { exitCode: 0, stdout: 'ok', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
-  expect([...w.store.keys()].sort()).toEqual(['agent:s:new', 'other'])
+  expect([...w.store.keys()].sort()).toEqual(['agent:s:new', 'other', 'session:new:handback', 'session:s:other'])
 })
 
 // ---- Codex's actions as native tool calls ---------------------------------
@@ -976,11 +981,55 @@ test('session.start: warns when codex is missing', async ($, on) => {
 
 // ---- one handback: SubagentHandback or final text ---------------------------
 
-test('auto without the reminder still hands back through SubagentHandback', async ($, on) => {
-  world(on, { handback: false })
+test('auto + API form without the reminder answers as text with a footer', async ($, on) => {
+  const w = world(on, { handback: false })
+  const { chunks, result } = await step($, 'agent-text')
+  expect(result.toolUses).toEqual([])
+  expect(result.stopReason).toBe('end_turn')
+  expect(result.answer).toBe('PONG\n\ncodex · gpt-6.1-sol · medium · workspace-write · 0 actions · 1 new tokens (0 cached, 1 out) · thread t-1')
+  expect(chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual([result.answer])
+  expect(chunks.some(c => c.kind === 'tool' && c.name === 'SubagentHandback')).toBe(false)
+  expect(w.logs.some(l => l.includes('handback route text') && l.includes('api read, signal none'))).toBe(true)
+})
+
+test('auto + rows fallback without the reminder still uses SubagentHandback', async ($, on) => {
+  const w = world(on, { handback: false, noApi: true })
   const { result } = await step($, 'agent-text')
   expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
   expect(handback(result).startsWith('PONG')).toBe(true)
+  expect(w.logs.some(l => l.includes('handback route tool') && l.includes('rows read, signal none'))).toBe(true)
+})
+
+test('auto + API form without a signal preserves a stored tool lock', async ($, on) => {
+  const store = new Map<string, unknown>([['agent:sess-1:agent-text', {
+    ...PERSISTED, agentName: 'codex', handbackLock: 'tool', updatedAt: 1_000_000,
+  }]])
+  world(on, { store, handback: false })
+  const { result } = await step($, 'agent-text')
+  expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
+})
+
+test('chooseHandback: auto respects signals, locks and read completeness', () => {
+  for (const source of ['api', 'rows', 'denied'] as const) {
+    expect(chooseHandback('auto', source)).toBe(source !== 'api')
+    expect(chooseHandback('auto', source, 'tool', 'text', true)).toBe(true)
+    expect(chooseHandback('auto', source, 'text', 'tool')).toBe(false)
+    expect(chooseHandback('auto', source, undefined, 'tool', true)).toBe(true)
+    expect(chooseHandback('auto', source, undefined, 'text')).toBe(false)
+    expect(chooseHandback('auto', source, undefined, undefined, true)).toBe(false)
+  }
+})
+
+test('chooseHandback: explicit modes ignore all automatic evidence', () => {
+  for (const mode of ['tool', 'text'] as const) {
+    for (const source of ['api', 'rows', 'denied'] as const) {
+      for (const signal of [undefined, 'tool', 'text'] as const) {
+        for (const lock of [undefined, 'tool', 'text'] as const) {
+          for (const inactive of [false, true]) expect(chooseHandback(mode, source, signal, lock, inactive)).toBe(mode === 'tool')
+        }
+      }
+    }
+  }
 })
 
 test('handbackMode text: the answer is the final text alone (end_turn, no handback call)', { options: { handbackMode: 'text' } }, async ($, on) => {
@@ -1471,7 +1520,7 @@ test('live sequence on the rows form alone (API form denied): nudges are invisib
 
 test('auto: a "not active" SubagentHandback result re-delivers the same answer as text; an enforce nudge switches back to the tool', async ($, on) => {
   let conv: any[] = [user('Reply with the single word PONG')]
-  const w = world(on, { messages: () => conv, handback: false })
+  const w = world(on, { messages: () => conv })
   const s1 = await step($, 'agent-fallback', 0)
   const answer = handback(s1.result)
   conv = [...conv,
@@ -1489,6 +1538,75 @@ test('auto: a "not active" SubagentHandback result re-delivers the same answer a
   expect(w.spawned.length).toBe(1)
   expect(handback(s3.result)).toBe(answer)
   expect(w.store.get('agent:sess-1:agent-fallback')).toMatchObject({ handbackLock: 'tool' })
+})
+
+for (const failure of [
+  { text: NOT_ACTIVE_TEXT, isError: false },
+  { text: 'No such tool available: SubagentHandback', isError: true },
+  { text: 'Handback failed', isError: true },
+]) {
+  test(`auto session memo: ${failure.text}`, async ($, on) => {
+    let conv: any[] = [user('first')]
+    const opts: WorldOpts = { handback: false, noApi: true, messages: () => conv }
+    const w = world(on, opts)
+    const first = await step($, 'agent-codex')
+    const answer = handback(first.result)
+    conv = [...conv,
+      { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'hb', tool: 'SubagentHandback', input: { message: answer } }] },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'hb', ...failure }] },
+    ]
+    const fallback = await step($, 'agent-codex', 1)
+    expect(fallback.result.toolUses).toEqual([])
+    expect(fallback.result.answer).toBe(answer)
+    expect(w.store.get('session:sess-1:handback')).toEqual({ handbackLock: 'text', updatedAt: w.clock.now })
+
+    conv = [user('second agent')]
+    // Rows without a signal would default to the tool without the session memo.
+    const second = await step($, 'agent-sol')
+    expect(second.result.toolUses).toEqual([])
+    expect(second.result.stopReason).toBe('end_turn')
+    expect(firstLine(second.result.answer)).toBe('PONG')
+    expect(lastLine(second.result.answer)).toContain('sol · gpt-6.1-sol · medium')
+    expect(w.spawned.length).toBe(2)
+
+    // The same agent must use the tool if the host now explicitly offers it.
+    opts.noApi = false
+    opts.handback = true
+    conv = [user('host enabled handback')]
+    const offered = await step($, 'agent-sol', 0, 'turn-2')
+    expect(offered.result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
+    expect(handback(offered.result).startsWith('PONG')).toBe(true)
+  })
+}
+
+test('auto session memo: reloads from the store and stays within its session', async ($, on) => {
+  const store = new Map<string, unknown>([['session:sess-1:handback', { handbackLock: 'text', updatedAt: 1_000_000 }]])
+  const opts: WorldOpts = { store, handback: false, noApi: true }
+  world(on, opts)
+  const sameSession = await step($, 'agent-codex')
+  expect(sameSession.result.toolUses).toEqual([])
+  expect(firstLine(sameSession.result.answer)).toBe('PONG')
+  opts.sessionId = 'sess-2'
+  const otherSession = await step($, 'agent-sol')
+  expect(otherSession.result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
+})
+
+test('auto session memo: remembers a historical failure even after a tool signal', async ($, on) => {
+  let conv: any[] = [user('first'),
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'hb', tool: 'SubagentHandback', input: {} }] },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'hb', text: NOT_ACTIVE_TEXT }] },
+    said('Previous answer'), meta(LIVE_ENFORCE), user('follow-up'),
+  ]
+  const opts: WorldOpts = { handback: false, messages: () => conv }
+  const w = world(on, opts)
+  const first = await step($, 'agent-codex')
+  expect(first.result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
+  expect(w.store.get('session:sess-1:handback')).toMatchObject({ handbackLock: 'text' })
+  conv = [user('second agent')]
+  opts.noApi = true
+  const second = await step($, 'agent-sol')
+  expect(second.result.toolUses).toEqual([])
+  expect(firstLine(second.result.answer)).toBe('PONG')
 })
 
 test('launch guard: at most maxRunsPerWindow (3) launches per agent in 10 min; beyond, "launch guard tripped" and no relaunch', async ($, on) => {

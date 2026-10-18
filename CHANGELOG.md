@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- In `handbackMode: auto`, use text directly when the complete API conversation has no handback signal, and remember failed handbacks per session so new agents avoid repeating an unavailable `SubagentHandback` call. Explicit tool signals still take precedence.
+
 ## 1.1.0 - 2026-10-18
 
 - New opt-in `transport` option: `exec` (default) or `app-server`. With `app-server`, a per-run Node sidecar (`scripts/codex-runner.mjs`) drives `codex app-server`, so a message sent to a running agent is delivered mid-turn (`turn/steer`) and stopping the agent sends `turn/interrupt`. Falls back to `exec` when Node, the runner or `codex app-server` is unavailable; the footer says why. New `nodePath` option.

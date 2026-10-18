@@ -21,11 +21,11 @@
 //     refused, the hook's `.catch` refuses when the hook itself fails, and
 //     `tool.check` denies such a call should it ever be reached;
 //   - when Codex ends, the step hands the answer back ONCE: as the
-//     `SubagentHandback` call (auto: the default, and whenever the
-//     conversation mentions the tool or the engine sends its
-//     `[handback-send-enforce]` nudge), else as the step's final text
-//     (`end_turn`; auto falls back to it only when the tool answers "not
-//     active for this agent", re-delivering the same answer, no Codex run).
+//     `SubagentHandback` call when the conversation mentions the tool or the
+//     engine sends its `[handback-send-enforce]` nudge, else as final text if
+//     the API form has no signal or the session has seen a not-active result.
+//     Auto still defaults to the tool on incomplete reads and falls back to
+//     text on a not-active result, re-delivering the same answer, no Codex run.
 //
 // Tasks: the conversation is read in its API form, meta rows included (the
 // rows form of `$.session.messages` leaves isMeta rows out: the host's
@@ -88,7 +88,8 @@
 // userCount, launch-guard counters, runSeq, updatedAt }`, kept in memory and
 // in `$.store` under `agent:<sessionId>:<agentId>`, so it survives a
 // hooks-worker restart, a hot reload and a `--resume`. Records not updated for
-// `pruneDays` are pruned at session start/end.
+// `pruneDays` are pruned at session start/end. A not-active handback memo lives
+// under `session:<sessionId>:handback` in the same store with the same pruning.
 //
 // Drift: lines of an unknown type (or not JSON) are counted; a run that ends
 // with no agent message and some of them fails as "protocol changed" with the
@@ -154,6 +155,7 @@ const MAX_ACTION_STEPS = 300
 const OUTPUT_MAX = 30000
 const FILE_MAX = 100000
 const STORE_PREFIX = 'agent:'
+const SESSION_PREFIX = 'session:'
 const DAY_MS = 24 * 60 * 60 * 1000
 // In this host a subagent's result reaches its caller through this tool when
 // it is active for the agent; its input is `{ message }`.
@@ -551,6 +553,8 @@ export function itemsFromRows(rows: readonly SessionMessage[]): ConvItem[] {
 export type Reading = {
   /** The latest handback signal: a reminder/mention/enforce nudge (tool) or a countermand/not-active result (text). */
   signal?: 'tool' | 'text'
+  /** Any failed/not-active handback result, even if later blocks supersede the signal. */
+  handbackFailed: boolean
   /** An engine `[handback-send-enforce]` nudge is in the conversation. */
   enforce: boolean
   /** The newest genuine user message (cleaned) and how many genuine user messages there are. */
@@ -567,6 +571,7 @@ export type Reading = {
 export function readConversation(items: readonly ConvItem[]): Reading {
   const toolOf = new Map<string, string>()
   let signal: Reading['signal']
+  let handbackFailed = false
   let enforce = false
   let latest: Reading['latest']
   let count = 0
@@ -587,7 +592,10 @@ export function readConversation(items: readonly ConvItem[]): Reading {
     if (it.kind === 'result') {
       const tool = toolOf.get(it.id)
       results.push({ id: it.id, tool, text: it.text, isError: it.isError })
-      if (tool === HANDBACK_TOOL && (it.isError || NOT_ACTIVE.test(it.text))) signal = 'text'
+      if (tool === HANDBACK_TOOL && (it.isError || NOT_ACTIVE.test(it.text))) {
+        signal = 'text'
+        handbackFailed = true
+      }
       continue
     }
     if (COUNTERMAND.test(it.text)) signal = 'text'
@@ -606,7 +614,16 @@ export function readConversation(items: readonly ConvItem[]): Reading {
     latest = { text, count }
     if (results.length > 0) textAfterResults = true
   }
-  return { signal, enforce, latest, results, textAfterResults, nudged }
+  return { signal, handbackFailed, enforce, latest, results, textAfterResults, nudged }
+}
+
+type ConversationSource = 'api' | 'rows' | 'denied'
+
+/** A missing signal is evidence for text only in the API form, which preserves meta reminders. */
+export function chooseHandback(mode: HandbackMode, source: ConversationSource, signal?: Reading['signal'], lock?: Reading['signal'], sessionInactive = false): boolean {
+  if (mode === 'tool') return true
+  if (mode === 'text') return false
+  return (signal ?? lock ?? (sessionInactive || source === 'api' ? 'text' : 'tool')) === 'tool'
 }
 
 /** True for a compaction summary / continuation notice (no flag on the row type). */
@@ -1015,6 +1032,7 @@ const runsDir = async ($: EngineInterface): Promise<string> => `${await cacheDir
 
 /** The `$.store` key of an agent's record. */
 export const recordKey = (sessionId: string, agentId: string): string => `${STORE_PREFIX}${sessionId}:${agentId}`
+const sessionHandbackKey = (sessionId: string): string => `${SESSION_PREFIX}${sessionId}:handback`
 
 // `note`: a `↪` line of ours about a mid-run message; shown like a message, but
 // never standing in for Codex's final answer.
@@ -1463,22 +1481,20 @@ async function agentName($: EngineInterface, agentId: string): Promise<string | 
 
 /**
  * Whether this agent's report goes through SubagentHandback: the option, else
- * the conversation's latest signal, else the stored one; auto defaults to the
- * tool (a "not active" result then re-delivers the same answer as text).
+ * the conversation's latest signal, else the stored one. Unknown reads still
+ * default to the tool; a complete API read without a signal defaults to text.
  */
-function handbackFor(agentId: string, signal?: 'tool' | 'text'): boolean {
-  if (cfg.handbackMode === 'tool') return true
-  if (cfg.handbackMode === 'text') return false
-  return (signal ?? records.get(agentId)?.handbackLock) !== 'text'
+function handbackFor(agentId: string, signal?: Reading['signal'], source: ConversationSource = 'denied', sessionInactive = false): boolean {
+  return chooseHandback(cfg.handbackMode, source, signal, records.get(agentId)?.handbackLock, sessionInactive)
 }
 
 /** The agent's conversation, meta rows included (API form), else the rows; `denied` when neither reads. */
-async function conversation($: EngineInterface, agentId: string): Promise<{ items: ConvItem[]; denied?: string }> {
+async function conversation($: EngineInterface, agentId: string): Promise<{ items: ConvItem[]; source: ConversationSource; denied?: string }> {
   const api = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
-  if (Array.isArray(api)) return { items: itemsFromApi(api) }
+  if (Array.isArray(api)) return { items: itemsFromApi(api), source: 'api' }
   const rows = await $.session.messages({ agentId })
-  if (Array.isArray(rows)) return { items: itemsFromRows(rows) }
-  return { items: [], denied: rows.deny }
+  if (Array.isArray(rows)) return { items: itemsFromRows(rows), source: 'rows' }
+  return { items: [], source: 'denied', denied: rows.deny }
 }
 
 /** Old records kept follow-ups as plain strings. */
@@ -1522,6 +1538,25 @@ async function sessionId($: EngineInterface): Promise<string> {
 const isRecord = (v: unknown): v is AgentRecord =>
   typeof v === 'object' && v !== null && typeof (v as any).model === 'string' && typeof (v as any).effort === 'string' &&
   typeof (v as any).sandbox === 'string' && typeof (v as any).agentName === 'string'
+
+type HandbackMemo = { handbackLock: 'text'; updatedAt: number }
+const isHandbackMemo = (v: unknown): v is HandbackMemo =>
+  typeof v === 'object' && v !== null && (v as any).handbackLock === 'text' && typeof (v as any).updatedAt === 'number'
+
+/** A failed handback teaches later agents in this session; explicit agent signals still win. */
+async function sessionHandbackInactive($: EngineInterface, failed: boolean): Promise<boolean> {
+  try {
+    const key = sessionHandbackKey(await sessionId($))
+    if (failed) {
+      await $.store.set(key, { handbackLock: 'text', updatedAt: await $.clock.now() })
+      return true
+    }
+    return isHandbackMemo(await $.store.get(key))
+  } catch (err) {
+    $.ui.log(`codex-mod: session handback memo failed: ${errText(err)}`, { to: 'debug' })
+    return failed
+  }
+}
 
 /** The agent's record: memory first, then `$.store` (this session's key, then any session's). */
 async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRecord | undefined> {
@@ -1569,14 +1604,15 @@ async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord)
   }
 }
 
-/** Deletes records not updated for `ttlMs` (and malformed ones). */
+/** Deletes agent records and session handback memos not updated for `ttlMs` (and malformed ones). */
 async function pruneRecords($: EngineInterface, ttlMs: number): Promise<void> {
   try {
     const now = await $.clock.now()
     for (const key of await $.store.keys()) {
-      if (!key.startsWith(STORE_PREFIX)) continue
+      if (!key.startsWith(STORE_PREFIX) && !(key.startsWith(SESSION_PREFIX) && key.endsWith(':handback'))) continue
       const v = await $.store.get(key)
-      if (!isRecord(v) || !(now - v.updatedAt < ttlMs)) await $.store.delete(key)
+      const valid = key.startsWith(STORE_PREFIX) ? isRecord(v) : isHandbackMemo(v)
+      if (!valid || !(now - (v as AgentRecord | HandbackMemo).updatedAt < ttlMs)) await $.store.delete(key)
     }
   } catch (err) {
     $.ui.log(`codex-mod: store prune failed: ${errText(err)}`, { to: 'debug' })
@@ -1627,7 +1663,9 @@ async function* answerWithCodex(
       await saveRecord($, agentId, rec)
     }
   }
-  const handback = handbackFor(agentId, rd.signal)
+  const sessionInactive = cfg.handbackMode === 'auto' && await sessionHandbackInactive($, rd.handbackFailed)
+  const handback = handbackFor(agentId, rd.signal, conv.source, sessionInactive)
+  $.ui.log(`codex-mod: agent ${agentId}: handback route ${handback ? 'tool' : 'text'} (mode ${cfg.handbackMode}, ${conv.source} read, signal ${rd.signal ?? 'none'}, lock ${rec?.handbackLock ?? 'none'}, session not active ${sessionInactive})`, { to: 'debug' })
   const fallback = (): AgentRecord => rec ?? { ...profileOf(name)!, agentName: name, updatedAt: 0 }
 
   // 1. Our SubagentHandback came back "not active": the same answer again as text, no Codex run.
