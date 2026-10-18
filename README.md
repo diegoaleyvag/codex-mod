@@ -6,7 +6,9 @@
 
 codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hooks-module API) that adds subagent types answered by the OpenAI Codex CLI running on your machine instead of an Anthropic model. Claude stays the orchestrator and delegates self-contained tasks to `codex exec --json`, using your own ChatGPT/Codex login. Codex's commands and file changes show up in the transcript as ordinary Bash, Edit and Write rows, and its final answer comes back like any other subagent report.
 
-<!-- demo: docs/demo.gif -->
+![Codex agent steered mid-turn in Claude Code Desktop: the agent panel shows its commands, the "↪ steer delivered to Codex mid-turn" note and the footer with app-server · 1 steer](docs/demo.gif)
+
+*Claude delegates to a Codex agent (gpt-6-luna, low), then sends it a change of plan while it works; Codex picks it up mid-turn.*
 
 ## How it works
 
@@ -216,7 +218,6 @@ Good first contributions:
 - Windows: the `app-server` runner relies on POSIX signals and file modes and has not been tried on Windows; test it and report or fix what breaks.
 - Linux: CI runs the runner tests on Ubuntu, but the plugin itself has only been verified on macOS (Claude Code Desktop); try it on Linux and report.
 - More native action types: only command executions and file changes are drawn as rows; other Codex items appear as text.
-- A demo GIF for the top of this README (`docs/demo.gif`).
 
 ## Disclaimer
 
