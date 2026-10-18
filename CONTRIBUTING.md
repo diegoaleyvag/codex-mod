@@ -14,7 +14,7 @@ claude plugin validate --strict .
 node --test tests/runner.test.mjs
 ```
 
-The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment; the runner tests can.
+The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment; the runner tests can. CI (`.github/workflows/ci.yml`) therefore runs only the runner tests, a syntax check and a JSON validity check on Ubuntu and macOS with Node 20 and 22; the hook tests and `claude plugin validate` run locally.
 
 ## Style
 

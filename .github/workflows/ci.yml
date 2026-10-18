@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Only the runner tests run here. The hook tests (tests/codex.test.ts) import
+# claude-code/testing, which ships with Claude Code, so `claude plugin test .`
+# and `claude plugin validate --strict .` run locally.
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: node --check scripts/codex-runner.mjs
+      - name: Runner tests
+        run: node --test tests/runner.test.mjs
+      - name: JSON validity
+        run: |
+          node -e "
+          const fs = require('fs');
+          const files = [...fs.readdirSync('.claude-plugin').filter(f => f.endsWith('.json')).map(f => '.claude-plugin/' + f), 'hooks/hooks.json'];
+          for (const f of files) { JSON.parse(fs.readFileSync(f, 'utf8')); console.log('ok', f); }
+          "

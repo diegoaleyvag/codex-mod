@@ -1,6 +1,12 @@
 # codex-mod
 
+[![CI](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml/badge.svg)](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version 1.1.0](https://img.shields.io/badge/version-1.1.0-informational.svg)](CHANGELOG.md)
+
 codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hooks-module API) that adds subagent types answered by the OpenAI Codex CLI running on your machine instead of an Anthropic model. Claude stays the orchestrator and delegates self-contained tasks to `codex exec --json`, using your own ChatGPT/Codex login. Codex's commands and file changes show up in the transcript as ordinary Bash, Edit and Write rows, and its final answer comes back like any other subagent report.
+
+<!-- demo: docs/demo.gif -->
 
 ## How it works
 
@@ -201,9 +207,16 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - Rows misbehave in your host: set `nativeActions` to false.
 - Debug messages are written to Claude Code's debug log (`claude --debug`), prefixed `codex-mod:`.
 
-## Contributing
+## Contributing and ideas
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md). Ideas and questions go to [Discussions](https://github.com/diegoaleyvag/codex-mod/discussions); bugs go to [issues](https://github.com/diegoaleyvag/codex-mod/issues). Security reports: see [SECURITY.md](SECURITY.md).
+
+Good first contributions:
+
+- Windows: the `app-server` runner relies on POSIX signals and file modes and has not been tried on Windows; test it and report or fix what breaks.
+- Linux: CI runs the runner tests on Ubuntu, but the plugin itself has only been verified on macOS (Claude Code Desktop); try it on Linux and report.
+- More native action types: only command executions and file changes are drawn as rows; other Codex items appear as text.
+- A demo GIF for the top of this README (`docs/demo.gif`).
 
 ## Disclaimer
 
