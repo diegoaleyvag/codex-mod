@@ -11,9 +11,10 @@ Run both before opening a pull request:
 ```bash
 claude plugin test .
 claude plugin validate --strict .
+node --test tests/runner.test.mjs
 ```
 
-The tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment.
+The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment; the runner tests can.
 
 ## Style
 
@@ -28,7 +29,7 @@ The tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with
 - One focused change per PR, with a short description of the problem and the fix.
 - Imperative commit messages ("Fix handback re-delivery").
 - Update README.md and CHANGELOG.md when behaviour or options change; options live in `.claude-plugin/plugin.json`.
-- Both checks must pass.
+- All checks must pass.
 
 ## Reporting bugs
 

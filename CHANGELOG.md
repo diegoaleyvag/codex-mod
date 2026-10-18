@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 - 2026-10-18
+
+- New opt-in `transport` option: `exec` (default) or `app-server`. With `app-server`, a per-run Node sidecar (`scripts/codex-runner.mjs`) drives `codex app-server`, so a message sent to a running agent is delivered mid-turn (`turn/steer`) and stopping the agent sends `turn/interrupt`. Falls back to `exec` when Node, the runner or `codex app-server` is unavailable; the footer says why. New `nodePath` option.
+- Visible `↪` notes in the agent's output for delivered, late and queued messages; the footer shows `app-server` and `N steer(s)`.
+- Fix: messages sent to a running agent (they arrive as a `queued_command` attachment) were silently dropped; they are now delivered on both transports.
+- Diagnostics: `codex exec --json` protocol drift detection, a warning for Codex older than 0.163.0, a provider-aware login check, and a `--device-auth` hint.
+- Control files live in `~/.cache/codex-mod/runs` (mode 0700) and are pruned after `pruneDays`.
+
 ## 1.0.0
 
 First public release.

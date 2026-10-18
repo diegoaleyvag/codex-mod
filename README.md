@@ -21,6 +21,7 @@ Codex events --> native Bash / Edit / Write rows (answered by a tool.call hook,
 - **`tool.call` guard.** Those calls carry a reserved id prefix and are answered from the result Codex already reported. They are never executed by Claude.
 - **Handback.** The final answer is delivered once through `SubagentHandback`, followed by a footer line.
 - **Resume.** Each agent keeps its Codex thread, so follow-ups continue the same conversation.
+- **Transport.** By default Codex runs through `codex exec --json`. The opt-in `app-server` transport adds mid-turn messages and stop (see [Transports](#transports)).
 
 ## Requirements
 
@@ -82,7 +83,7 @@ Summarise what src/index.ts exports.
 
 An unknown model or unsupported effort fails with a clear error; nothing falls back silently.
 
-Follow-ups go through `SendMessage` to the same agent and resume its Codex thread.
+Follow-ups go through `SendMessage` to the same agent and resume its Codex thread. A message sent while the agent is still running is delivered too, according to the transport (see [Transports](#transports)).
 
 Each answer ends with a footer, for example:
 
@@ -90,7 +91,7 @@ Each answer ends with a footer, for example:
 codex · gpt-6-luna · low · workspace-write · 3 actions · 37.4K new tokens (154K cached, 631 out) · thread 01a14f50
 ```
 
-It shows the agent, model, effort, sandbox, number of actions, Codex's token counts (new, cached, output) and the Codex thread id. Failures are never silent: the answer starts with `codex failed: <reason>` followed by the last lines of Codex's stderr.
+It shows the agent, model, effort, sandbox, number of actions, Codex's token counts (new, cached, output) and the Codex thread id. With the `app-server` transport it also shows `app-server` and, when any were delivered, `N steer(s)`. Failures are never silent: the answer starts with `codex failed: <reason>` followed by the last lines of Codex's stderr.
 
 ## Agents
 
@@ -124,11 +125,46 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `maxActionsPerStep` | `10` | Most actions shown in one step (1 to 50). |
 | `timeoutMinutes` | `0` | Stop a run after this many minutes and report `codex failed: timeout`. `0`: no limit. |
 | `maxRunsPerWindow` | `3` | Launch guard: most launches per agent in 10 minutes (1 to 100). |
+| `transport` | `exec` | `exec` (`codex exec --json`, most stable) or `app-server` (experimental, see [Transports](#transports)). |
+| `nodePath` | empty | Absolute path of Node (18 or later) for the `app-server` sidecar. Empty: `PATH`, then common locations. |
 | `pruneDays` | `2` | Delete stored agent records (thread, model, effort) unused for this many days. |
+
+To set `transport` from a settings file:
+
+```json
+{
+  "pluginConfigs": {
+    "codex-mod@codex-mod": { "options": { "transport": "app-server" } }
+  }
+}
+```
+
+### Transports
+
+- **`exec`** (default, most stable). Each launch is `codex exec --json`. A message sent to an agent while it runs cannot reach the running turn: it is queued and runs after the turn, resuming the same thread.
+- **`app-server`** (opt-in, needs Node 18 or later on `PATH` or `nodePath`). A per-run sidecar, `scripts/codex-runner.mjs`, owns the stdin of `codex app-server` for that run, because the hook cannot keep a child's stdin open. A message you send to a running Codex agent is delivered mid-turn (`turn/steer`), and stopping the agent sends `turn/interrupt`. Codex marks `app-server` as experimental, so its protocol may change.
+
+If Node, the runner or `codex app-server` is unavailable, the session falls back to `exec` automatically and the footer says why.
+
+The agent's output shows what happened to a message:
+
+```
+↪ steer delivered to Codex mid-turn: "..."
+↪ Codex had already finished; this message runs next, on the same thread
+↪ queued: runs after this turn (exec transport has no mid-turn steer)
+```
+
+The notes exist because Claude Code Desktop does not render the coordinator's message itself in the subagent view. A steer lands at Codex's next step boundary (about 3 s in a live check).
+
+Control files for a live run (steer text, interrupt) live in `~/.cache/codex-mod/runs` (mode 0700) and are pruned after `pruneDays`.
 
 ### Global rules off
 
 With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/codex-mod/home` (default `~/.cache/codex-mod/home`), which contains symbolic links to your real `auth.json`, `config.toml` and `models_cache.json` only. The plugin never writes to your real Codex home. Trade-offs: sessions for these runs live in the shadow folder (threads do not carry across the switch), skills and plugins from your Codex home are not visible, and if Codex replaces `auth.json` instead of writing through the link, your main install may ask you to log in again.
+
+## How is this different from openai/codex-plugin-cc?
+
+[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) exposes Codex through slash commands and a Claude wrapper subagent, with a shared broker process. codex-mod instead registers native subagent types whose rows are answered by a `turn.step` hook without any Claude model request, runs one sidecar per run (no shared broker), and can steer a running turn. The two take different routes to the same Codex CLI; pick the one that fits your workflow.
 
 ## Costs
 
@@ -144,6 +180,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - Installing or editing the plugin takes effect in a new session.
 - In `workspace-write`, Codex usually cannot commit inside a git worktree or use the network; let the caller commit and push.
 - Only finished actions and Codex's messages are shown, not its reasoning. Codex reports file changes without a diff, so Edit rows are reconstructed from file text seen before and after.
+- With `app-server`, a steer is applied at Codex's next step boundary, not instantly.
 - A run does not survive a restart of the plugin worker: the agent reports `codex failed: run lost`, and a follow-up resumes its thread.
 
 ## Safety model
@@ -157,6 +194,8 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 ## Troubleshooting
 
 - Agents not listed: start a new session, then check that Codex is installed and logged in (`codex login status`). Role agents are skipped when their model is not in `models_cache.json`.
+- Footer or note says the transport fell back to `exec`: check `node --version` (18 or later), set `nodePath`, and confirm `codex app-server --help` works.
+- Diagnostics: a change in the `codex exec --json` event format is reported as `protocol changed (codex-cli X)`; a Codex older than 0.163.0 produces a warning; the login check is provider-aware (skipped for a non-OpenAI `model_provider`), and a failed login suggests `codex login --device-auth`.
 - `codex failed: ...` at the start of an answer: read the stderr lines that follow. Common causes are a missing binary (set `codexPath`), a logged-out Codex, or an unknown model or effort.
 - `launch guard tripped`: too many launches in 10 minutes; wait or raise `maxRunsPerWindow`.
 - Rows misbehave in your host: set `nativeActions` to false.
