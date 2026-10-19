@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `modelAgents` (default true): register each listed Codex model as `codex-mod:<slug>`, with catalog effort defaults and supported efforts in its description. The current host rejects dots in type names, so `gpt-6.1-sol` falls back to `gpt-6-1-sol` with a log note and exact executing model ID. Project roles win collisions; unreadable catalogs retain generic/role types only.
+- Resolve native Agent `effort` from the scoped tool input and detect spawn-field support; prompt lines take precedence, then native effort, then defaults. Unsupported native efforts fall back with a visible note; invalid prompt overrides still fail before launch.
+- Show actual model and effort in owned launch titles (including nested observers) and alongside the parent's native Agent row, retaining native controls and failure fallback. Row/footer profiles follow later changes through the same resolver used by Codex launch. Keep the unused `haiku` execution placeholder; native GPT badges remain unsupported.
+
 ### Breaking
 
 - Removed built-in `sol`, `sol-high`, `astra-audit` agents and the `roles` option. To restore equivalent roles, copy the example in README's "Roles per project" section into `.claude/codex-mod.json`; the new names are `implementer`, `implementer-high` and `auditor`. The generic `codex-mod:codex` agent remains available. Leftover `roles` settings are ignored with a warning.

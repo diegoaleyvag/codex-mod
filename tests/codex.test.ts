@@ -12,10 +12,11 @@ import batch5Items, { CHILD as B5_CHILD, THREAD as B5_THREAD } from './fixtures/
 import batch6Items, { PNG, questionParams, ANSWER } from './fixtures/batch6-items.mjs'
 import batch6Images from './fixtures/batch6-images.mjs'
 import { imageFile, captureImage, generationAction, findingsAction, literalReceipt, IMAGE_MAX } from '../hooks/images-modes.ts'
+import batch7Models from './fixtures/batch7-models.mjs'
 import { RECORD_BUDGET } from '../hooks/store-state.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
 import { PARENT as N_PARENT, CHILD as N_CHILD, PARENT_TURN as N_PT, CHILD_TURN as N_CT, nestedCommand, nestedFile, nestedActivity } from './fixtures/nested-items.mjs'
-import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
+import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, resolveProfile, modelTitle, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // Cache-directory setup is infrastructure, independent of each test's process fixture.
 const cacheDirectories = {
@@ -36,14 +37,7 @@ const test: typeof hostTest = ((name: string, options: any, fn?: any) => {
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
 
-const MODELS_CACHE = JSON.stringify({
-  fetched_at: '2026-10-18T00:00:00Z', etag: 'x', client_version: '0.163.0',
-  models: [
-    { slug: 'gpt-hidden', visibility: 'hide', priority: 0, supported_reasoning_levels: [{ effort: 'low' }] },
-    { slug: 'gpt-6-luna', display_name: 'Luna', visibility: 'list', priority: 4, default_reasoning_level: 'medium', supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh', 'max'].map(effort => ({ effort, description: effort })) },
-    { slug: 'gpt-6.1-sol', display_name: 'Sol', visibility: 'list', priority: 1, default_reasoning_level: 'low', supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(effort => ({ effort, description: effort })) },
-  ],
-})
+const MODELS_CACHE = JSON.stringify(batch7Models)
 
 // A project file supplied through the session-relative fs.read mock, never the real repo.
 const PROJECT_ROLES = JSON.stringify({ roles: {
@@ -445,8 +439,10 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   ] })
   let childFinal = ''
   on('turn.start', (_$, e: any) => ({ turnId: e.turnId }))
+  on('ui.render', () => ({ type: 'Text', children: ['NESTED HOST CONTROLS'] }))
   on('agent.spawn', async (_$, e: any) => {
     actual.push(e)
+    expect(e.description).toContain('Codex gpt-6.1-sol · medium · ')
     // Re-enter before the API resolves, as core can do. This is an API-chain
     // test, not evidence that the testing kit created a native task record.
     prompt = e.prompt
@@ -470,6 +466,9 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   expect(link).toBeDefined()
   const answer: any = await $.tool.call({ tool: 'Agent', ...link.input, tool_use_id: link.id, agentId: 'agent-progress' } as any)
   expect(answer.result.agentId).toBe(host)
+  const label = JSON.stringify(await b7Render($, link.id))
+  expect(label).toContain('Codex gpt-6.1-sol · medium')
+  expect(label).toContain('NESTED HOST CONTROLS')
   expect(answer.result.content[0].text).toContain('Observation link')
   expect(childFinal).toContain('child checked the fixture')
   expect(childFinal).toContain('500 new tokens (1.5K cached, 100 out)')
@@ -1294,7 +1293,7 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   on('ui.toast', () => ({ value: undefined }))
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
-  expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
+  expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high', 'gpt-6-1-sol', 'gpt-6-luna'])
   expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'])
   expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
@@ -4978,4 +4977,265 @@ for (const option of ['lean', 'text', 'registration-fails']) test(`batch 6 quest
   expect(w.writes).toEqual([])
   expect(handback(s.result)).not.toContain('unsupported')
   expect(w.core).toEqual([])
+})
+
+// Batch 7: explicit host-event harness. The real AgentSpawnInput has no effort
+// in 2.1.302; passing it here tests detection of a future host, not that claim.
+function b7Hooks(options: any = {}) {
+  const hooks = new Map<string, { handler: any; catcher: any }>()
+  codexRegister(((name: string, ...args: any[]) => {
+    const filter = typeof args[0] === 'object' ? args[0].component ?? '' : ''
+    const hook = { handler: args.at(-1), catcher: undefined as any }
+    hooks.set(name + filter, hook)
+    return { catch: (fn: any) => { hook.catcher = fn } }
+  }) as any, options)
+  return hooks
+}
+// Direct hook calls need EngineInterface, not the kit's public test driver.
+// Use the same world state as the normal hook mocks so real steps can reload
+// the captured selection and verify execution, rendering and follow-ups.
+function b7Engine(w: ReturnType<typeof world>, agents: () => any[] = () => []) {
+  return {
+    plugin: { name: 'codex-mod', root: '/plugin' },
+    agent: { list: async () => agents() },
+    session: { id: async () => 'sess-1', cwd: async () => w.location.cwd },
+    env: { get: async (name: string) => name === 'HOME' ? '/home/t' : undefined },
+    clock: { now: async () => w.clock.now },
+    ui: {
+      log: (text: string) => { w.logs.push(text) },
+      invalidate: () => {},
+      toast: () => {},
+      notify: async () => ({ isSent: false }),
+    },
+    fs: {
+      read: async (path: string) => {
+        w.reads.push(path)
+        const text = w.files.get(path)
+        if (text === undefined) throw new Error(`ENOENT ${path}`)
+        return text
+      },
+      write: async (path: string, text: string) => {
+        if (/\/runs\/state-[^/]+\/record\.json$/.test(path)) {
+          w.stateWrites.push({ path, text })
+          w.files.set(path, text)
+        } else w.writes.push({ path, text })
+      },
+    },
+    store: {
+      get: async (key: string) => w.store.get(key),
+      keys: async () => [...w.store.keys()],
+      set: async (key: string, value: unknown) => {
+        expect(JSON.stringify(value).length <= RECORD_BUDGET).toBe(true)
+        w.store.set(key, JSON.parse(JSON.stringify(value)))
+      },
+      delete: async (key: string) => { w.store.delete(key) },
+    },
+    process: { run: async (argv: string[]) => {
+      expect(argv[0]).toBe('mkdir')
+      return runOk().value
+    } },
+  }
+}
+const b7Event = (changes: any = {}) => ({ tool_use_id: 'b7-launch', prompt: 'First task', description: 'Inspect exports',
+  subagentType: 'codex-mod:codex', provider: { plugin: 'codex-mod', tier: 'project' }, model: undefined,
+  parentModel: 'claude-opus-4-7', permissionMode: 'default', background: true, fork: false, ...changes })
+const b7Next = (fn: any) => Object.assign(fn, { origin: { plugin: 'engine', tier: 'core' }, signal: new AbortController().signal,
+  budget: { remainingMs: 10000 }, called: false })
+const b7Render = ($: any, id: string, tool = 'Agent', input: any = {}) => $.ui.render({ component: 'ToolUse', surface: 'desktop', requestId: id,
+  props: { tool_use_id: id, tool, input, isRunning: false, isErrored: false, isInterrupted: false } })
+
+for (const [label, task, native, base, model, effort] of [
+  ['generic default', 'work', undefined, { model: '', effort: 'medium' }, 'gpt-6.1-sol', 'medium'],
+  ['role default', 'work', undefined, { model: 'gpt-6-luna', effort: 'low' }, 'gpt-6-luna', 'low'],
+  ['native wins role', 'work', 'high', { model: 'gpt-6-luna', effort: 'low' }, 'gpt-6-luna', 'high'],
+  ['prompt wins native', 'codex-effort: xhigh\nwork', 'low', { model: 'gpt-6.1-sol', effort: 'medium' }, 'gpt-6.1-sol', 'xhigh'],
+  ['model override validates native', 'codex-model: gpt-6-luna\nwork', 'ultra', { model: 'gpt-6.1-sol', effort: 'medium' }, 'gpt-6-luna', 'medium'],
+  ['model type default', 'work', undefined, { model: 'gpt-6.1-sol', effort: 'low' }, 'gpt-6.1-sol', 'low'],
+  ['sticky follow-up', 'next', undefined, { model: 'gpt-6-luna', effort: 'max' }, 'gpt-6-luna', 'max'],
+] as const) test(`batch 7 precedence: ${label}`, async () => {
+  const selected = resolveProfile({ ...base, sandbox: 'read-only' }, task, parseModelsCache(MODELS_CACHE), native)
+  expect(selected.profile).toEqual({ model, effort, sandbox: 'read-only' })
+  expect(selected.rest).toBe(task.includes('codex-') ? 'work' : task)
+  expect(selected.invalid).toBe(undefined)
+})
+
+test('batch 7 invalid native effort notes fallback; invalid prompt overrides still fail', async () => {
+  const list = parseModelsCache(MODELS_CACHE)
+  const base = { model: 'gpt-6-luna', effort: 'high', sandbox: 'workspace-write' }
+  for (const native of ['ultra', 'bogus', 7, null, 'HIGH']) {
+    const selected = resolveProfile(base, 'work', list, native)
+    expect(selected.profile.effort).toBe('high')
+    expect(selected.note).toContain('using default high')
+  }
+  const switched = resolveProfile({ ...base, model: 'gpt-6.1-sol', effort: 'ultra' }, 'codex-model: gpt-6-luna\nwork', list, 'ultra')
+  expect(switched.profile.effort).toBe('medium')
+  expect(resolveProfile(base, 'codex-effort: ultra\nwork', list, 'low').invalid).toContain('not supported')
+  expect(resolveProfile(base, 'codex-model: missing\nwork', list, 'low').invalid).toContain('not available')
+  expect(resolveProfile({ model: '', effort: '', sandbox: 'read-only' }, 'work').profile).toEqual({ model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'read-only' })
+})
+
+for (const enabled of [true, false]) test(`batch 7 catalog model registration modelAgents=${enabled}`, { options: { modelAgents: enabled } }, async ($, on) => {
+  const registered: any[] = []
+  world(on, { files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE]]) })
+  on('agent.register', (_$, e: any) => { registered.push(e); return { value: { agent: 'codex-mod:' + e.name } } })
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await startSession($)
+  expect(registered.map(s => s.name)).toEqual(enabled ? ['codex', 'gpt-6-1-sol', 'gpt-6-luna', 'codex-child'] : ['codex', 'codex-child'])
+  expect(registered.every(s => s.model === 'haiku' && s.effort === 'low')).toBe(true)
+  if (enabled) expect(registered.find(s => s.name === 'gpt-6-1-sol').description).toBe('OpenAI Codex gpt-6.1-sol; pass effort to choose reasoning (low, medium, high, xhigh, max, ultra)')
+})
+
+test('batch 7 unreadable catalog keeps generic + roles; colliding project role wins', async ($, on) => {
+  const registered: any[] = []
+  const files = new Map([['.claude/codex-mod.json', JSON.stringify({ roles: { 'gpt-6-luna': { model: 'gpt-6.1-sol', effort: 'high', description: 'Project winner' } } })]])
+  const w = world(on, { files })
+  on('agent.register', (_$, e: any) => { registered.push(e); return { value: { agent: 'codex-mod:' + e.name } } })
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await startSession($)
+  expect(registered.map(s => s.name)).toEqual(['codex', 'gpt-6-luna', 'codex-child'])
+  files.set('/home/t/.codex/models_cache.json', MODELS_CACHE)
+  registered.length = 0
+  await startSession($)
+  expect(registered.map(s => s.name)).toEqual(['codex', 'gpt-6-luna', 'gpt-6-1-sol', 'codex-child'])
+  expect(registered[1].description).toContain('Project winner')
+  expect(w.logs.some(l => l.includes('project role wins name collision'))).toBe(true)
+})
+
+for (const source of ['spawn', 'tool', 'both', 'absent', 'invalid', 'prompt'] as const) test(`batch 7 ${source} effort binds before first step; title, row, launch and footer agree`, async ($, on) => {
+  let task = source === 'prompt' ? 'codex-model: gpt-6-luna\ncodex-effort: xhigh\nFirst task' : 'First task'
+  const id = 'b7-' + source
+  const host = 'b7-host-' + source
+  const info = { id: host, type: 'codex-mod:codex', description: '', status: 'running' }
+  const w = world(on, { messages: () => [user(task)], agentList: () => [info], files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE]]) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST CONTROLS'] }))
+  on('agent.register', (_$, e: any) => ({ value: { agent: 'codex-mod:' + e.name } }))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await startSession($)
+  const hooks = b7Hooks()
+  const $e = b7Engine(w, () => [info])
+  const spawn = hooks.get('agent.spawn')!.handler
+  const effort = source === 'absent' ? undefined : source === 'invalid' ? 'bogus' : 'high'
+  const event = b7Event({ tool_use_id: id, prompt: task, ...(source === 'spawn' || source === 'both' || source === 'prompt' || source === 'invalid' ? { effort } : {}) })
+  const expectedEffort = source === 'prompt' ? 'xhigh' : source === 'absent' || source === 'invalid' ? 'medium' : 'high'
+  const expectedModel = source === 'prompt' ? 'gpt-6-luna' : 'gpt-6.1-sol'
+  const launch = b7Next(async (e: any) => {
+    expect(e.model).toBe(undefined)
+    expect(e.parentModel).toBe(event.parentModel)
+    expect(e.permissionMode).toBe(event.permissionMode)
+    expect(e.provider).toEqual(event.provider)
+    expect(e.prompt).toBe(task)
+    info.description = e.description
+    expect(e.description).toBe(`Codex ${expectedModel} · ${expectedEffort} · Inspect exports`)
+    await hooks.get('turn.start')!.handler($e, { agentId: host, text: task }, b7Next(async () => ({ turnId: 'early' })))
+    expect(w.store.get(`agent:sess-1:${host}`)).toMatchObject({ model: expectedModel, effort: expectedEffort })
+    return { model: 'claude-haiku-4-5', agentId: host }
+  })
+  if (source === 'tool' || source === 'both') {
+    await hooks.get('tool.call')!.handler($e, { tool: 'Agent', subagent_type: 'codex-mod:codex', effort: source === 'both' ? 'low' : effort, tool_use_id: id },
+      b7Next(async () => ({ result: await spawn($e, event, launch) })))
+  } else await spawn($e, event, launch)
+  const first = await step($, host)
+  expect(argOf(w.spawned[0]!.argv, '-m')).toBe(expectedModel)
+  expect(w.spawned[0]!.argv).toContain(`model_reasoning_effort="${expectedEffort}"`)
+  expect(handback(first.result)).toContain(`${expectedModel} · ${expectedEffort}`)
+  if (source === 'invalid') expect(handback(first.result)).toContain('using default medium')
+  if (source === 'absent') expect(w.logs.some(l => l.includes('spawn.effort=absent; Agent.effort=absent'))).toBe(true)
+  if (source === 'tool') expect(w.logs.some(l => l.includes('spawn.effort=absent; Agent.effort=high'))).toBe(true)
+  const row = JSON.stringify(await b7Render($, id))
+  expect(row).toContain(`Codex ${expectedModel} · ${expectedEffort}`)
+  expect(row).toContain('HOST CONTROLS')
+  // A follow-up updates the current row and footer; the launch title stays fixed.
+  task = 'codex-model: gpt-6-luna\ncodex-effort: low\nSecond task'
+  const second = await step($, host, 0, 'turn-2')
+  expect(w.spawned[1]!.argv).toContain('model_reasoning_effort="low"')
+  expect(handback(second.result)).toContain('gpt-6-luna · low')
+  expect(JSON.stringify(await b7Render($, id))).toContain('Codex gpt-6-luna · low')
+  expect(info.description).toContain(`${expectedModel} · ${expectedEffort}`)
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+  expect(JSON.stringify(w.store.get(`agent:sess-1:${host}`)).length < RECORD_BUDGET).toBe(true)
+})
+
+test('batch 7 only pinned codex-mod spawns get titles; fixed workflow/resume descriptions and normal Claude spawns stay intact', async ($, on) => {
+  const w = await startWithCatalog($, on)
+  const spawn = b7Hooks().get('agent.spawn')!.handler
+  for (const changes of [
+    { subagentType: 'general-purpose' }, { provider: { plugin: 'other', tier: 'project' } },
+    { subagentType: 'other:codex' }, { fork: true }, { workflow: { runId: 'wf_1', agentIndex: 1 } },
+    { resume: { agentId: 'b7-resumed' } },
+  ]) {
+    const event = b7Event(changes)
+    await spawn(b7Engine(w), event, b7Next(async (e: any) => {
+      expect(e).toEqual(event)
+      return { deny: 'fixture refusal' }
+    }))
+  }
+})
+
+test('batch 7 owned Agent renders restore from compact records, preserve native rows and ignore lookalike calls', async ($, on) => {
+  const w = world(on, { store: new Map([['agent:sess-1:b7-restored', {
+    model: 'gpt-6-luna', effort: 'max', sandbox: 'read-only', agentName: 'codex', updatedAt: 1,
+    selection: { session: 'sess-1', toolUseId: 'b7-durable', type: 'codex-mod:codex', launchModel: 'gpt-6.1-sol', launchEffort: 'low' },
+  }]]) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  expect(JSON.stringify(await b7Render($, 'b7-durable'))).toContain('Codex gpt-6-luna · max')
+  for (const [id, tool, input] of [['foreign', 'Agent', { subagent_type: 'codex-mod:codex' }], ['b7-durable', 'Bash', {}], ['foreign', 'Agent', { subagent_type: 'general-purpose' }]] as const) {
+    expect(await b7Render($, id, tool, input)).toMatchObject({ type: 'Text', children: ['HOST'] })
+  }
+  const render = b7Hooks().get('ui.renderToolUse')!
+  const e = { props: { tool: 'Agent', tool_use_id: 'b7-durable' } }
+  const broken = { ...b7Engine(w), ui: { resolve: () => { throw new Error('unsupported surface') } } }
+  let caught = false
+  try { await render.handler(broken, e, b7Next(async () => ({ type: 'Text', children: ['HOST'] }))) } catch { caught = true }
+  expect(caught).toBe(true)
+  expect(await render.catcher($, e, b7Next(async () => ({ type: 'Text', children: ['HOST'] })))).toEqual({ type: 'Text', children: ['HOST'] })
+  expect(w.spawned).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('batch 7 catalog agent defaults launch the exact model despite the host-safe type alias', async ($, on) => {
+  const w = world(on, { files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE]]),
+    agentList: () => [{ id: 'b7-model-type', type: 'codex-mod:gpt-6-1-sol', description: 'Catalog selection', status: 'running' }] })
+  on('agent.register', (_$, e: any) => ({ value: { agent: 'codex-mod:' + e.name } }))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await startSession($)
+  const s = await step($, 'b7-model-type')
+  expect(argOf(w.spawned[0]!.argv, '-m')).toBe('gpt-6.1-sol')
+  expect(w.spawned[0]!.argv).toContain('model_reasoning_effort="low"')
+  expect(handback(s.result)).toContain('gpt-6.1-sol · low')
+  expect(w.logs.some(l => l.includes('registering gpt-6-1-sol for Codex gpt-6.1-sol'))).toBe(true)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('batch 7 simultaneous launches keep distinct row IDs, parent scope and early effort selections', async ($, on) => {
+  const infos: any[] = []
+  const w = await startWithCatalog($, on, { agentList: () => infos })
+  const hooks = b7Hooks()
+  const spawn = hooks.get('agent.spawn')!.handler
+  const $e = b7Engine(w, () => infos)
+  const launch = (id: string, effort: string, parent: string) => spawn($e, b7Event({ tool_use_id: id, effort, parentAgentId: parent }),
+    b7Next(async (e: any) => {
+      infos.push({ id: 'host-' + id, type: e.subagentType, description: e.description, parentId: parent, status: 'running' })
+      await hooks.get('turn.start')!.handler($e, { agentId: 'host-' + id, text: 'First task' }, b7Next(async () => ({ turnId: id })))
+      return { model: 'claude-haiku-4-5', agentId: 'host-' + id }
+    }))
+  await Promise.all([launch('b7-concurrent-a', 'high', 'parent-a'), launch('b7-concurrent-b', 'low', 'parent-b')])
+  expect(w.store.get('agent:sess-1:host-b7-concurrent-a')).toMatchObject({ effort: 'high', selection: { toolUseId: 'b7-concurrent-a' } })
+  expect(w.store.get('agent:sess-1:host-b7-concurrent-b')).toMatchObject({ effort: 'low', selection: { toolUseId: 'b7-concurrent-b' } })
+  expect(w.spawned).toEqual([])
+})
+
+test('batch 7 project role wins a sanitized model alias collision and supplies the launch profile', async ($, on) => {
+  const registered: string[] = []
+  const w = world(on, { files: new Map([['/home/t/.codex/models_cache.json', MODELS_CACHE],
+    ['.claude/codex-mod.json', JSON.stringify({ roles: { 'gpt-6-1-sol': { model: 'gpt-6-luna', effort: 'high', description: 'Alias winner' } } })]]),
+    agentList: () => [{ id: 'b7-alias-role', type: 'codex-mod:gpt-6-1-sol', description: 'Role', status: 'running' }] })
+  on('agent.register', (_$, e: any) => { registered.push(e.name); return { value: { agent: 'codex-mod:' + e.name } } })
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  await startSession($)
+  expect(registered).toEqual(['codex', 'gpt-6-1-sol', 'gpt-6-luna', 'codex-child'])
+  await step($, 'b7-alias-role')
+  expect(argOf(w.spawned[0]!.argv, '-m')).toBe('gpt-6-luna')
+  expect(w.spawned[0]!.argv).toContain('model_reasoning_effort="high"')
+  expect(w.logs.some(l => l.includes('project role wins name collision'))).toBe(true)
 })

@@ -113,7 +113,38 @@ Use codex-mod:auditor (declared below) to review the diff of branch feature/x ag
 
 Codex sees only the prompt and the repository's `AGENTS.md`, so the prompt must carry the whole task: branch, allowed paths, how to verify, what to report.
 
-Override the model or effort for one agent by starting the prompt with these lines (the choice sticks for its follow-ups):
+### Choosing model and effort
+
+Choose a catalog model directly with an Agent type such as
+`codex-mod:gpt-6-1-sol` on the current host, or use `codex-mod:codex` with your configured defaults.
+With `modelAgents:true` (the default), session start registers one type per
+model with `visibility:list` in Codex's `models_cache.json`; its description
+lists supported reasoning efforts. The plugin first tries the exact slug;
+Claude Code 2.1.302 rejects dots in type names, so it logs a fallback with
+punctuation replaced by hyphens (`gpt-6.1-sol` → `gpt-6-1-sol`). The Codex
+model ID stays exact. Project roles also win collisions with these aliases.
+These types use the model's catalog effort
+default and `defaultSandbox`. If the catalog is unreadable, only the generic
+agent and project roles are offered. Project roles win name collisions.
+
+The coordinator can pass the native Agent `effort` parameter:
+
+```json
+{"subagent_type":"codex-mod:gpt-6-1-sol","effort":"high","description":"Check validation","prompt":"Review src/api.ts. Allowed paths: none. Report findings."}
+```
+
+Effort precedence is **prompt `codex-effort:` > Agent `effort` > role/model-type/generic
+default**. Native effort is validated against the resolved Codex model. An
+unsupported native value uses the agent's default (or that model's supported
+catalog default if necessary), with a visible note. The current host exposes
+Agent input `effort` to `tool.call` but omits it from `agent.spawn`; codex-mod
+binds the input by the real tool-use ID and also detects a future spawn
+`effort` field. If neither surface supplies it, defaults apply. The debug log
+records `spawn.effort` and `Agent.effort`; see the [Batch 7 harness](tests/fixtures/batch7-harness.md).
+
+[Project roles](#roles-per-project) provide named model, effort, sandbox and
+instruction defaults. Leading prompt lines remain the portable fallback,
+including efforts the host's Agent schema cannot spell (such as `ultra`):
 
 ```
 codex-model: gpt-6-luna
@@ -121,7 +152,20 @@ codex-effort: low
 Summarise what src/index.ts exports.
 ```
 
-An unknown model or unsupported effort fails with a clear error; nothing falls back silently.
+Prompt overrides stick for follow-ups. An unknown model or unsupported
+**prompt-line** effort fails with a clear error before any Codex launch.
+
+Launch titles read `Codex <model> · <effort> · <description>` for owned
+codex-mod spawns. The parent Agent row adds current model/effort text alongside
+the original native row, preserving its controls, status and navigation. The
+row and answer footer follow later model changes; the title records the
+launch choice. Resume/workflow titles are fixed by the host. Missing ownership
+or render failures retain the native row.
+
+The native model badge cannot display arbitrary GPT IDs: it may still show
+**Haiku**, the unused Claude execution placeholder. codex-mod keeps registered
+agents on `haiku`; putting a GPT ID there can change provider model selection.
+Titles, added row text and footers are the supported model visibility sites.
 
 Follow-ups go through `SendMessage` to the same agent and resume its Codex thread. A message sent while the agent is still running is delivered too, according to the transport (see [Transports](#transports)).
 
@@ -167,6 +211,7 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `defaultModel` | empty | Model of `codex-mod:codex`. Empty: first model Codex lists. |
 | `defaultEffort` | `medium` | Effort of `codex-mod:codex`; must be supported by the model. |
 | `defaultSandbox` | `workspace-write` | `read-only`, `workspace-write` or `danger-full-access`. |
+| `modelAgents` | `true` | Register an agent type for each listed Codex model; project roles win name collisions. |
 | `projectRoles` | `true` | Load roles from `.claude/codex-mod.json` at session start. Off: do not read the file. |
 | `allowProjectFullAccess` | `false` | Allow project roles to request `danger-full-access`. User-level opt-in. |
 | `lean` | `true` | Turn off Codex plugins, apps, skills instructions, web search, multi-agent and configured MCP servers per launch. |
@@ -256,7 +301,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 
 ## Limitations and known behaviours
 
-- The row label in Claude Code Desktop shows the placeholder Anthropic model the agent is registered with. That model is never called; the footer shows the real Codex model.
+- The native Claude model badge can still show the unused Haiku placeholder. Codex launch titles, added Agent-row text and footers show the real model and effort; separate header/task badges cannot display arbitrary GPT IDs.
 - In auto mode, every handback carries the note "Auto mode classifier was unavailable". No Anthropic request was made for the classifier to review, so the note is accurate: Claude did not review Codex's work. Verify it yourself.
 - The plugin relies on early-access APIs (`turn.step`, `tool.call`, `$.agent.register`, `SubagentHandback`) that may change.
 - Installing or editing the plugin takes effect in a new session.

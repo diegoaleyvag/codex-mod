@@ -304,6 +304,7 @@ export type Config = {
   globalRules: boolean
   generic: Profile
   projectRoles: boolean
+  modelAgents: boolean
   allowProjectFullAccess: boolean
   extraConfig: string[]
   intervalMs: number
@@ -386,6 +387,7 @@ export function parseConfig(raw: unknown): Config {
       sandbox: oneOf('defaultSandbox', 'workspace-write', SANDBOXES),
     },
     projectRoles: bool('projectRoles', true),
+    modelAgents: bool('modelAgents', true),
     allowProjectFullAccess: bool('allowProjectFullAccess', false),
     extraConfig,
     intervalMs: int('progressIntervalMs', 1000, 0, 60000),
@@ -407,6 +409,9 @@ export function parseConfig(raw: unknown): Config {
 /** Kept per agent between steps, runs, worker restarts and resumes. */
 export type AgentRecord = Profile & {
   agentName: string
+  // Only small row identity/profile metadata belongs in the host store.
+  selection?: { session: string; toolUseId: string; type: string; launchModel: string; launchEffort: string; note?: string }
+  modelRowIds?: string[]
   thread?: string
   lastTask?: string
   handedBack?: boolean
@@ -1033,6 +1038,31 @@ export function catalogLine(catalog: readonly ModelInfo[]): string {
   return catalog.map(m => (m.efforts.length > 0 ? `${m.slug} (${m.efforts.join('|')})` : m.slug)).join(', ')
 }
 
+/** One resolver for spawn presentation and execution. Explicit prompt errors
+ * still fail the run; an unsupported native Agent effort uses the default. */
+export function resolveProfile(base: Profile, task: string, list?: readonly ModelInfo[], nativeEffort?: unknown): { profile: Profile; rest: string; note?: string; invalid?: string } {
+  const o = parseOverrides(task)
+  const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
+  const info = list?.find(m => m.slug === model)
+  const defaultEffort = base.effort || info?.defaultEffort || FALLBACK_EFFORT
+  let effort = o.effort ?? defaultEffort
+  let note: string | undefined
+  if (o.effort === undefined && nativeEffort !== undefined) {
+    const supported = info?.efforts.length ? info.efforts : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+    if (typeof nativeEffort === 'string' && supported.includes(nativeEffort)) effort = nativeEffort
+    else {
+      effort = supported.includes(defaultEffort) ? defaultEffort
+        : info?.defaultEffort && supported.includes(info.defaultEffort) ? info.defaultEffort : supported[0]!
+      const supplied = typeof nativeEffort === 'string' ? oneLine(nativeEffort, 80) : typeof nativeEffort
+      note = `Agent effort ${JSON.stringify(supplied)} is not supported by ${model}; using default ${effort}`
+    }
+  }
+  return { profile: { model, effort, sandbox: base.sandbox }, rest: o.rest, note, invalid: checkProfile(list, model, effort) }
+}
+
+export const modelTitle = (profile: Pick<Profile, 'model' | 'effort'>, description: string): string =>
+  `Codex ${profile.model} · ${profile.effort} · ${description}`
+
 // ---- actions ---------------------------------------------------------------
 
 /** Unquotes one shell word (`'a'\''b'`, `"x \"y\""`, `pwd`); undefined if it is not exactly one word. */
@@ -1393,6 +1423,12 @@ let availableTools: Set<string> | undefined
 const agentTools = new Map<string, Set<string>>()
 // Session-start snapshot, refreshed only when registration is retried, never on cwd changes.
 let projectRoles = new Map<string, ProjectRole>()
+let modelProfiles = new Map<string, Profile>()
+type ModelLaunch = { session: string; toolUseId: string; type: string; parent?: string; description: string; prompt?: string;
+  profile: Profile; recordProfile: Profile; note?: string; host?: string }
+// Pending launch bodies stay in memory only. Durable rows bind to agent records.
+const modelLaunches = new Map<string, ModelLaunch>()
+const agentEfforts = new Map<string, unknown>()
 const projectNotified = new Set<string>()
 // False after a session start whose agent registration failed: retried once on the next main-loop step.
 let agentsReady = true
@@ -1465,8 +1501,81 @@ function holdAnswer(id: string, sid: string, agentId: string, action: Action): b
 /** The profile of an agent type name; undefined for a name this module does not define. */
 const profileOf = (name: string): Profile | undefined => {
   if (name === 'codex') return { ...cfg.generic }
-  const role = projectRoles.get(name)
+  const role = projectRoles.get(name) ?? modelProfiles.get(name)
   return role === undefined ? undefined : { model: role.model, effort: role.effort, sandbox: role.sandbox }
+}
+
+function ownedSpawn($: EngineInterface, e: any): string | undefined {
+  const prefix = `${$.plugin.name}:`
+  if (typeof e.subagentType !== 'string' || !e.subagentType.startsWith(prefix)) return
+  const provider = e.provider?.plugin
+  if (provider !== $.plugin.name && !(typeof provider === 'string' && provider.startsWith(`${$.plugin.name}@`))) return
+  return e.subagentType.slice(prefix.length)
+}
+
+async function bindModelLaunch($: EngineInterface, launch: ModelLaunch, host: string): Promise<void> {
+  const alreadyBound = launch.host === host
+  launch.host = host
+  const rec = await loadRecord($, host) ?? { ...launch.recordProfile, agentName: launch.type.slice(launch.type.indexOf(':') + 1), updatedAt: 0 }
+  if (!alreadyBound && !runs.has(host)) Object.assign(rec, launch.recordProfile)
+  rec.selection ??= { session: launch.session, toolUseId: launch.toolUseId, type: launch.type,
+    launchModel: launch.profile.model, launchEffort: launch.profile.effort, note: launch.note }
+  rec.selection.session = launch.session
+  const ids = [...new Set([...(rec.modelRowIds ?? [rec.selection.toolUseId]), launch.toolUseId])].filter(id => id.length <= 128)
+  rec.modelRowIds = [ids[0]!, ...ids.slice(1).slice(-7)].filter(Boolean)
+  delete launch.prompt
+  known.set(host, rec.agentName)
+  await saveRecord($, host, rec)
+  $.ui.invalidate('ui.render')
+}
+
+/** Core may start the first step before its spawn acknowledgement. Bind only
+ * a unique pending launch with the host's actual type/title/parent identity. */
+async function bindPendingModelLaunch($: EngineInterface, host: string, text?: string): Promise<void> {
+  if ((await loadRecord($, host))?.selection) return
+  const sid = await sessionId($)
+  const pending = [...modelLaunches.values()].filter(l => l.session === sid && !l.host && (text === undefined || l.prompt === text))
+  if (!pending.length) return
+  const info = (await $.agent.list()).find(a => a.id === host)
+  if (!info) return
+  const matches = pending.filter(l => l.type === info.type && l.description === info.description && l.parent === info.parentId)
+  if (matches.length === 1) await bindModelLaunch($, matches[0]!, host)
+  else if (matches.length > 1 && matches.every(l => stableJSON(l.recordProfile) === stableJSON(matches[0]!.recordProfile)) && !await loadRecord($, host)) {
+    // Identical concurrent titles cannot establish a row ID before the ack.
+    // Their agreed profile is still safe to checkpoint before the first step.
+    const name = info.type.slice(info.type.indexOf(':') + 1)
+    known.set(host, name)
+    await saveRecord($, host, { ...matches[0]!.recordProfile, agentName: name, updatedAt: 0 })
+  }
+}
+
+async function agentRowProfile($: EngineInterface, id: string): Promise<{ model: string; effort: string; note?: string } | undefined> {
+  const sid = await sessionId($)
+  const launch = modelLaunches.get(id)
+  if (launch?.session === sid) {
+    const rec = launch.host ? await loadRecord($, launch.host) : undefined
+    return { ...(rec ?? launch.profile), note: launch.note }
+  }
+  // A reopened row has no live launch or held executor capability.
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
+    const value = await $.store.get(key)
+    if (!isRecord(value) || value.selection?.session !== sid || value.selection.toolUseId !== id && !value.modelRowIds?.includes(id)) continue
+    const host = key.slice(`${STORE_PREFIX}${sid}:`.length)
+    const rec = await loadRecord($, host)
+    if (rec) return { ...rec, note: rec.selection?.note }
+  }
+  const owned = sourceRows.get(id)
+  if (!owned || owned.sessionId !== sid || owned.tool !== 'Agent') return
+  const source = owned.source
+  const data = source?.data
+  const mirror = data?.thread_id ? mirrors.get(mirrorKey(sid, data.thread_id)) : undefined
+  if (mirror) return { model: mirror.model, effort: mirror.effort }
+  const item = source?.item
+  const receivers = item?.receiverThreadIds ?? item?.receiver_thread_ids
+  const states = item?.agentsStates ?? item?.agents_states
+  const model = item?.model ?? states?.[receivers?.[0]]?.model
+  if (typeof model === 'string') return { model, effort: item.reasoningEffort ?? item.reasoning_effort ?? 'unreported effort' }
 }
 
 /** Shared by launches and live steers; instructions never enter task records or rendered notes. */
@@ -1609,7 +1718,7 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
     parent = list.find(a => a.id === parent!.parentId)
     if (!parent) return mirrorFallback($, run, data, 'host ancestry unavailable')
   }
-  const description = oneLine(`Codex ${data.model ?? run.prof.model} · ${data.path ?? data.thread_id}`, 120)
+  const description = modelTitle({ model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort }, oneLine(data.path ?? data.thread_id, 120))
   const token = `codex-mirror:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}:${Math.random().toString(36).slice(2)}`
   const input = { subagentType: `${$.plugin.name}:codex-child`, prompt: token, description, name: `codex-${data.thread_id}`, cwd: run.cwd }
   m = { version: 1, session: run.sessionId, thread: data.thread_id, parentThread: run.thread!, parentHost: run.agentId,
@@ -1852,6 +1961,12 @@ export const register: Register = (on, options) => {
     if (held) return next(e)
     if (guarded(e)) return answerGuarded(e, await sessionId($))
     if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
+    // The current host omits effort from agent.spawn but exposes the Agent
+    // input here. Keep it scoped to this real call's lifetime and tool ID.
+    if (e.tool === 'Agent' && typeof (e as any).subagent_type === 'string' && (e as any).subagent_type.startsWith(`${$.plugin.name}:`) && typeof e.tool_use_id === 'string') {
+      agentEfforts.set(e.tool_use_id, (e as any).effort)
+      try { return await next(e) } finally { agentEfforts.delete(e.tool_use_id) }
+    }
     return next(e)
   }).catch(($, e, next) => {
     if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
@@ -1881,6 +1996,18 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     const id = e.props.tool_use_id
+    if (e.props.tool === 'Agent') {
+      const profile = await agentRowProfile($, id)
+      if (profile) {
+        const { Box, Text } = $.ui.resolve(e)
+        // Retain the host tree, including status, navigation and accessibility.
+        const native = await next(e)
+        return Box({ flexDirection: 'column', children: [
+          Text({ weight: 'semibold', children: `Codex ${profile.model} · ${profile.effort}` }),
+          ...(profile.note ? [Text({ children: profile.note })] : []), native,
+        ] })
+      }
+    }
     let row = hasPrefix(id) ? coordinatorRows.get(id) : undefined
     // Reopened history need not have called turn.step or consumed a guard.
     // Restore presentation only; never restore an executable held answer.
@@ -1996,7 +2123,36 @@ export const register: Register = (on, options) => {
     .catch(($, e, next) => e.agent.endsWith(':codex-child') ? { isOffered: false } : next(e))
 
   on('agent.spawn', async ($, e, next) => {
-    if (e.subagentType !== `${$.plugin.name}:codex-child`) return next(e)
+    if (e.subagentType !== `${$.plugin.name}:codex-child`) {
+      const name = ownedSpawn($, e)
+      if (!name || e.fork) return next(e)
+      await loadCatalog($)
+      const base = e.resume ? await loadRecord($, e.resume.agentId) : undefined
+      const defaults = base ?? profileOf(name)
+      if (!defaults) return next(e)
+      const spawnEffort = (e as any).effort
+      const native = spawnEffort !== undefined ? spawnEffort : agentEfforts.get(e.tool_use_id)
+      const resolved = resolveProfile(defaults, e.prompt, catalog ?? undefined, native)
+      const tag = (v: unknown) => v === undefined ? 'absent' : typeof v === 'string' && /^[a-z]+$/.test(v) ? v : 'other'
+      $.ui.log(`codex-mod: model selection: spawn keys=${Object.keys(e).sort().join(',')}; spawn.effort=${tag((e as any).effort)}; Agent.effort=${tag(agentEfforts.get(e.tool_use_id))}; resolved=${resolved.profile.model}/${resolved.profile.effort}${resolved.note ? `; ${resolved.note}` : ''}`, { to: 'debug' })
+      // Workflow/resume content is fixed by core. Their row/footer can still
+      // show the selected profile without attempting a forbidden title edit.
+      const description = e.resume || e.workflow ? e.description : modelTitle(resolved.profile, e.description)
+      const launch: ModelLaunch = { session: await sessionId($), toolUseId: e.tool_use_id, type: e.subagentType,
+        parent: e.parentAgentId, description, prompt: e.prompt, profile: resolved.profile,
+        recordProfile: resolved.invalid ? resolveProfile(defaults, '', catalog ?? undefined).profile : resolved.profile, note: resolved.note }
+      modelLaunches.set(e.tool_use_id, launch)
+      try {
+        if (e.resume) await bindModelLaunch($, launch, e.resume.agentId)
+        const result = await next(description === e.description ? e : { ...e, description })
+        if (result.agentId) await bindModelLaunch($, launch, result.agentId)
+        else modelLaunches.delete(e.tool_use_id)
+        return result
+      } catch (err) {
+        modelLaunches.delete(e.tool_use_id)
+        throw err
+      }
+    }
     const held = heldMirrorSpawn(e, next.origin.plugin)
     flushMirrorDiagnostics($)
     if (!held) return { deny: 'codex-mod: unowned or unsupported mirror launch' }
@@ -2018,6 +2174,7 @@ export const register: Register = (on, options) => {
     await hydrateMirrors($)
     const held = [...mirrors.values()].find(m => m.token === e.text && m.launch === 'launching')
     if (held) await bindMirror($, held, e.agentId)
+    else await bindPendingModelLaunch($, e.agentId, e.text)
     return next(e)
   })
 
@@ -2050,6 +2207,7 @@ export const register: Register = (on, options) => {
       }
       return yield* next(e)
     }
+    await bindPendingModelLaunch($, e.agentId)
     let name: string | undefined
     try {
       name = await agentName($, e.agentId)
@@ -2298,7 +2456,8 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
   }
 }
 
-/** Registers the generic agent and each project role whose model Codex lists. */
+/** Registers generic, project and optional catalog types; all use haiku as
+ * the host execution placeholder, never a GPT provider model ID. */
 async function registerAgents($: EngineInterface, config: Config): Promise<boolean> {
   // without the display tools their rows degrade to text; the agents must still register
   await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
@@ -2308,7 +2467,7 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
   const list = catalog ?? undefined
   const models = list !== undefined ? ` Codex models available here: ${catalogLine(list)}.` : ''
   const override = ' Start the prompt with a line "codex-model: <model>" and/or "codex-effort: <effort>" to override the defaults.'
-  const specs: { name: string; description: string }[] = []
+  const specs: { name: string; description: string; profile?: Profile }[] = []
   const g = config.generic
   specs.push({
     name: 'codex',
@@ -2317,11 +2476,22 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
   for (const [name, r] of projectRoles) {
     specs.push({ name, description: `${r.description} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox (declared by this project).${override}${models}` })
   }
+  modelProfiles = new Map()
+  if (config.modelAgents) for (const info of list ?? []) {
+    const alias = info.slug.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64)
+    if (projectRoles.has(info.slug) || projectRoles.has(alias)) {
+      $.ui.log(`codex-mod: model agent ${info.slug} not registered: project role wins name collision`, { to: 'debug' })
+      continue
+    }
+    if (['codex', 'codex-child'].includes(info.slug)) continue
+    specs.push({ name: info.slug, profile: { model: info.slug, effort: info.defaultEffort || info.efforts[0] || FALLBACK_EFFORT, sandbox: g.sandbox },
+      description: `OpenAI Codex ${info.slug}; pass effort to choose reasoning (${info.efforts.join(', ') || 'not reported'})` })
+  }
   specs.push({ name: 'codex-child', description: 'Internal observation loop for an existing Codex child. Never dispatch directly.' })
   for (const s of specs) {
     try {
       const tools = [...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (config.richRows || tool === 'Agent' && config.nestedAgents || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)]
-      await $.agent.register({
+      const spec = {
         name: s.name,
         description: s.description,
         prompt: PLACEHOLDER_PROMPT,
@@ -2333,8 +2503,20 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
         maxTurns: 400,
         background: true,
         omitClaudeMd: true,
-      })
-      agentTools.set(s.name, new Set(tools))
+      }
+      try {
+        await $.agent.register(spec)
+      } catch (err) {
+        // 2.1.302 rejects dots at the API boundary, before registration hooks.
+        // Try the literal slug first so a future host can support exact names.
+        const alias = s.name.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64)
+        if (!s.profile || alias === s.name || !alias || modelProfiles.has(alias) || ['codex', 'codex-child'].includes(alias)) throw err
+        $.ui.log(`codex-mod: model type ${s.name} refused (${errText(err)}); registering ${alias} for Codex ${s.profile.model}`, { to: 'debug' })
+        spec.name = alias
+        await $.agent.register(spec)
+      }
+      if (s.profile) modelProfiles.set(spec.name, s.profile)
+      agentTools.set(spec.name, new Set(tools))
     } catch (err) {
       failed = true
       $.ui.log(`codex-mod: agent ${s.name} not registered: ${errText(err)}`, { to: 'debug' })
@@ -2755,16 +2937,12 @@ async function* startRun(
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const agentId = e.agentId!
   await loadCatalog($)
-  const list = catalog ?? undefined
-  const o = parseOverrides(rawTask)
-  const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
+  const resolved = resolveProfile(base, rawTask, catalog ?? undefined)
   const lastTask = delivery !== undefined && base.lastTask !== undefined ? base.lastTask : rawTask
   const rec: AgentRecord = {
     ...base,
     agentName: name,
-    model,
-    effort: o.effort ?? (base.effort || list?.find(m => m.slug === model)?.defaultEffort || FALLBACK_EFFORT),
-    sandbox: base.sandbox,
+    ...resolved.profile,
     thread: base.thread,
     lastTask,
     userCount: count,
@@ -2775,7 +2953,7 @@ async function* startRun(
     updatedAt: base.updatedAt,
   }
   const prof: Profile = { model: rec.model, effort: rec.effort, sandbox: rec.sandbox }
-  const invalid = checkProfile(list, prof.model, prof.effort)
+  const invalid = resolved.invalid
   if (invalid !== undefined) {
     // nothing runs; the record keeps the last profile that could
     await saveRecord($, agentId, { ...base, agentName: name, lastTask, userCount: count, handedBack: false, handback, redeliveries: 0 })
@@ -2808,7 +2986,9 @@ async function* startRun(
   rec.launchKey = key
   rec.guardTrip = undefined
   await saveRecord($, agentId, rec)
-  const task = roleTask(name, o.rest)
+  $.ui.invalidate('ui.render')
+  if (base.lastTask === undefined && base.selection?.note) carry = [carry, `↪ ${base.selection.note}`].filter(Boolean).join('\n\n')
+  const task = roleTask(name, resolved.rest)
 
   const cwd = await $.session.cwd()
   const lean = config.lean ? await leanArgs($) : []

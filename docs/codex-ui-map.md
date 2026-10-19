@@ -235,3 +235,49 @@ stop usage stays null, preventing parent-tree/child-direct double counting.
 No native GPT badge or zero auxiliary host inference claim follows from this
 accounting. See the [nested harness](../tests/fixtures/nested-harness.md) for
 core task, provider-boundary and NEW Desktop checks.
+
+
+## Model and effort visibility (Batch 7, M2/M3)
+
+The shared `resolveProfile` selects the actual model/effort for agent.spawn
+presentation and startRun execution on both transports. Leading prompt lines
+win over the native Agent effort, then role/model-type/generic defaults.
+Native effort is read from `tool.call`'s flat Agent input by tool-use ID;
+`agent.spawn.effort` is also detected if supplied by a later host. The supplied
+API snapshot and installed 2.1.302 spawn-event builder omit effort but include
+model, parentModel, permissionMode and provider. Debug diagnostics distinguish
+both effort surfaces and absence. Unsupported native efforts visibly fall back;
+invalid prompt profiles still fail without launching Codex.
+
+M2 prefixes only pinned codex-mod types/providers with
+`Codex <model> · <effort> · <description>`. Normal Claude agents and fixed
+resume/workflow descriptions pass through. Nested observers construct the
+same prefix before the mirror capability digest, preserving admission.
+The title records launch selection; there is no supported title setter for
+later profile changes.
+
+M3 binds the real spawn tool-use ID to the actual host agent's compact record,
+with pending-launch identity checks before an early first step. The ToolUse
+renderer matches only these owned Agent IDs or owned synthetic child rows.
+It adds literal current model/effort text around the original native tree;
+status, errors, navigation and accessibility remain the host's. Rendering
+errors or missing state fall back to the native tree. Compact row IDs survive
+reopened history; prompt bodies/catalogs stay out of $.store. Follow-up runs
+invalidate the row and the footer uses the same selected execution profile.
+
+The native header/activity/task model badge recognizes Claude families and
+cannot be made to display arbitrary GPT IDs through this plugin API. All
+registered types retain `model:haiku`; GPT registration risks provider request
+selection. No model request, usage projection or tool execution is induced by
+presentation. `modelAgents:true` offers one type per listed catalog slug,
+independent of the placeholder. The host registration API permits only
+letters, digits, underscores and hyphens (64 characters), so unsupported
+literal slugs fall back to a logged sanitized alias, e.g.
+`codex-mod:gpt-6-1-sol` still launches `gpt-6.1-sol`. Project roles win both
+literal and alias collisions.
+
+The native-actions default remains enabled. The existing richRows default
+remains false pending the matrix's NEW Desktop acceptance for task placement
+and native controls; this batch does not promote unverified candidates.
+See the [Batch 7 harness](../tests/fixtures/batch7-harness.md) for host-field,
+provider-boundary and live rendering checks.

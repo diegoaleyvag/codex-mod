@@ -51,6 +51,12 @@
       "description": "Read .claude/codex-mod.json in the session working directory at session start and register its roles besides codex. Off: do not read the file.",
       "default": true
     },
+    "modelAgents": {
+      "type": "boolean",
+      "title": "Agent types per Codex model",
+      "description": "Register each visible model in models_cache.json as a codex-mod agent type. Hosts that reject slug punctuation use a logged hyphenated alias. Project roles win name collisions.",
+      "default": true
+    },
     "allowProjectFullAccess": {
       "type": "boolean",
       "title": "Allow project full access",
