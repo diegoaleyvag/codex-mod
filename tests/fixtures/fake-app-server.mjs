@@ -6,6 +6,7 @@ import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from '
 import { dirname, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import batch4Items from './batch4-items.mjs'
+import batch5Items from './batch5-items.mjs'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
 // and the whole turn in ONE stdout write), steer / steer-reject / hang / deaf
@@ -125,6 +126,19 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch5-plans-children') {
+        for (const entry of batch5Items) {
+          if (entry.plan) note('turn/plan/updated', { threadId: THREAD, turnId: TURN, ...entry.plan })
+          else {
+            const item = entry.item
+            note('item/started', { threadId: THREAD, turnId: TURN, item: { ...item, status: 'inProgress' } })
+            note('item/completed', { threadId: THREAD, turnId: TURN, item })
+            note('item/completed', { threadId: THREAD, turnId: TURN, item })
+          }
+        }
+        complete('completed')
+        break
+      }
       if (scenario === 'batch4-web-tools') {
         for (const item of batch4Items) {
           note('item/started', { threadId: THREAD, turnId: TURN, item: { ...item, ...('status' in item ? { status: 'inProgress' } : {}), results: null, result: null, contentItems: null } })

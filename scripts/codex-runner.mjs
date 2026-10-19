@@ -181,7 +181,7 @@ function completedItem(item, changesOf) {
     case 'mcpToolCall': return { type: 'mcp_tool_call', server: item.server, tool: item.tool, arguments: item.arguments, result: item.result, error: item.error, status: item.status }
     case 'dynamicToolCall': return { type: 'dynamic_tool_call', namespace: item.namespace, tool: item.tool, arguments: item.arguments, content_items: item.contentItems, success: item.success, status: item.status }
     case 'plan': return { type: 'proposed_plan', text: item.text }
-    case 'collabAgentToolCall': return { type: 'collab_tool_call', tool: item.tool.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`), receiver_thread_ids: item.receiverThreadIds, prompt: item.prompt, agents_states: item.agentsStates, status: item.status }
+    case 'collabAgentToolCall': return { ...item, type: 'collab_tool_call', tool: item.tool.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`), receiver_thread_ids: item.receiverThreadIds, agents_states: item.agentsStates }
     case 'subAgentActivity': {
       const agent = String(item.agentPath || item.agentThreadId).replace(/\s+/g, ' ')
       const text = item.kind === 'completed' ? `Codex agent ${agent} finished`

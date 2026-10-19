@@ -7,6 +7,8 @@ import { patchActions, parsePatch } from '../hooks/patches.ts'
 import batch4Items from './fixtures/batch4-items.mjs'
 import { webAction, toolFallback, publicToolText } from '../hooks/web-tools.ts'
 import { absolute } from '../hooks/codex.ts'
+import { childRows, planRows, emptyDisplayState, planText, displayChildId } from '../hooks/plans-children.ts'
+import batch5Items, { CHILD as B5_CHILD, THREAD as B5_THREAD } from './fixtures/batch5-items.mjs'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
@@ -2690,9 +2692,9 @@ test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, p
   expect(dynamic.action.result[0].text).toContain('omitted')
   expect(dynamic.action.result[0].text.includes('PRIVATE_IMAGE')).toBe(false)
   for (const type of ['item.started', 'item.updated', 'item.completed']) {
-    expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: 'Plan updated by Codex' }], input: { steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] } } })
+    expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: planText({ steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] }) }], input: { steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] } } })
   }
-  expect(parseCodexLine(itemLine(planItem, 'item.updated'))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: 'Plan updated by Codex' }], input: { explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] } } })
+  expect(parseCodexLine(itemLine(planItem, 'item.updated'))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: planText({ explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] }) }], input: { explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] } } })
   expect(parseCodexLine(itemLine({ type: 'proposed_plan', text: 'Do the work.' }))).toEqual({ kind: 'interim', text: 'Proposed plan:\nDo the work.' })
   expect(parseCodexLine(itemLine({ type: 'note', text: 'Codex compacted context', dim: true }))).toEqual({ kind: 'note', text: '↪ Codex compacted context', dim: true })
   expect(parseCodexLine(itemLine({ type: 'agent_message', phase: 'commentary', text: 'Working.' }))).toEqual({ kind: 'interim', text: 'Working.' })
@@ -2700,11 +2702,14 @@ test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, p
   expect(parseCodexLine(itemLine({ type: 'error', message: 'Configuration notice' }))).toEqual({ kind: 'other' })
 })
 
-test('phase 3 parser: collaboration notes are one line and wait calls disappear', async () => {
+test('phase 3 parser: full collaboration fallback and waits without state transitions', () => {
   const spawn = { type: 'collab_tool_call', tool: 'spawn_agent', prompt: 'Inspect tests.\nReport back.', receiver_thread_ids: ['child-1'] }
-  expect(parseCodexLine(itemLine(spawn))).toEqual({ kind: 'note', text: '↪ Codex spawned an agent: Inspect tests. Report back.' })
-  expect(parseCodexLine(itemLine({ ...spawn, tool: 'send_input' }))).toEqual({ kind: 'note', text: '↪ Codex messaged child-1' })
-  expect(parseCodexLine(itemLine({ ...spawn, tool: 'sendMessage' }))).toEqual({ kind: 'note', text: '↪ Codex messaged child-1' })
+  for (const tool of ['spawn_agent', 'send_input', 'sendMessage']) {
+    const ev: any = parseCodexLine(itemLine({ ...spawn, tool }))
+    expect(ev.display).toBe('codex_tool')
+    expect(ev.action.input.arguments.prompt).toBe(spawn.prompt)
+    expect(ev.action.result[0].text).toContain('richRows disabled')
+  }
   expect(parseCodexLine(itemLine({ ...spawn, tool: 'wait' }))).toEqual({ kind: 'other' })
 })
 
@@ -2734,23 +2739,23 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   const first = await step($, 'agent-progress')
   expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
   expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
-  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__codex_tool'])
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_tool'])
   expect(callsOf(first.chunks)[1].input).toEqual({ server: 'docs', name: 'lookup', arguments: { topic: 'options' } })
   expect(callsOf(first.chunks)[3].input).toEqual({ server: 'local', name: 'inspect', arguments: {} })
   const results: any[] = await runCalls($, first.chunks, 'agent-progress')
   expect(results[0].result.results[0].content[0].url).toBe('https://example.test/docs')
   expect(results[1].result[0].text).toContain('Found options.')
-  expect(results[2]).toEqual({ result: [{ type: 'text', text: 'Plan updated by Codex' }] })
+  expect(results[2]).toEqual({ result: [{ type: 'text', text: planText({ explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] }) }] })
   expect(results[3].deny).toContain('Inspection failed.')
   const second = await step($, 'agent-progress', 1)
   const texts = second.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
-  expect(texts).toContain('Proposed plan:\n1. Verify')
+  expect(first.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')).toContain('Proposed plan:\n1. Verify')
   expect(texts).toContain('↪ Codex compacted context')
   expect(handback(second.result)).toContain('Verified.')
-  expect(handback(second.result)).toContain('↪ Codex spawned an agent: Inspect tests')
-  expect(handback(second.result)).toContain('↪ Codex messaged child-1')
+  expect(results[4].result[0].text).toContain('spawn_agent')
+  expect(results[5].result[0].text).toContain('send_input')
   expect(handback(second.result)).toContain('↪ Codex agent reviewer finished')
-  expect(handback(second.result)).toContain('4 actions')
+  expect(handback(second.result)).toContain('6 actions')
   expect(handback(second.result)).not.toContain('Checking sources.')
   expect(handback(second.result)).not.toContain('Proposed plan:')
   expect(JSON.stringify([first, second])).not.toContain('PRIVATE')
@@ -2799,7 +2804,7 @@ test('phase 3 nativeActions false degrades new items into text in one step', { o
   expect(s.result.answer).toContain('Searched by Codex: example docs')
   expect(s.result.answer).toContain('Codex called docs.lookup')
   expect(s.result.answer).toContain('Codex called local.inspect')
-  expect(s.result.answer).toContain('Codex updated plan: [completed] Inspect; [in_progress] Test; [pending] Report')
+  expect(s.result.answer).toContain('Verify\nCodex plan (display only):\n[x] Inspect\n[-] Test\n[ ] Report')
   expect(s.result.answer).toContain('Proposed plan:\nVerify it.')
   expect(s.result.answer).toContain('↪ Codex compacted context')
   expect(s.result.answer).toContain('Done.')
@@ -2891,15 +2896,11 @@ const spawnItem = {
 
 // The completed branch of the host's output union, including every required field.
 const spawnResult: Extract<BuiltinToolResults['Agent'], { status: 'completed' }> = {
-  agentId: 'codex-child-1', agentType: 'codex-mod:codex', status: 'completed',
+  agentId: 'codex-display-sess-1-child-1', agentType: 'codex-mod:codex', status: 'completed',
   prompt: spawnItem.prompt, canContinueAgent: false, resolvedModel: 'gpt-6.1-sol',
-  content: [{ type: 'text', text: 'Codex reported child-1 (reviewer): running, model gpt-6.1-sol. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported.' }],
+  content: [{ type: 'text', text: 'Codex spawn returned; child child-1: running. Model gpt-6.1-sol. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported. Child transcript unavailable; no host child task exists.' }],
   totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
-  usage: {
-    input_tokens: 0, output_tokens: 0,
-    cache_creation_input_tokens: null, cache_read_input_tokens: null,
-    server_tool_use: null, service_tier: null, cache_creation: null,
-  },
+  usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, server_tool_use: null, service_tier: null, cache_creation: null },
 }
 
 test('richRows is opt-in and rejects non-boolean options', () => {
@@ -2908,33 +2909,17 @@ test('richRows is opt-in and rejects non-boolean options', () => {
   expect(parseConfig({ richRows: 'true' })).toMatchObject({ richRows: false, warnings: ['richRows: not a boolean; default used'] })
 })
 
-test('rich parser: completed spawns use Agent input fields and a Codex text result', () => {
-  const expected = {
-    kind: 'action', action: {
-      tool: 'Agent',
-      input: { description: 'Inspect the tests.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' },
-      result: spawnResult,
-    },
+test('rich parser: completed spawn call and failure use different result paths', () => {
+  const ev: any = parseCodexLine(itemLine(spawnItem), true)
+  expect(ev.action.input).toEqual({ description: 'Codex spawn: Inspect the tests. Report findings.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' })
+  expect(ev.action.result).toEqual({ ...spawnResult, agentId: 'codex-display-unreported-child-1' })
+  for (const status of ['failed', 'declined']) {
+    const failed: any = parseCodexLine(itemLine({ ...spawnItem, status }), true)
+    expect(failed.action.result).toEqual({})
+    expect(failed.action.error).toContain(status)
+    expect(validAction(failed.action)).toBe(true)
   }
-  expect(parseCodexLine(itemLine(spawnItem), true)).toEqual(expected)
-  expect(parseCodexLine(itemLine({
-    type: 'collabAgentToolCall', tool: 'spawnAgent', prompt: spawnItem.prompt, status: 'completed', model: spawnItem.model,
-    receiverThreadIds: spawnItem.receiver_thread_ids, agentsStates: spawnItem.agents_states,
-  }), true)).toEqual(expected)
   for (const type of ['item.started', 'item.updated']) expect(parseCodexLine(itemLine(spawnItem, type), true)).toEqual({ kind: 'other' })
-  const long: any = parseCodexLine(itemLine({ ...spawnItem, prompt: `${'A'.repeat(80)}\nSecond line` }), true)
-  expect(long.action.input.description).toBe(`${'A'.repeat(57)}...`)
-  expect(long.action.input.prompt).toBe(`${'A'.repeat(80)}\nSecond line`)
-  const unnamed: any = parseCodexLine(itemLine({ type: 'collab_tool_call', tool: 'spawn_agent', status: 'failed' }), true)
-  expect(unnamed.action.input).toEqual({ description: 'Codex sub-agent', prompt: '', subagent_type: 'codex-mod:codex' })
-  expect(unnamed.action.result.content[0].text).toBe('Codex reported agent: failed. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported.')
-  expect(unnamed.action.result).toMatchObject({ agentId: 'codex-agent', status: 'completed', canContinueAgent: false })
-  expect(unnamed.action.result.resolvedModel).toBe(undefined)
-  for (const tool of ['send_input', 'close_agent', 'wait', 'wait_agent']) {
-    expect(parseCodexLine(itemLine({ ...spawnItem, tool }), true)).toEqual(parseCodexLine(itemLine({ ...spawnItem, tool })))
-  }
-  const activity = itemLine({ type: 'note', text: 'Codex agent /root/reviewer finished' })
-  expect(parseCodexLine(activity, true)).toEqual({ kind: 'note', text: '↪ Codex agent /root/reviewer finished' })
 })
 
 test('rich parser: exec todos and normalized app-server plan updates use required TodoWrite fields', () => {
@@ -2997,11 +2982,11 @@ for (const toolListThrows of [false, true]) {
     expect(calls[1].input).toEqual({ steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] })
     expect(calls[2].input).toEqual({ explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] })
     const results: any[] = await runCalls($, first.chunks, 'agent-progress')
-    if (toolListThrows) expect(results[0].result[0].text).toContain('Agent unavailable')
+    if (toolListThrows) expect(results[0].result[0].text).toContain('unavailable')
     else expect(results[0].result).toEqual(spawnResult)
     expect(results.slice(1)).toEqual([
-      { result: [{ type: 'text', text: 'Plan updated by Codex' }] },
-      { result: [{ type: 'text', text: 'Plan updated by Codex' }] },
+      { result: [{ type: 'text', text: planText({ steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] }) }] },
+      { result: [{ type: 'text', text: planText({ explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] }) }] },
     ])
     const final = await step($, 'agent-progress', 1)
     expect(handback(final.result)).toContain('3 actions')
@@ -3025,7 +3010,7 @@ test('rich rows are guarded, counted and refuse foreign ids, owners, tools and r
     const [c] = callsOf(s.chunks)
     expect(c.name).toBe(index === 0 ? 'Agent' : 'TodoWrite')
     expect(c.input).toEqual(index === 0
-      ? { description: 'Inspect the tests.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' }
+      ? { description: 'Codex spawn: Inspect the tests. Report findings.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' }
       : { todos: [
         { content: 'Inspect', status: 'completed', activeForm: 'Inspect' },
         { content: 'Test', status: 'in_progress', activeForm: 'Test' },
@@ -3087,17 +3072,17 @@ for (const richRows of [false, true]) {
   })
 }
 
-test('richRows false preserves the spawn note and display-only plan row', { options: { richRows: false } }, async ($, on) => {
+test('richRows false preserves full spawn and display-only plan cards', { options: { richRows: false } }, async ($, on) => {
   const w = world(on, { pieces: [itemPiece(spawnItem), itemPiece(planItem), MESSAGE('Done.')] })
   const first = await step($, 'agent-progress')
-  expect(first.chunks[0]).toEqual({ kind: 'text', index: 0, text: '↪ Codex spawned an agent: Inspect the tests. Report findings.' })
-  expect(callsOf(first.chunks).map(c => [c.name, c.input])).toEqual([['mcp__codex-mod__codex_plan', {
-    explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }],
-  }]])
-  const [result] = await runCalls($, first.chunks, 'agent-progress')
-  expect(result.result).toEqual([{ type: 'text', text: 'Plan updated by Codex' }])
-  const final = await step($, 'agent-progress', 1)
-  expect(handback(final.result)).toContain('1 action')
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['mcp__codex-mod__codex_tool'])
+  const [spawn] = await runCalls($, first.chunks, 'agent-progress')
+  expect(spawn.result[0].text).toContain('Inspect the tests.')
+  const second = await step($, 'agent-progress', 1)
+  const [plan] = await runCalls($, second.chunks, 'agent-progress')
+  expect(plan.result[0].text).toContain('[x] Inspect')
+  const final = await step($, 'agent-progress', 2)
+  expect(handback(final.result)).toContain('2 actions')
   expect(w.core).toEqual([])
 })
 
@@ -3105,8 +3090,8 @@ test('rich rows with nativeActions false degrade to text and retain action count
   const w = world(on, { pieces: [itemPiece(spawnItem), itemPiece(planItem), MESSAGE('Done.')] })
   const s = await step($, 'agent-plain')
   expect(callsOf(s.chunks)).toEqual([])
-  expect(s.result.answer).toContain('Codex spawned an agent: Inspect the tests. Report findings.')
-  expect(s.result.answer).toContain('Codex updated plan: [completed] Inspect; [in_progress] Test; [pending] Report')
+  expect(s.result.answer).toContain('Codex spawn returned; child child-1: running')
+  expect(s.result.answer).toContain('Verify\nCodex plan (display only):\n[x] Inspect\n[-] Test\n[ ] Report')
   expect(s.result.answer).toContain('2 actions')
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
@@ -4242,4 +4227,207 @@ test('batch 4 open uses matched source timing before choosing its native row', a
   const [answer]: any[] = await runCalls($, first.chunks, 'agent-progress')
   expect(answer.result.durationMs).toBe(20)
   expect(w.core).toEqual([])
+})
+
+// ---- Batch 5: shadow plans and nonexecuting child operation rows ----------
+const b5Context = (tools = ['TaskCreate', 'TaskUpdate'], extra = {}) => ({ session: 's', agent: 'a', thread: 't', turn: 'turn', rich: true, tools: new Set(tools), ...extra })
+const b5Actions = (rows: ReturnType<typeof planRows>) => rows.filter((r): r is Extract<typeof r, { kind: 'action' }> => r.kind === 'action').map(r => r.action)
+
+test('batch 5 plan identity: rename, reorder, duplicates, completion, clear and restored snapshots', () => {
+  let state = emptyDisplayState()
+  const ctx = b5Context()
+  const input: any = { explanation: 'Start', steps: [{ step: 'A', status: 'pending' }, { step: 'B', status: 'in_progress' }, { step: 'B', status: 'pending' }] }
+  const first = b5Actions(planRows(input, state, ctx))
+  expect(first.map(a => a.tool)).toEqual(['TaskCreate', 'TaskCreate', 'TaskUpdate', 'TaskCreate'])
+  const ids = state.plans.t.steps.map(s => s.id)
+  expect(new Set(ids).size).toBe(3)
+  expect(planRows(input, state, ctx)).toEqual([])
+  state = JSON.parse(JSON.stringify(state))
+  const progress: any = { explanation: 'Progress', steps: input.steps.map(s => ({ ...s, status: 'completed' })) }
+  const updates = b5Actions(planRows(progress, state, ctx))
+  expect(updates.every(a => a.tool === 'TaskUpdate' && validAction(a))).toBe(true)
+  expect(state.plans.t.steps.map(s => s.id)).toEqual(ids)
+  const reordered = { ...progress, steps: [progress.steps[1], progress.steps[0], progress.steps[2]] }
+  const reorder = b5Actions(planRows(reordered, state, ctx))
+  expect(reorder.filter(a => a.input.status === 'deleted').map(a => a.input.taskId)).toEqual([ids[0], ids[1]])
+  expect(state.plans.t.steps[2].id).toBe(ids[2])
+  const renamed: any = { steps: [{ step: 'Renamed', status: 'pending' }] }
+  expect(b5Actions(planRows(renamed, state, ctx)).filter(a => a.tool === 'TaskCreate').length).toBe(1)
+  const clear = b5Actions(planRows({ steps: [] }, state, ctx))
+  expect(clear.map(a => a.input.status)).toEqual(['deleted'])
+  expect(planRows({ steps: [] }, state, ctx)).toEqual([])
+  for (const a of [...first, ...updates, ...reorder, ...clear]) expect(validAction(a)).toBe(true)
+  const isolated = emptyDisplayState()
+  planRows(input, isolated, b5Context([], { thread: 'other' }))
+  expect(state.plans.other).toBe(undefined)
+  planRows(input, state, b5Context(['TaskCreate', 'TaskUpdate'], { thread: 'other' }))
+  expect(state.plans.other.steps.some(s => ids.includes(s.id))).toBe(false)
+  const foreign = emptyDisplayState()
+  planRows(input, foreign, b5Context(['TaskCreate', 'TaskUpdate'], { agent: 'another' }))
+  expect(foreign.plans.t.steps.some(s => ids.includes(s.id))).toBe(false)
+})
+
+test('batch 5 plan admission: exact TodoWrite history, paired Task tools, fallback checklist and surface changes', () => {
+  const state = emptyDisplayState()
+  const first: any = { steps: [{ step: 'A', status: 'pending' }] }
+  const next: any = { explanation: 'Done\nFull explanation', steps: [{ step: 'A', status: 'completed' }] }
+  const todo = b5Context(['TodoWrite', 'TaskCreate', 'TaskUpdate'])
+  expect(b5Actions(planRows(first, state, todo))[0].result).toEqual({ oldTodos: [], newTodos: [{ content: 'A', status: 'pending', activeForm: 'A' }] })
+  expect(b5Actions(planRows(next, state, todo))[0].result).toEqual({ oldTodos: [{ content: 'A', status: 'pending', activeForm: 'A' }], newTodos: [{ content: 'A', status: 'completed', activeForm: 'A' }] })
+  for (const tools of [[], ['TaskCreate'], ['TaskUpdate']]) {
+    const row = b5Actions(planRows(next, emptyDisplayState(), b5Context(tools)))[0]
+    expect(row.tool).toBe('codex_plan')
+    expect(row.result).toEqual([{ type: 'text', text: planText(next) }])
+  }
+  const switched = b5Actions(planRows(next, state, b5Context()))
+  expect(switched.map(a => a.tool)).toEqual(['TaskCreate', 'TaskUpdate'])
+  expect(b5Actions(planRows({ steps: [] }, emptyDisplayState(), b5Context([])))[0].result[0].text).toContain('empty checklist')
+})
+
+test('batch 5 child identity, completed spawn vs child lifetime, failed spawn, waits and activity dedup', () => {
+  let state = emptyDisplayState()
+  const ctx = b5Context(['Agent', 'SendMessage', 'TaskStop'])
+  const spawn: any = batch5Items.find(e => e.item?.id === 'spawn').item
+  const [a] = b5Actions(childRows(spawn, state, ctx))
+  expect(validAction(a)).toBe(true)
+  expect(a.result).toMatchObject({ status: 'completed', canContinueAgent: false, totalTokens: 0, agentId: displayChildId('s', B5_CHILD) })
+  expect(a.result.content[0].text).toContain('child ' + B5_CHILD + ': running')
+  expect(a.result.content[0].text).toContain('usage and duration unreported')
+  expect(a.result.content[0].text).toContain('no host child task')
+  const started: any = batch5Items.find(e => e.item?.id === 'started').item
+  expect(childRows(started, state, ctx)).toEqual([])
+  for (const status of ['failed', 'declined']) {
+    const denied = b5Actions(childRows({ ...spawn, status, receiverThreadIds: ['failed-child'], agentsStates: {} }, state, ctx))[0]
+    expect(denied.error).toContain(status)
+    expect(denied.result).toEqual({})
+    expect(state.children[JSON.stringify(['t', 'failed-child'])]).toBe(undefined)
+  }
+  state = JSON.parse(JSON.stringify(state))
+  const send: any = batch5Items.find(e => e.item?.id === 'send').item
+  const sent = b5Actions(childRows(send, state, b5Context(['SendMessage'], { session: 'resumed' })))[0]
+  expect(sent.input.to).toEqual({ agentId: a.result.agentId })
+  expect(sent.input.message).toBe(send.prompt)
+  expect(sent.result).toEqual({ status: 'completed', agentsStates: send.agentsStates })
+  expect(validAction(sent)).toBe(true)
+  expect(childRows({ ...send, tool: 'wait' }, state, ctx)).toEqual([])
+  const completed: any = batch5Items.find(e => e.item?.id === 'wait-completed').item
+  const transition = childRows(completed, state, ctx)
+  expect(transition.length).toBe(1)
+  expect(transition[0].text).toContain('after 1200 ms')
+  expect(transition[0].text).toContain('Exact child report\nAll checks passed.')
+  expect(childRows(batch5Items.find(e => e.item?.id === 'completed').item, state, ctx)).toEqual([])
+  expect(childRows(completed, state, ctx)).toEqual([])
+})
+
+test('batch 5 output contracts reject host IDs, owner/dependency writes, wrong updated fields and null send', () => {
+  const state = emptyDisplayState()
+  const plans = b5Actions(planRows({ steps: [{ step: 'A', status: 'completed' }] }, state, b5Context()))
+  for (const a of plans) expect(validAction(a)).toBe(true)
+  const create: any = plans[0], update: any = plans[1]
+  const close: any = b5Actions(childRows(batch5Items.find(e => e.item?.id === 'close').item, state, b5Context(['TaskStop'])))[0]
+  const send: any = b5Actions(childRows(batch5Items.find(e => e.item?.id === 'send').item, state, b5Context(['SendMessage'])))[0]
+  for (const malformed of [
+    { ...create, result: { task: { id: 'real-host-id', subject: create.input.subject } } },
+    { ...update, input: { ...update.input, taskId: 'real-host-id' } },
+    { ...update, input: { ...update.input, owner: 'main' } },
+    { ...update, input: { ...update.input, addBlocks: ['real-host-id'] } },
+    { ...update, result: { ...update.result, updatedFields: ['owner'] } },
+    { ...update, result: { ...update.result, statusChange: { from: 'pending', to: 'pending' } } },
+    { ...close, input: { task_id: 'real-host-child' } },
+    { ...close, result: { ...close.result, task_type: 'local_agent' } },
+    { ...send, result: null },
+    { ...send, result: { success: true, message: 'Delivered' } },
+    { ...send, input: { ...send.input, to: { agentId: 'real-host-child' } } },
+  ]) expect(validAction(malformed)).toBe(false)
+})
+
+const b5Stream = (transport: 'exec' | 'app-server') => [JSON.stringify({ type: 'thread.started', thread_id: B5_THREAD }), ...batch5Items.flatMap((entry: any, index) => {
+  if (entry.plan) return [JSON.stringify({ type: 'item.updated', thread_id: B5_THREAD, turn_id: 'b5-turn', item: { type: 'plan_update', id: 'plan-' + index, explanation: entry.plan.explanation, steps: entry.plan.plan } })]
+  const item = entry.item
+  return ['item.started', 'item.completed', 'item.completed'].map(event => JSON.stringify(transport === 'exec'
+    ? { type: event, turn_id: 'b5-turn', item: { ...execItem(item), ...(event === 'item.started' ? { status: 'in_progress' } : {}) } }
+    : { type: event, item: item.type === 'agentMessage' ? { type: 'agent_message', text: item.text, phase: item.phase } : { type: 'source_only' }, source: { transport, event: event.replace('.', '/'), threadId: B5_THREAD, turnId: 'b5-turn', item: { ...item, ...(event === 'item.started' ? { status: 'inProgress' } : {}) } } }))
+})].join('\n') + '\n'
+
+for (const transport of ['exec', 'app-server'] as const) for (const surface of ['tasks', 'todo', 'display', 'absent', 'registration-fails', 'text'] as const) {
+  test(`batch 5 ${transport} ${surface}: own admission, source binding, schema, replay and no host execution`, { options: { richRows: surface !== 'display', nativeActions: surface !== 'text', transport, progressIntervalMs: 0 } }, async ($, on) => {
+    const tools = surface === 'absent' || surface === 'registration-fails' ? [] : ['Agent', 'SendMessage', 'TaskStop', ...(surface === 'todo' ? ['TodoWrite'] : ['TaskCreate', 'TaskUpdate'])]
+    const w = world(on, { availableTools: tools, stdout: b5Stream(transport), toolRegisterThrows: surface === 'registration-fails' ? 'codex_tool' : undefined })
+    if (transport === 'app-server') {
+      on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? `/usr/local/bin/${e.argv[1]}` : RUNNER_PATH.test(e.argv[1] ?? '') ? '1' : 'codex-cli 0.163.0'))
+      on('fs.exists', (_$, e: any) => ({ value: RUNNER_PATH.test(e.path) }))
+    }
+    const specs: any[] = []
+    on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: 'codex-mod:' + e.name } } })
+    await startSession($)
+    const emitted: any[] = [], results: any[] = []
+    let final = '', text = ''
+    for (let i = 0; i < 40; i++) {
+      const s = await step($, 'agent-progress', i)
+      text += s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+      if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+      for (const c of callsOf(s.chunks)) {
+        expect(specs[0].tools.includes(c.name)).toBe(true)
+        emitted.push(c)
+        for (const agentId of [undefined, 'agent-gp', 'agent-normal']) expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId } as any) as any).deny).toContain('not executed')
+        expect((await $.tool.check({ tool: c.name, input: c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)).decision).toBe('deny')
+        expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress', unexpected: 'tamper' } as any) as any).deny).toContain('not executed')
+        const answer: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+        results.push(answer)
+        expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+      }
+    }
+    expect(final).toContain('Batch 5 complete.')
+    expect(w.core).toEqual([])
+    expect(w.checks).toEqual([])
+    expect(w.modelCalls).toEqual([])
+    expect(w.spawned.length).toBe(1)
+    expect(w.writes).toEqual([])
+    const record: any = w.store.get('agent:sess-1:agent-progress')
+    expect(record.display.plans[B5_THREAD].steps).toEqual([])
+    expect(record.display.children[JSON.stringify([B5_THREAD, B5_CHILD])].displayId).toBe(displayChildId('sess-1', B5_CHILD))
+    if (surface === 'text' || surface === 'registration-fails') {
+      expect(emitted).toEqual([])
+      expect(text + final).toContain('Literal <tag> & Unicode café.')
+    } else if (surface === 'tasks' || surface === 'todo') {
+      expect(emitted.some(c => c.name === (surface === 'tasks' ? 'TaskCreate' : 'TodoWrite'))).toBe(true)
+      const agentIndexes = emitted.map((c, i) => c.name === 'Agent' ? i : -1).filter(i => i >= 0)
+      expect(agentIndexes.length).toBe(4)
+      expect(results[agentIndexes[0]].result.status).toBe('completed')
+      expect(results[agentIndexes[1]].deny).toContain('Capacity exhausted')
+      expect(results[agentIndexes[2]].deny).toContain('declined')
+      expect(results[agentIndexes[3]].result.content[0].text).toContain(': unknown')
+      expect(emitted.filter(c => c.name === 'SendMessage').map(c => c.input.message)).toEqual([
+        'Check the reducer boundary.\nLiteral <tag> & Unicode café.', 'Full failed message', 'Follow-up body\nPreserve me.',
+      ])
+      expect(emitted.filter(c => c.name === 'TaskStop').length).toBe(3)
+    } else {
+      expect(emitted.every(c => c.name.startsWith('mcp__'))).toBe(true)
+      expect(results.some(r => JSON.stringify(r).includes('empty checklist'))).toBe(true)
+    }
+  })
+}
+
+// Characterize Q1's evidence boundary, not an imported or invented host reducer.
+// Native Task* persistence lives in the skipped executor; TodoWrite input can
+// affect a derived main list only when the host loses the child parent scope.
+test('batch 5 reducer evidence boundary: child stream/reload/resume cannot replace main todos when parent scope survives', { options: { richRows: true } }, async ($, on) => {
+  const w = world(on, { availableTools: ['TodoWrite'], stdout: b5Stream('exec') })
+  const main = [{ content: 'MAIN SENTINEL', status: 'pending', activeForm: 'MAIN SENTINEL' }]
+  const mainReader = (rows: any[]) => rows.reduce((todos, row) => row.parent_tool_use_id != null || row.name !== 'TodoWrite' ? todos : row.input.todos, main)
+  const rows: any[] = []
+  for (let i = 0; i < 40; i++) {
+    const s = await step($, 'agent-progress', i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) break
+    for (const c of callsOf(s.chunks)) {
+      expect((c.input as any).parent_tool_use_id).toBe(undefined)
+      rows.push({ ...c, parent_tool_use_id: 'actual-host-parent-spawn-id' })
+    }
+    await runCalls($, s.chunks, 'agent-progress')
+  }
+  expect(rows.some(r => r.name === 'TodoWrite')).toBe(true)
+  for (const representation of [rows, JSON.parse(JSON.stringify(rows)), JSON.parse(JSON.stringify(rows))]) expect(mainReader(representation)).toEqual(main)
+  expect(mainReader(rows.map(r => ({ ...r, parent_tool_use_id: null })))).toEqual([])
+  expect(w.core).toEqual([])
+  expect(w.writes).toEqual([])
 })

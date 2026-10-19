@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import batch5Items from './fixtures/batch5-items.mjs'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const RUNNER = join(here, '..', 'scripts', 'codex-runner.mjs')
@@ -46,6 +47,29 @@ function start(scenario, { extra = [], prompt = 'do it', env = {}, control: cont
   return { child, control, exit, lines, sent, waitFor, cleanup, stderr: () => stderr }
 }
 const types = r => r.lines().map(l => l.type)
+
+test('batch 5 transports full plans, child identities, states, messages and failures without child RPCs', async () => {
+  const r = start('batch5-plans-children')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const lines = r.lines()
+    const completed = lines.filter(l => l.type === 'item.completed')
+    assert.equal(completed.length, batch5Items.filter(e => e.item).length)
+    for (const { item } of batch5Items.filter(e => e.item)) {
+      const wire = completed.find(l => l.source.item.id === item.id)
+      assert.deepEqual(wire.source.item, item)
+      assert.equal(wire.source.threadId, 'thr-1')
+      assert.equal(wire.source.turnId, 'turn-1')
+      if (item.type === 'collabAgentToolCall') {
+        for (const key of ['id', 'senderThreadId', 'model', 'reasoningEffort', 'prompt', 'status']) assert.deepEqual(wire.item[key], item[key])
+        assert.deepEqual(wire.item.agents_states, item.agentsStates)
+      }
+    }
+    assert.deepEqual(lines.filter(l => l.item?.type === 'plan_update').map(l => ({ explanation: l.item.explanation, plan: l.item.steps })), batch5Items.filter(e => e.plan).map(e => e.plan))
+    assert.deepEqual(r.sent().map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
+    assert.equal(lines.filter(l => l.type === 'turn.completed').length, 1)
+  } finally { r.cleanup() }
+})
 
 test('--version prints the protocol version', async () => {
   const r = await new Promise(res => {
