@@ -85,6 +85,20 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch2-exploration') {
+        const items = JSON.parse(readFileSync(new URL('./batch2-app-items.json', import.meta.url), 'utf8'))
+        for (const item of items) {
+          note('item/started', { threadId: THREAD, turnId: TURN, item: { ...item, status: 'inProgress', aggregatedOutput: null, exitCode: null } })
+          if (item.id === 'whole') {
+            note('item/commandExecution/outputDelta', { threadId: THREAD, turnId: TURN, itemId: item.id, delta: 'one\n' })
+            note('item/commandExecution/terminalInteraction', { threadId: THREAD, turnId: TURN, itemId: item.id, processId: item.processId, stdin: '' })
+            note('item/commandExecution/outputDelta', { threadId: THREAD, turnId: TURN, itemId: item.id, delta: 'two\n' })
+          }
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+        }
+        return setTimeout(finishNormally, 50)
+      }
       if (scenario === 'batch1-wire') {
         const items = JSON.parse(readFileSync(new URL('./batch1-wire-items.json', import.meta.url), 'utf8'))
         for (const item of items) {

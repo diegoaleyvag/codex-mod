@@ -424,3 +424,30 @@ test('batch 1 wire: all 19 public source variants, lifecycle replay and notifica
     })
   } finally { r.cleanup() }
 })
+
+test('batch 2 exploration: action evidence and exact output survive start/delta/poll/completion, once per command', async () => {
+  const r = start('batch2-exploration')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const fixtures = JSON.parse(readFileSync(join(here, 'fixtures', 'batch2-app-items.json'), 'utf8'))
+    const lines = r.lines()
+    const commands = lines.filter(l => l.type === 'item.completed' && l.item?.type === 'command_execution')
+    assert.equal(commands.length, fixtures.length)
+    for (const [index, item] of fixtures.entries()) {
+      const done = commands[index]
+      assert.deepEqual(done.source.item, item)
+      assert.equal(done.item.aggregated_output, item.aggregatedOutput)
+      assert.equal(done.item.exit_code, item.exitCode)
+      assert.deepEqual(done.item.commandActions, item.commandActions)
+      assert.equal(lines.filter(l => l.type === 'item.started' && l.source?.item?.id === item.id).length, 1)
+    }
+    const interactions = lines.filter(l => l.source?.event === 'item/commandExecution/terminalInteraction')
+    assert.equal(interactions.length, 1)
+    assert.equal(interactions[0].source.data.processId, fixtures[0].processId)
+    assert.equal(interactions[0].source.data.stdin, '')
+    assert.deepEqual(lines.filter(l => l.source?.event === 'item/commandExecution/outputDelta').map(l => l.source.data.delta), ['one\n', 'two\n'])
+    assert.equal(lines.filter(l => l.item?.type === 'agent_message').length, 1)
+    assert.deepEqual(r.sent().map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
+    assert.ok(!lines.some(l => l.type === 'codexmod.protocol'))
+  } finally { r.cleanup() }
+})

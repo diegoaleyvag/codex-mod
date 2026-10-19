@@ -109,6 +109,9 @@
 // so the user-level AGENTS.md is not loaded. Nothing in the real home is
 // written or deleted by this module.
 
+import { explorationAction, validExploration } from './exploration.ts'
+import type { GlobResult, GrepResult } from './exploration.ts'
+export { explorationAction, literalWords } from './exploration.ts'
 import type {
   BuiltinToolInputs,
   BuiltinToolResults,
@@ -166,7 +169,7 @@ const HANDBACK_TOOL = 'SubagentHandback'
 export const ID_PREFIX = 'toolu_codexmod_'
 export const HANDBACK_ID_PREFIX = 'toolu_codexhandback_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
+export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
 const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite'])
 type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message'
 const displayTools: Partial<Record<DisplayTool, string>> = {}
@@ -565,7 +568,7 @@ type ActionResult = Record<string, unknown> | { type: 'text'; text: string }[]
 export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord }
 
 type NativeName = typeof NATIVE_TOOLS[number]
-type NativeResult = BuiltinToolResults[NativeName]
+type NativeResult = BuiltinToolResults[Exclude<NativeName, 'Glob' | 'Grep'>] | GlobResult | GrepResult
 type DisplayResult = { type: 'text'; text: string }[]
 type GuardAnswer = { result: NativeResult | DisplayResult } | { deny: string }
 const object = (v: unknown): v is Record<string, any> => v !== null && typeof v === 'object' && !Array.isArray(v)
@@ -588,6 +591,7 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
   const i = a.input
   const r = a.result
   if (!object(i)) return false
+  if (['Read', 'Glob', 'Grep'].includes(a.tool)) return a.error === undefined && validExploration(a)
   let inputOK = false
   if (a.tool === 'Bash') inputOK = keysOnly(i, ['command', 'description']) && typeof i.command === 'string' && typeof i.description === 'string'
   else if (a.tool === 'Edit') inputOK = keysOnly(i, ['file_path', 'old_string', 'new_string', 'replace_all']) && ['file_path', 'old_string', 'new_string'].every(k => typeof i[k] === 'string') && (i.replace_all === undefined || i.replace_all === false)
@@ -1218,6 +1222,7 @@ export function fileAction(change: FileChange, rel: string, before: string | und
 
 /** One action as a plain text line (nativeActions off). */
 export function actionLine(a: Action): string {
+  if (['Read', 'Glob', 'Grep'].includes(a.tool)) return `$ ${oneLine(String(a.source?.item?.command), 300)} (${a.tool}, cwd ${String(a.source?.cwd)})`
   if (a.tool === 'Edit') return `Edited ${String(a.input.file_path)}`
   if (a.tool === 'Agent') return `Codex spawned an agent: ${oneLine(String(a.input.prompt), 300)}`
   if (a.tool === 'TodoWrite') return `Codex updated plan: ${(a.input.todos as { content: string; status: string }[]).map(t => `[${t.status}] ${oneLine(t.content)}`).join('; ')}`
@@ -1521,7 +1526,8 @@ function holdAnswer(id: string, sid: string, agentId: string, action: Action): b
   if (!validAction(action)) return false
   const status = action.source?.item?.status
   if (status !== undefined && !['completed', 'failed', 'declined'].includes(status)) return false
-  if (['failed', 'declined'].includes(status) && !action.error) return false
+  const noMatches = ['Grep', 'Bash'].includes(action.tool) && action.source?.item?.exitCode === 1 && explorationAction(action.source)?.tool === 'Grep'
+  if (['failed', 'declined'].includes(status) && !action.error && !noMatches) return false
   // Snapshot before handing anything to core; later caller/input mutations must
   // never alter the answer or its source binding.
   const snapshot: Action = JSON.parse(JSON.stringify(action))
@@ -2714,7 +2720,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
   } else if (ev.kind === 'command') {
     run.actions++
     if (source?.item?.status === 'inProgress') return
-    run.queue.push({ kind: 'action', action: { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
+    run.queue.push({ kind: 'action', action: explorationAction(source) ?? { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
   } else if (ev.kind === 'fileStart') {
     // the text before the patch, when it is read in time (best effort)
     for (const c of ev.changes) {
@@ -2944,8 +2950,26 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
       else blocks.push({ text: q.text, ...(q.dim ? { dim: true as const } : {}) })
     } else {
       const id = mintId(e)
+      if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && q.action.source?.item) {
+        const source = q.action.source
+        const item = source.item!
+        const durationUnknown = q.action.tool === 'Glob' && item.durationMs == null && (source.startedAtMs === undefined || source.completedAtMs === undefined)
+        blocks.push({ text: `Codex command (cwd ${JSON.stringify(source.cwd)}):\n${item.command}${durationUnknown ? '\nDuration unreported (0 ms display sentinel).' : ''}` })
+      }
       if (q.action.tool === 'WebSearch' && !Array.isArray(q.action.result) && Array.isArray(q.action.result.results)) {
         for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
+      }
+      if (!tools.has(q.action.tool)) {
+        if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item) {
+          const original = q.action
+          const item = original.source!.item!
+          blocks.push({ text: `${original.tool} unavailable in this agent's tools; showing the original Bash command.` })
+          q.action = { ...commandAction(item.command, item.aggregatedOutput, item.exitCode, item.status), source: original.source }
+          if (original.tool === 'Grep' && item.exitCode === 1) {
+            delete q.action.error
+            q.action.input.description = `${q.action.input.description} (no matches; exit 1)`
+          }
+        }
       }
       if (!tools.has(q.action.tool)) {
         const original = q.action

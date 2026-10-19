@@ -1,5 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import type { BuiltinToolResults, On } from 'claude-code'
+import { explorationAction, literalWords } from '../hooks/exploration.ts'
+import { batch2Cases } from './fixtures/batch2-cases.ts'
 import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, fileAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
@@ -790,8 +792,8 @@ test('safety: other loops\' Bash calls are untouched (reach the engine as usual)
   const gp: any = await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'toolu_01b', agentId: 'agent-gp' } as any)
   const read: any = await $.tool.call({ tool: 'Read', file_path: '/tmp/x', tool_use_id: 'toolu_01c', agentId: 'agent-codex' } as any)
   expect([main.result.stdout, gp.result.stdout]).toEqual(['REALLY RAN', 'REALLY RAN'])
-  expect(read.result).toBeDefined()
-  expect(w.core.map(c => c.id)).toEqual(['toolu_01a', 'toolu_01b', 'toolu_01c'])
+  expect(read.deny).toContain('not executed')
+  expect(w.core.map(c => c.id)).toEqual(['toolu_01a', 'toolu_01b'])
 })
 
 test('safety: tool.check denies a Codex agent\'s Bash/Edit/Write (with or without the prefix), passes others', async ($, on) => {
@@ -3604,7 +3606,7 @@ test('foundation verified ordinary ownership stays cached during a later lookup 
     expect((await $.tool.check({ tool, input: {}, tool_use_id: 'normal', agentId: 'agent-gp' } as any)).decision).toBe('allow')
   }
   expect((await $.tool.call({ tool: 'Bash', tool_use_id: 'normal', agentId: 'foundation-unresolved-outage' } as any) as any).deny).toContain('not executed')
-  expect(w.core.length).toBe(7)
+  expect(w.core.length).toBe(NATIVE_TOOLS.length + 1)
 })
 
 test('foundation missing native and display tools drain to exactly one handback with literal fallback', async ($, on) => {
@@ -3645,4 +3647,186 @@ test('foundation coordinator registration retry respects the existing agent tool
   expect(coordinatorCalls(s.chunks)).toEqual([])
   expect(s.chunks.some(c => c.kind === 'text' && c.text === 'Coordinator message:\n\nFull receipt')).toBe(true)
   expect(w.core).toEqual([])
+})
+
+const explorationSource = (item: Record<string, any>) => ({ transport: 'app-server' as const, event: 'item/completed', threadId: 'thread', turnId: 'turn', itemId: item.id, cwd: item.cwd, item })
+const explorationLine = (item: Record<string, any>, event = 'item/completed') => JSON.stringify({ type: event === 'item/started' ? 'item.started' : 'item.completed',
+  item: { ...item, type: 'command_execution', aggregated_output: item.aggregatedOutput, exit_code: item.exitCode }, source: { ...explorationSource(item), event } })
+
+for (const { item, tool } of batch2Cases) {
+  test(`batch 2 mapping: ${item.id} -> ${tool}`, () => {
+    const action = explorationAction(explorationSource(item))
+    expect(action?.tool ?? 'Bash').toBe(tool)
+    if (action) {
+      expect(validAction(action)).toBe(true)
+      expect(action.source!.item!.aggregatedOutput).toBe(item.aggregatedOutput)
+      expect(Object.keys(action.input).includes('_host')).toBe(false)
+    }
+  })
+}
+
+test('batch 2 exact results: whole/empty/CRLF/slices, glob scope, grep modes and literal regex escaping', () => {
+  const action = (id: string): any => explorationAction(explorationSource(batch2Cases.find(c => c.item.id === id)!.item))!
+  expect(action('whole').result).toEqual({ type: 'text', file: { filePath: '/workspace/a.txt', content: 'one\ntwo\n', numLines: 2, startLine: 1, totalLines: 2 } })
+  expect(action('empty').result.file).toMatchObject({ content: '', numLines: 0, totalLines: 0 })
+  expect(action('crlf').result.file).toMatchObject({ content: 'one\r\ntwo\r\n', numLines: 2, totalLines: 2 })
+  expect(action('no-final-newline').result.file).toMatchObject({ content: 'one\ntwo', numLines: 2, totalLines: 2 })
+  expect(action('slice-tail').input).toEqual({ file_path: '/workspace/a.txt', offset: 3 })
+  expect(action('slice-tail').result.file).toMatchObject({ numLines: 2, startLine: 3, totalLines: 4 })
+  expect(action('slice-head-eof').input).toEqual({ file_path: '/workspace/a.txt', limit: 5 })
+  expect(action('slice-head-eof').result.file.totalLines).toBe(2)
+  expect(action('immediate-files').input).toEqual({ pattern: '*', path: '/workspace' })
+  expect(action('recursive-files').result).toEqual({ durationMs: 12, numFiles: 2, filenames: ['/workspace/a.txt', '/workspace/sub/b.txt'], truncated: false })
+  expect(action('rg-files').input).toEqual({ pattern: '**/*.ts', path: '/workspace/src' })
+  expect(action('empty-list').result.numFiles).toBe(0)
+  expect(action('duration-sentinel').result.durationMs).toBe(0)
+  expect(action('content').result).toMatchObject({ mode: 'content', numFiles: 2, numLines: 2, filenames: ['/workspace/a.txt', '/workspace/sub/b.txt'] })
+  expect(action('content').result.content).toBe('a.txt:1:x\nsub/b.txt:3:x again\n')
+  expect(action('json-framing').result).toMatchObject({ numFiles: 1, numLines: 1, content: 'a.txt:x\n' })
+  expect(action('multiline-result').result).toMatchObject({ numLines: 2, content: 'a.txt:x\na.txt:x again\n' })
+  expect(action('content-no-newline').result).toMatchObject({ numLines: 2, content: 'a.txt:x\nb.txt:x\n' })
+  expect(action('files').result).toEqual({ mode: 'files_with_matches', numFiles: 2, filenames: ['/workspace/a.txt', '/workspace/sub/b.txt'] })
+  expect(action('count').result).toEqual({ mode: 'count', numFiles: 2, filenames: ['/workspace/a.txt', '/workspace/sub/b.txt'], content: 'a.txt\0' + '2\nsub/b.txt\0' + '3\n', numMatches: 5 })
+  expect(action('fixed').input.pattern).toBe('a\\.b\\[\\$\\]')
+  expect(action('flags').input).toEqual({ path: '/workspace', output_mode: 'content', head_limit: 0, '-i': true, '-n': true, '-A': 1, glob: '*.ts', type: 'ts', pattern: 'x' })
+  for (const id of ['no-matches-files', 'no-matches-count', 'no-matches-json']) expect(action(id).result.numFiles).toBe(0)
+  expect(action('no-matches-json').result).toMatchObject({ content: '', numLines: 0 })
+})
+
+test('batch 2 literal words distinguish quoted operators from executable shell syntax', () => {
+  expect(literalWords("cat 'a | $(x) ; b'" )).toEqual(['cat', 'a | $(x) ; b'])
+  expect(literalWords('cat "a \\$x \\`y\\`"')).toEqual(['cat', 'a $x `y`'])
+  for (const command of ['cat a; cat b', 'cat a\ncat b', 'cat < a', 'cat a >> b', 'cat ${x}', 'cat <(echo x)', 'cat "`x`"', "cat 'a", 'cat a\\']) expect(literalWords(command)).toBeUndefined()
+})
+
+test('batch 2 schema boundary rejects invented fields, mismatched paths/counts, routing and invalid limits', () => {
+  const get = (id: string): any => explorationAction(explorationSource(batch2Cases.find(c => c.item.id === id)!.item))!
+  const read = get('whole')
+  const glob = get('recursive-files')
+  const grep = get('content')
+  for (const action of [
+    { ...read, input: { ...read.input, command: 'cat a.txt' } },
+    { ...read, input: { ...read.input, offset: 0 } },
+    { ...read, result: { ...read.result, file: { ...read.result.file, filePath: '/foreign', totalLines: 1 } } },
+    { ...read, result: { ...read.result, file: { ...read.result.file, numLines: 1 } } },
+    { ...glob, input: { ...glob.input, _host: 'foreign' } },
+    { ...glob, result: { ...glob.result, numFiles: 99 } },
+    { ...glob, result: { ...glob.result, durationMs: -1 } },
+    { ...grep, input: { ...grep.input, offset: -1 } },
+    { ...grep, input: { ...grep.input, head_limit: 1.5 } },
+    { ...grep, result: { ...grep.result, mode: 'count' } },
+    { ...grep, result: { ...grep.result, numLines: 999 } },
+    { ...grep, result: { ...grep.result, content: undefined } },
+  ]) expect(validAction(action)).toBe(false)
+})
+
+test('batch 2 all fixture rows answer from held output, with command/cwd visible and no executor or extra file reads', { options: { maxActionsPerStep: 50 } }, async ($, on) => {
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: batch2Cases.map(c => explorationLine(c.item)).join('\n') + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  let checked = 0
+  for (let index = 0; checked < batch2Cases.length; index++) {
+    const s = await step($, 'agent-progress', index)
+    for (const c of callsOf(s.chunks)) {
+      const fixture = batch2Cases[checked++]!
+      expect(c.name).toBe(fixture.tool)
+      const answer: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+      const expected = explorationAction(explorationSource(fixture.item)) ?? commandAction(fixture.item.command, fixture.item.aggregatedOutput, fixture.item.exitCode, fixture.item.status)
+      expect(answer).toEqual(expected.error ? { deny: expected.error } : { result: expected.result })
+      if (fixture.tool !== 'Bash') {
+        expect(s.chunks.some(b => b.kind === 'text' && b.text.includes(fixture.item.command) && b.text.includes('/workspace'))).toBe(true)
+        expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+      }
+      const wire: any = (w.store.get('agent:sess-1:agent-progress') as any).wire
+      expect(wire.rows[c.id].item.aggregatedOutput).toBe(fixture.item.aggregatedOutput)
+    }
+  }
+  expect(w.core).toEqual([])
+  expect(w.spawned.length).toBe(1)
+  expect(w.reads.some(p => p.startsWith('/workspace'))).toBe(false)
+})
+
+for (const tool of ['Read', 'Glob', 'Grep']) {
+  test(`batch 2 ${tool} guard: own ID, stolen owner/tool/input, main/ordinary calls, replay, exception and backstop`, async ($, on) => {
+    const fixture = batch2Cases.find(c => c.tool === tool)!
+    const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: explorationLine(fixture.item) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+    const s = await step($, 'agent-progress')
+    const [call] = callsOf(s.chunks)
+    const e = { tool, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' }
+    for (const change of [{ agentId: undefined }, { agentId: 'agent-gp' }, { agentId: 'agent-codex' }, { tool: 'Bash' }, { extra: true }, { ...call.input, [tool === 'Read' ? 'file_path' : 'path']: '/forged' }]) expect((await $.tool.call({ ...e, ...change } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool, tool_use_id: call.id, agentId: 'agent-progress', input: call.input } as any)).decision).toBe('deny')
+    expect((await $.tool.call(e as any) as any).result).toEqual(explorationAction(explorationSource(fixture.item))!.result)
+    expect((await $.tool.call(e as any) as any).deny).toContain('not executed')
+    for (const agentId of [undefined, 'agent-gp']) {
+      expect((await $.tool.call({ tool, ...call.input, tool_use_id: 'ordinary', agentId } as any) as any).result.stdout).toBe('REALLY RAN')
+      expect((await $.tool.check({ tool, input: call.input, tool_use_id: 'ordinary', agentId } as any)).decision).toBe('allow')
+    }
+    expect(w.core.length).toBe(2)
+    expect(w.checks.length).toBe(2)
+  })
+  test(`batch 2 ${tool} ownership exception refuses in both guards`, async ($, on) => {
+    const w = world(on, { listThrows: true })
+    expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId: 'unresolved-exploration' } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool, input: {}, tool_use_id: 'ordinary', agentId: 'unresolved-exploration' } as any)).decision).toBe('deny')
+    expect(w.core).toEqual([])
+    expect(w.checks).toEqual([])
+  })
+}
+
+test('batch 2 stream/poll interactions and replay produce one final row with authoritative output and one handback', async ($, on) => {
+  const item = batch2Cases[0]!.item
+  const notification = (event: string, data: any) => JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event, threadId: 'thread', turnId: 'turn', data: { itemId: item.id, processId: item.processId, ...data } } })
+  const start = explorationLine({ ...item, status: 'inProgress', aggregatedOutput: null, exitCode: null }, 'item/started')
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: [start,
+    notification('item/commandExecution/outputDelta', { delta: 'one\n' }),
+    notification('item/commandExecution/terminalInteraction', { stdin: '' }),
+    notification('item/commandExecution/outputDelta', { delta: 'two\n' }),
+    explorationLine(item), explorationLine(item), start, itemLine({ type: 'agent_message', text: 'Done' }),
+  ].join('\n') })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Read'])
+  const [answer]: any = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer.result.file.content).toBe('one\ntwo\n')
+  const final = await step($, 'agent-progress', 1)
+  expect(callsOf(final.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  await runCalls($, final.chunks, 'agent-progress')
+  expect(w.core.map(c => c.tool)).toEqual(['SubagentHandback'])
+  expect(w.spawned.length).toBe(1)
+})
+
+test('batch 2 unavailable exploration tool falls back to one original Bash row', async ($, on) => {
+  const w = world(on, { availableTools: ['Bash'], stdout: explorationLine(batch2Cases[0]!.item) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
+  const [answer]: any = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer.result.stdout).toBe('one\ntwo\n')
+  expect(s.chunks.some(c => c.kind === 'text' && c.text.includes('Read unavailable'))).toBe(true)
+  expect(w.core).toEqual([])
+})
+
+test('batch 2 an unavailable Grep preserves the successful no-match outcome in Bash', async ($, on) => {
+  const fixture = batch2Cases.find(c => c.item.id === 'no-matches-files')!
+  const w = world(on, { availableTools: ['Bash'], stdout: explorationLine(fixture.item) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
+  expect(callsOf(s.chunks)[0].input.description).toContain('no matches; exit 1')
+  const [answer]: any = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer).toEqual({ result: { stdout: '', stderr: '', interrupted: false } })
+  expect(w.core).toEqual([])
+})
+
+test('batch 2 nativeActions off displays exploration commands as text, preserving one handback', { options: { nativeActions: false } }, async ($, on) => {
+  const fixtures = ['Read', 'Glob', 'Grep'].map(tool => batch2Cases.find(c => c.tool === tool)!.item)
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: fixtures.map(item => explorationLine(item)).join('\n') + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  for (const item of fixtures) expect(text).toContain(item.command)
+  expect(w.core).toEqual([])
+})
+
+test('batch 2 exploration tools are admitted in each registered Codex agent independently of richRows', async ($, on) => {
+  world(on, { availableTools: [...NATIVE_TOOLS] })
+  const specs: any[] = []
+  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  await startSession($)
+  for (const spec of specs) for (const tool of ['Read', 'Glob', 'Grep']) expect(spec.tools.includes(tool)).toBe(true)
 })
