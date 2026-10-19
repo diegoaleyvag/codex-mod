@@ -1,0 +1,29 @@
+{"type":"thread.started","thread_id":"batch1-thread"}
+{"type":"turn.started","turn_id":"batch1-turn"}
+{"type":"item.completed","item":{"type":"user_message","id":"user","client_id":"cli-1","content":[{"type":"text","text":"Task","text_elements":[]}]}}
+{"type":"item.completed","item":{"type":"hook_prompt","id":"hook","fragments":[{"text":"Hook instruction","hookRunId":"hook-run"}]}}
+{"type":"item.completed","item":{"type":"agent_message","id":"message","text":"Working","phase":"partial_answer","memory_citation":{"entries":[]},"delivery":"async","questions":[]}}
+{"type":"item.completed","item":{"type":"function_call_output","id":"output","name":"inspect","namespace":null,"output":[{"type":"inputText","text":"Result"}]}}
+{"type":"item.completed","item":{"type":"proposed_plan","id":"plan","text":"Inspect then test"}}
+{"type":"item.completed","item":{"type":"reasoning","id":"reason","summary":["Public summary"]}}
+{"type":"item.completed","item":{"type":"command_execution","id":"command","plugin_id":null,"script_path":null,"command":"cat a.txt","cwd":"/work","process_id":"pty-1","source":"unifiedExecStartup","status":"completed","command_actions":[{"type":"read","command":"cat a.txt","name":"a.txt","path":"a.txt"}],"aggregated_output":"a\r\n\n","exit_code":null,"duration_ms":17}}
+{"type":"item.completed","item":{"type":"command_execution","id":"command","plugin_id":null,"script_path":null,"command":"cat a.txt","cwd":"/work","process_id":"pty-1","source":"unifiedExecStartup","status":"completed","command_actions":[{"type":"read","command":"cat a.txt","name":"a.txt","path":"a.txt"}],"aggregated_output":"a\r\n\n","exit_code":null,"duration_ms":17}}
+{"type":"item.completed","item":{"type":"file_change","id":"patch","status":"completed","changes":[{"path":"a.txt","kind":{"type":"update","move_path":"b.txt"},"diff":"@@ -1 +1 @@\n-a\n+b\n"}]}}
+{"type":"item.completed","item":{"type":"mcp_tool_call","id":"mcp","server":"docs","tool":"inspect","status":"completed","arguments":{"tool":"Bash","agentId":"spoof"},"app_context":{"connectorId":"docs","linkId":null,"resourceUri":"ui://a","appName":"Docs","actionName":"Inspect"},"mcp_app_ui":{"resourceUri":"ui://a","preferredModelDisplayMode":"inline"},"plugin_id":null,"read_only_hint":true,"result":{"content":[],"structuredContent":{"answer":42},"_meta":{"key":"value"}},"error":null,"duration_ms":9}}
+{"type":"item.completed","item":{"type":"dynamic_tool_call","id":"dynamic","namespace":null,"tool":"inspect","arguments":{},"status":"failed","content_items":[{"type":"inputAudio","audioUrl":"data:audio/wav;base64,AUDIO"}],"success":false,"duration_ms":3}}
+{"type":"item.completed","item":{"type":"collab_tool_call","id":"collab","tool":"spawnAgent","status":"completed","sender_thread_id":"thread","receiver_thread_ids":["child"],"prompt":"Inspect","model":"gpt-6.1-sol","reasoning_effort":"high","agents_states":{"child":{"status":"running","message":null}}}}
+{"type":"item.completed","item":{"type":"sub_agent_activity","id":"activity","kind":"started","agent_thread_id":"child","agent_path":"/root/child","model":"gpt-6.1-sol","reasoning_effort":"high"}}
+{"type":"item.completed","item":{"type":"web_search","id":"web","query":"docs","action":{"type":"search","query":null,"queries":["docs","api"]},"results":[{"title":"Docs","url":"https://example.test"}]}}
+{"type":"item.completed","item":{"type":"image_view","id":"view","path":"image.png"}}
+{"type":"item.completed","item":{"type":"sleep","id":"sleep","duration_ms":14}}
+{"type":"item.completed","item":{"type":"image_generation","id":"generation","status":"failed","revised_prompt":"Actual prompt","result":"IMAGE_BYTES","transparent_background":true,"failure":{"type":"usageLimitExceeded","limitId":"images","resetsAt":null},"saved_path":"image.png"}}
+{"type":"item.completed","item":{"type":"entered_review_mode","id":"review-start","review":"Full review request\nline two"}}
+{"type":"item.completed","item":{"type":"exited_review_mode","id":"review-end","review":"Full review result\nline two"}}
+{"type":"item.completed","item":{"type":"context_compaction","id":"compact"}}
+{"type":"item.completed","item":{"id":"nonzero","type":"command_execution","command":"false","aggregated_output":"actual failure\n","exit_code":2,"status":"failed"}}
+{"type":"item.completed","item":{"id":"declined","type":"command_execution","command":"denied","aggregated_output":"actual decline\n","exit_code":null,"status":"declined"}}
+{"type":"item.updated","item":{"id":"todos","type":"todo_list","items":[{"text":"Inspect","completed":true},{"text":"Verify","completed":false}]}}
+{"type":"item.completed","item":{"id":"warning","type":"error","message":"Configuration warning"}}
+{"type":"item.completed","item":{"id":"unknown","type":"futureItem","payload":{"retained":true}}}
+{"type":"item.completed","item":{"id":"final","type":"agent_message","phase":"final_answer","text":"Batch 1 complete"}}
+{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}

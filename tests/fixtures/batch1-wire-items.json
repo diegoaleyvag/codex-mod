@@ -1,0 +1,235 @@
+[
+  {
+    "type": "userMessage",
+    "id": "user",
+    "clientId": "cli-1",
+    "content": [
+      {
+        "type": "text",
+        "text": "Task",
+        "text_elements": []
+      }
+    ]
+  },
+  {
+    "type": "hookPrompt",
+    "id": "hook",
+    "fragments": [
+      {
+        "text": "Hook instruction",
+        "hookRunId": "hook-run"
+      }
+    ]
+  },
+  {
+    "type": "agentMessage",
+    "id": "message",
+    "text": "Working",
+    "phase": "partial_answer",
+    "memoryCitation": {
+      "entries": []
+    },
+    "delivery": "async",
+    "questions": []
+  },
+  {
+    "type": "functionCallOutput",
+    "id": "output",
+    "name": "inspect",
+    "namespace": null,
+    "output": [
+      {
+        "type": "inputText",
+        "text": "Result"
+      }
+    ]
+  },
+  {
+    "type": "plan",
+    "id": "plan",
+    "text": "Inspect then test"
+  },
+  {
+    "type": "reasoning",
+    "id": "reason",
+    "summary": [
+      "Public summary"
+    ],
+    "content": [
+      "PRIVATE_RAW_REASONING"
+    ]
+  },
+  {
+    "type": "commandExecution",
+    "id": "command",
+    "pluginId": null,
+    "scriptPath": null,
+    "command": "cat a.txt",
+    "cwd": "/work",
+    "processId": "pty-1",
+    "source": "unifiedExecStartup",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat a.txt",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "a\r\n\n",
+    "exitCode": null,
+    "durationMs": 17
+  },
+  {
+    "type": "fileChange",
+    "id": "patch",
+    "status": "completed",
+    "changes": [
+      {
+        "path": "a.txt",
+        "kind": {
+          "type": "update",
+          "move_path": "b.txt"
+        },
+        "diff": "@@ -1 +1 @@\n-a\n+b\n"
+      }
+    ]
+  },
+  {
+    "type": "mcpToolCall",
+    "id": "mcp",
+    "server": "docs",
+    "tool": "inspect",
+    "status": "completed",
+    "arguments": {
+      "tool": "Bash",
+      "agentId": "spoof"
+    },
+    "appContext": {
+      "connectorId": "docs",
+      "linkId": null,
+      "resourceUri": "ui://a",
+      "appName": "Docs",
+      "actionName": "Inspect"
+    },
+    "mcpAppUi": {
+      "resourceUri": "ui://a",
+      "preferredModelDisplayMode": "inline"
+    },
+    "pluginId": null,
+    "readOnlyHint": true,
+    "result": {
+      "content": [],
+      "structuredContent": {
+        "answer": 42
+      },
+      "_meta": {
+        "key": "value"
+      }
+    },
+    "error": null,
+    "durationMs": 9
+  },
+  {
+    "type": "dynamicToolCall",
+    "id": "dynamic",
+    "namespace": null,
+    "tool": "inspect",
+    "arguments": {},
+    "status": "failed",
+    "contentItems": [
+      {
+        "type": "inputAudio",
+        "audioUrl": "data:audio/wav;base64,AUDIO"
+      }
+    ],
+    "success": false,
+    "durationMs": 3
+  },
+  {
+    "type": "collabAgentToolCall",
+    "id": "collab",
+    "tool": "spawnAgent",
+    "status": "completed",
+    "senderThreadId": "thread",
+    "receiverThreadIds": [
+      "child"
+    ],
+    "prompt": "Inspect",
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "high",
+    "agentsStates": {
+      "child": {
+        "status": "running",
+        "message": null
+      }
+    }
+  },
+  {
+    "type": "subAgentActivity",
+    "id": "activity",
+    "kind": "started",
+    "agentThreadId": "child",
+    "agentPath": "/root/child",
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "high"
+  },
+  {
+    "type": "webSearch",
+    "id": "web",
+    "query": "docs",
+    "action": {
+      "type": "search",
+      "query": null,
+      "queries": [
+        "docs",
+        "api"
+      ]
+    },
+    "results": [
+      {
+        "title": "Docs",
+        "url": "https://example.test"
+      }
+    ]
+  },
+  {
+    "type": "imageView",
+    "id": "view",
+    "path": "image.png"
+  },
+  {
+    "type": "sleep",
+    "id": "sleep",
+    "durationMs": 14
+  },
+  {
+    "type": "imageGeneration",
+    "id": "generation",
+    "status": "failed",
+    "revisedPrompt": "Actual prompt",
+    "result": "IMAGE_BYTES",
+    "transparentBackground": true,
+    "failure": {
+      "type": "usageLimitExceeded",
+      "limitId": "images",
+      "resetsAt": null
+    },
+    "savedPath": "image.png"
+  },
+  {
+    "type": "enteredReviewMode",
+    "id": "review-start",
+    "review": "Full review request\nline two"
+  },
+  {
+    "type": "exitedReviewMode",
+    "id": "review-end",
+    "review": "Full review result\nline two"
+  },
+  {
+    "type": "contextCompaction",
+    "id": "compact"
+  }
+]

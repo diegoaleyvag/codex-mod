@@ -1,0 +1,23 @@
+{
+  "roles": {
+    "implementer": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium",
+      "sandbox": "workspace-write",
+      "description": "Normal bounded coding task in codex-mod; the prompt carries the full spec (branch, allowed paths, verification command, report format)."
+    },
+    "implementer-high": {
+      "model": "gpt-6.1-sol",
+      "effort": "xhigh",
+      "sandbox": "workspace-write",
+      "description": "High-risk codex-mod work (hooks, transport, handback, guards) or a retry after a failed attempt."
+    },
+    "auditor": {
+      "model": "gpt-6-astra",
+      "effort": "low",
+      "sandbox": "read-only",
+      "description": "One read-only cross-model review of a whole codex-mod change, for Claude-implemented work.",
+      "instructions": "You are a read-only auditor. Never edit files. Report findings with file:line and a concrete failure scenario."
+    }
+  }
+}

@@ -9,7 +9,7 @@
     {
       "name": "codex-mod",
       "source": "./",
-      "description": "Subagent types codex-mod:codex, sol, sol-high and astra-audit answered by the local OpenAI Codex CLI."
+      "description": "Codex agents by model and project-declared roles, with guarded native action rows, answered by the local OpenAI Codex CLI."
     }
   ]
 }

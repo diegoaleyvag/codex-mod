@@ -6,7 +6,8 @@
 // single string) and `codex app-server` exits as soon as stdin hits EOF, so the
 // hook cannot hold the app-server pipe open to send `turn/steer` or
 // `turn/interrupt` mid-run. This process owns app-server's stdin for exactly
-// one run; the hook talks to it through files in a control directory.
+// one run; the hook negotiates private HTTP/Unix control (protocol 2),
+// with control files as a compatibility fallback. Stdio events remain version 1.
 //
 // CLI:  node codex-runner.mjs run --codex <path> --cwd <dir> --model <m>
 //         --effort <e> --sandbox <s> [--thread <id>] [--config k=v]...
@@ -23,15 +24,20 @@
 // poll up to 10 times, then deleted with a rejected ack.
 //
 // Output (JSONL): exec-compatible `thread.started`, `item.started|completed`
-// (file_change, command_execution, agent_message), `turn.completed` (usage of
-// this turn only), `turn.failed`, `error`; plus runner-only `codexmod.turn`,
+// (including reasoning, web_search, mcp_tool_call, plan_update, proposed_plan
+// and note), `turn.completed` (usage of this turn only), `turn.failed`, `error`; plus runner-only `codexmod.turn`,
 // `codexmod.steer`, `codexmod.protocol` (drift evidence) and `codexmod.fatal`.
 // Exit code: 0 when the turn completed, 1 otherwise. Never writes outside the
 // control dir; never prints credentials.
 
 import { spawn } from 'node:child_process'
-import { chmodSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { createSteerControl } from '../hooks/steer-control.mjs'
+import { TreeUsage } from '../hooks/tree-usage.mjs'
+import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
+import { JOURNAL_BYTES, journalPath, journalIndex } from '../hooks/child-journal.mjs'
 
 const PROTOCOL_VERSION = 1
 const PLUGIN_VERSION = '1'
@@ -40,26 +46,27 @@ const OPT_OUT = [
   'item/reasoning/summaryTextDelta',
   'item/reasoning/summaryPartAdded',
   'item/reasoning/textDelta',
-  'item/commandExecution/outputDelta',
   'item/fileChange/outputDelta',
 ]
 // Notifications / item types we know about (handled or deliberately ignored).
 // Anything else is reported once at the end as protocol drift evidence.
 const KNOWN_METHODS = new Set([
   'error', 'warning', 'configWarning', 'deprecationNotice', 'guardianWarning',
-  'thread/started', 'thread/status/changed', 'thread/tokenUsage/updated', 'thread/settings/updated',
+  'rawResponse/completed', 'thread/started', 'thread/status/changed', 'thread/tokenUsage/updated', 'thread/settings/updated',
   'thread/name/updated', 'thread/goal/updated', 'thread/goal/cleared', 'thread/readState/changed', 'thread/prediction/updated', 'thread/compacted', 'thread/closed', 'thread/queue/changed',
   'turn/started', 'turn/completed', 'turn/diff/updated', 'turn/plan/updated', 'turn/moderationMetadata',
   'hook/started', 'hook/completed', 'item/started', 'item/completed', 'rawResponseItem/completed',
   'item/autoApprovalReview/started', 'item/autoApprovalReview/completed', 'serverRequest/resolved',
   'item/fileChange/patchUpdated', 'item/plan/delta', 'item/mcpToolCall/progress',
   'item/commandExecution/terminalInteraction', 'mcpServer/startupStatus/updated',
+  'item/commandExecution/outputDelta',
   'account/updated', 'account/rateLimits/updated', 'model/rerouted', 'model/verification',
   'model/safetyBuffering/updated', 'skills/changed', 'app/list/updated', 'remoteControl/status/changed',
   ...OPT_OUT,
 ])
+const DEFERRED_ITEMS = ['userMessage', 'hookPrompt', 'functionCallOutput']
 const KNOWN_ITEMS = new Set([
-  'userMessage', 'hookPrompt', 'agentMessage', 'functionCallOutput', 'plan', 'reasoning', 'commandExecution',
+  ...DEFERRED_ITEMS, 'agentMessage', 'plan', 'reasoning', 'commandExecution',
   'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch',
   'imageView', 'imageGeneration', 'enteredReviewMode', 'exitedReviewMode', 'contextCompaction', 'sleep',
 ])
@@ -74,6 +81,15 @@ const emit = obj => {
   } catch {
     stdoutBroken = true
   }
+}
+
+// Completed turn/thread snapshots may contain private reasoning as well.
+const publicSource = value => {
+  if (Array.isArray(value)) return value.map(publicSource)
+  if (value === null || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => value.type !== 'reasoning' || key !== 'content')
+    .map(([key, child]) => [key, publicSource(child)]))
 }
 
 // --- args / config values ---------------------------------------------------
@@ -159,6 +175,36 @@ function makeControlDir(dir) {
   }
 }
 
+/** Completed items only: started searches and calls do not carry usable results. */
+function completedItem(item, changesOf) {
+  switch (item?.type) {
+    case 'fileChange': return { ...item, type: 'file_change', changes: changesOf(item) }
+    case 'commandExecution': return { ...item, type: 'command_execution', aggregated_output: item.aggregatedOutput, exit_code: item.exitCode }
+    case 'agentMessage': return { type: 'agent_message', text: item.text ?? '', ...(item.phase != null ? { phase: item.phase } : {}) }
+    // Only the public summary crosses the pipe; never reasoning.content.
+    case 'reasoning': return { type: 'reasoning', text: (Array.isArray(item.summary) ? item.summary : []).filter(s => typeof s === 'string').join('\n\n') }
+    case 'webSearch': return { type: 'web_search', query: item.query, action: item.action, results: item.results }
+    case 'mcpToolCall': return { type: 'mcp_tool_call', server: item.server, tool: item.tool, arguments: item.arguments, result: item.result, error: item.error, status: item.status }
+    case 'dynamicToolCall': return { type: 'dynamic_tool_call', namespace: item.namespace, tool: item.tool, arguments: item.arguments, content_items: item.contentItems, success: item.success, status: item.status }
+    case 'plan': return { type: 'proposed_plan', text: item.text }
+    case 'collabAgentToolCall': return { ...item, type: 'collab_tool_call', tool: item.tool.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`), receiver_thread_ids: item.receiverThreadIds, agents_states: item.agentsStates }
+    case 'subAgentActivity': {
+      const agent = String(item.agentPath || item.agentThreadId).replace(/\s+/g, ' ')
+      const text = item.kind === 'completed' ? `Codex agent ${agent} finished`
+        : item.kind === 'interacted' ? `Codex messaged ${agent}`
+        : item.kind === 'interrupted' ? `Codex interrupted agent ${agent}` : `Codex agent ${agent} started`
+      return { type: 'note', text }
+    }
+    case 'contextCompaction': return { type: 'note', text: 'Codex compacted context', dim: true }
+    case 'enteredReviewMode': return { ...item, type: 'entered_review_mode' }
+    case 'exitedReviewMode': return { ...item, type: 'exited_review_mode' }
+    case 'sleep': return { ...item, type: 'sleep' }
+    case 'imageView': return { ...item, type: 'image_view' }
+    case 'imageGeneration': return { ...item, type: 'image_generation' }
+    default: return undefined
+  }
+}
+
 // --- main -----------------------------------------------------------------
 
 async function main() {
@@ -166,6 +212,20 @@ async function main() {
   if (argv[0] === '--version') {
     process.stdout.write(`${PROTOCOL_VERSION}\n`)
     return
+  }
+  if (argv[0] === 'observe') {
+    const a = parseArgs(argv.slice(1))
+    const until = Date.now() + 2000
+    for (;;) {
+      const owner = JSON.parse(readFileSync(join(a.control, 'owner.json'), 'utf8'))
+      let text = ''
+      let latest = 0
+      try { latest = JSON.parse(readFileSync(journalIndex(a.control, a.thread), 'utf8')).segment } catch (err) { if (err.code !== 'ENOENT') throw err }
+      if (latest > Number(a.segment ?? 0)) return
+      try { text = readFileSync(journalPath(a.control, a.thread, Number(a.segment ?? 0)), 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
+      if (text.length > Number(a.cursor) || owner.ended || owner.generation !== a.generation || Date.now() >= until) return
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
   }
   if (argv[0] !== 'run') {
     process.stderr.write('usage: codex-runner.mjs run --codex <path> --cwd <dir> --model <m> --effort <e> --sandbox <s> [--thread <id>] [--config k=v]... --control <dir>\n')
@@ -194,15 +254,79 @@ async function main() {
   let interruptTimer
   let codexVersion = 'unknown'
   const buffered = []
+  const bufferedRequests = []
   let badLineReported = false
   const unknownMethods = new Set()
   const unknownItems = new Set()
-  let baseline // total usage before this turn
-  let lastTotal
+  const itemLifecycles = new Set()
   const turnWaiters = []
   const retries = new Map()
   const inflight = new Set()
+  const questions = new Map()
+  const requestIds = new Map()
   let ppid = process.ppid
+  const nested = args.nested !== 'false'
+  const generation = randomUUID()
+  const threads = new Map()
+  const early = new Map()
+  const usage = new TreeUsage()
+  let drainTimer
+  let rootCode = 0
+  let parentStopping = false
+  const journals = new Map()
+  const appendJournal = (id, text) => {
+    const state = journals.get(id) ?? { segment: 0, bytes: 0 }
+    let rest = Buffer.from(text)
+    while (rest.length) {
+      let take = Math.min(rest.length, JOURNAL_BYTES - state.bytes)
+      // Keep UTF-8 code points intact for the host's text-only filesystem API.
+      while (take < rest.length && take > 0 && (rest[take] & 0xc0) === 0x80) take--
+      if (!take) { state.segment++; state.bytes = 0; continue }
+      appendFileSync(journalPath(args.control, id, state.segment), rest.subarray(0, take), { mode: 0o600 })
+      state.bytes += take
+      rest = rest.subarray(take)
+      // Publish only segments whose bytes already exist on disk.
+      const index = journalIndex(args.control, id)
+      writeFileSync(index + '.tmp', JSON.stringify({ version: 1, segment: state.segment }), { mode: 0o600 })
+      renameSync(index + '.tmp', index)
+    }
+    journals.set(id, state)
+  }
+  const ownerState = () => {
+    const path = join(args.control, 'owner.json')
+    writeFileSync(path + '.tmp', JSON.stringify({ generation, updatedAt: Date.now(), ended: finished }))
+    renameSync(path + '.tmp', path)
+  }
+  const childEmit = (state, event) => {
+    const tagged = event.type === 'codexmod.child' ? { ...event, owner_thread_id: state.id, owner_turn_id: state.turnId }
+      : { ...event, thread_id: state.id, turn_id: state.turnId }
+    appendJournal(state.id, JSON.stringify(tagged) + '\n')
+    emit({ type: 'codexmod.childEvent', thread_id: state.id, turn_id: state.turnId, event: tagged })
+  }
+  const usageSnapshot = (final = false) => {
+    if (!threadId || !turnId || !threads.size) return
+    writeFileSync(join(args.control, 'usage.json'), JSON.stringify({ version: 1, generation, edges: [...usage.edges], turns: [...usage.turns], responses: [...usage.responses] }), { mode: 0o600 })
+    for (const state of threads.values()) {
+      const snapshot = usage.snapshot(state.id, state.rootTurnId)
+      if (state.id === threadId) emit({ type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
+      else if (state.id !== threadId && !state.attaching && !state.failed) childEmit(state, { type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
+      if (!snapshot.children) continue
+      const event = { type: 'codexmod.treeUsage', ...snapshot,
+        active: snapshot.threadIds.filter(id => id !== state.id && threads.has(id) && !threads.get(id).done && !threads.get(id).failed).length }
+      if (state.id === threadId) emit(event)
+      else childEmit(state, event)
+    }
+    const total = threads.get(threadId)?.lastTotal
+    if (total) emit({ type: 'codexmod.threadUsage', thread_id: threadId, total: {
+      input: total.inputTokens ?? 0, cached: total.cachedInputTokens ?? 0, output: total.outputTokens ?? 0,
+    } })
+  }
+  const maybeFinish = () => {
+    clearTimeout(drainTimer)
+    if (!turnDone || [...threads.values()].some(t => t.id !== threadId && (t.attaching || !t.done && !t.failed))) return
+    // Final usage can follow terminal notifications on the same connection.
+    drainTimer = setTimeout(() => { usageSnapshot(true); void finish(rootCode) }, 200)
+  }
 
   const flushAndExit = code => {
     const t = setTimeout(() => process.exit(code), 500)
@@ -232,13 +356,19 @@ async function main() {
   const finish = async code => {
     if (finished) return
     finished = true
+    ownerState()
+    bridge.close()
+    clearTimeout(drainTimer)
     clearInterval(poller)
     clearInterval(parentWatch)
     clearTimeout(interruptTimer)
     sweepControl(true)
+    for (const q of questions.values()) settleQuestion(q, { error: { code: -32800, message: 'turn finished before a user response' } }, 'cancelled')
     if (unknownMethods.size > 0 || unknownItems.size > 0) {
       emit({ type: 'codexmod.protocol', unknown_methods: [...unknownMethods], unknown_items: [...unknownItems] })
     }
+    await Promise.all([...threads.values()].filter(t => t.id !== threadId && !t.failed && t.done).map(t =>
+      Promise.race([send('thread/unsubscribe', { threadId: t.id }).catch(() => {}), new Promise(resolve => setTimeout(resolve, 300))])))
     await killChild()
     flushAndExit(code)
   }
@@ -248,15 +378,17 @@ async function main() {
     await finish(1)
   }
 
-  const send = (method, params) =>
+  const send = (method, params, beforeWrite) =>
     new Promise((resolve, reject) => {
       const id = ++nextId
-      pending.set(id, { resolve, reject })
+      try { beforeWrite?.(id) } catch { reject({ code: -1, message: 'operation journal unavailable', transport: true }); return }
+      const timer = setTimeout(() => { pending.delete(id); reject({ code: -32000, message: `${method} outcome unknown (timeout)`, transport: true }) }, 10000)
+      pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value) }, reject: error => { clearTimeout(timer); reject(error) } })
       try {
         child.stdin.write(JSON.stringify({ id, method, params }) + '\n')
       } catch (e) {
         pending.delete(id)
-        reject({ code: -1, message: String(e?.message ?? e) })
+        reject({ code: -1, message: String(e?.message ?? e), transport: true })
       }
     })
   const notify = method => {
@@ -288,6 +420,7 @@ async function main() {
 
   const shutdown = async () => {
     if (finished) return
+    for (const t of threads.values()) if (t.id !== threadId && t.turnId && !t.done && !t.failed) void interruptThread(t, 'owner shutdown')
     if (turnId && !turnDone) await interrupt(2000)
     await finish(1)
   }
@@ -305,7 +438,34 @@ async function main() {
 
   // --- control directory ----------------------------------------------------
 
-  const ack = (id, status, reason) => emit({ type: 'codexmod.steer', id, status, ...(reason ? { reason } : {}) })
+  const ack = (id, status, reason, target) => {
+    const event = { type: 'codexmod.steer', id, status, ...(reason ? { reason } : {}) }
+    if (target && target.id !== threadId) childEmit(target, event)
+    else emit(event)
+  }
+  const interrupted = new Set()
+  const stoppedThreads = new Set()
+  const stoppedAncestor = state => {
+    const seen = new Set()
+    while (state && !seen.has(state.id)) {
+      if (stoppedThreads.has(state.id)) return true
+      seen.add(state.id)
+      state = threads.get(state.parent)
+    }
+    return false
+  }
+  const interruptThread = async (target, operationId) => {
+    const key = JSON.stringify([target.id, target.turnId])
+    if (!target.turnId || target.done || target.failed || interrupted.has(key)) return
+    interrupted.add(key)
+    try {
+      await send('turn/interrupt', { threadId: target.id, turnId: target.turnId })
+      childEmit(target, { type: 'codexmod.interrupt', operationId, status: 'accepted' })
+    } catch (e) {
+      childEmit(target, { type: 'codexmod.interrupt', operationId, status: 'unknown', message: String(e?.message ?? e) })
+    }
+  }
+
   const fileId = name => {
     const id = name.slice('steer-'.length, -'.json'.length)
     return /^\d+$/.test(id) ? Number(id) : id
@@ -316,14 +476,75 @@ async function main() {
     } catch {}
   }
 
-  const handleSteer = async (name, path, text) => {
-    const id = fileId(name)
-    remove(path)
+  const requestEvent = (q, status, extra = {}) => {
+    const event = { type: 'codexmod.request', token: q.token, requestId: q.id, method: q.method, params: q.params, status, ...extra }
+    const target = threads.get(q.params.threadId)
+    if (target && target.id !== threadId && !target.attaching && !target.failed) childEmit(target, event)
+    else if (q.params.threadId === undefined || q.params.threadId === threadId) emit(event)
+  }
+  const settleQuestion = (q, response, status) => {
+    if (!questions.delete(q.token)) return
+    const failed = () => requestEvent(q, 'failed', { error: { code: -32000, message: 'question response could not be delivered to Codex' } })
     try {
-      await send('turn/steer', { threadId, expectedTurnId: turnId, input: [{ type: 'text', text, text_elements: [] }] })
-      ack(id, 'accepted')
-    } catch (e) {
-      ack(id, 'rejected', String(e?.message ?? 'turn/steer failed'))
+      if (!child.stdin.writable || child.stdin.destroyed) return failed()
+      child.stdin.write(JSON.stringify({ id: q.id, ...response }) + '\n', err => err ? failed() : requestEvent(q, status, response))
+    } catch { failed() }
+  }
+  const responseFile = (name, path, final) => {
+    const token = name.slice('response-'.length, -'.json'.length)
+    const q = questions.get(token)
+    let body
+    try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { return }
+    remove(path)
+    if (!q || final || turnDone || body.token !== token || body.requestId !== q.id || body.threadId !== threadId || body.turnId !== turnId || body.itemId !== q.params.itemId) {
+      emit({ type: 'codexmod.responseRejected', token, message: 'stale or mismatched question response; no answer delivered' })
+      return
+    }
+    if (body.unsupported === true && body.result === undefined) settleQuestion(q, { error: { code: -32601, message: 'owned question UI unavailable; no user answer supplied' } }, 'unsupported')
+    else if (body.cancel === true && body.result === undefined) settleQuestion(q, { error: { code: -32800, message: 'user cancelled the question' } }, 'cancelled')
+    else if (choiceResponse(q.params, body.result)) settleQuestion(q, { result: body.result }, 'answered')
+    else emit({ type: 'codexmod.responseRejected', token, message: 'invalid question response; no answer delivered' })
+  }
+
+  const bridge = createSteerControl({ control: args.control, generation,
+    destination: body => {
+      if (body.threadId && body.threadId !== threadId) {
+        const t = threads.get(body.threadId)
+        return t && !t.attaching && !t.failed ? t : undefined
+      }
+      return { id: threadId, turnId, done: turnDone || finished }
+    },
+    dispatch: (params, beforeWrite) => send('turn/steer', params, beforeWrite),
+    emit: event => {
+      const target = threads.get(event.threadId)
+      if (target && target.id !== threadId) childEmit(target, event)
+      else emit(event)
+    },
+    interrupt: async body => {
+      if (body.threadId && body.threadId !== threadId) {
+        const target = threads.get(body.threadId)
+        if (!target || target.turnId !== body.turnId) throw new Error('stale child interrupt')
+        stoppedThreads.add(target.id)
+        for (const state of threads.values()) if (stoppedAncestor(state)) void interruptThread(state, body.operationId)
+      } else {
+        if (body.turnId && body.turnId !== turnId) throw new Error('stale root interrupt')
+        parentStopping = true
+        for (const t of threads.values()) if (t.id !== threadId) void interruptThread(t, 'parent stop')
+        void interruptAndEnd()
+      }
+    },
+  })
+  await bridge.listen()
+  const handleSteer = async (name, path, body) => {
+    // The file remains until the durable journal owns the operation.
+    try {
+      const entry = await bridge.submit({ ...body, id: fileId(name), messageId: body.messageId ?? String(fileId(name)),
+        expectedTurnId: body.expectedTurnId ?? body.turnId })
+      remove(path)
+      await entry.done
+    } catch (error) {
+      remove(path)
+      ack(fileId(name), 'rejected', String(error?.message ?? error))
     }
   }
 
@@ -337,7 +558,24 @@ async function main() {
     }
     for (const name of names) {
       const path = join(args.control, name)
+      if (/^response-[A-Za-z0-9-]+\.json$/.test(name)) {
+        responseFile(name, path, final)
+        continue
+      }
+      if (/^interrupt-.+\.json$/.test(name)) {
+        let body
+        try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { continue }
+        remove(path)
+        const target = threads.get(body.threadId)
+        if (!final && target && target.id !== threadId && target.turnId === body.turnId) {
+          stoppedThreads.add(target.id)
+          for (const state of threads.values()) if (stoppedAncestor(state)) void interruptThread(state, body.operationId)
+        }
+        continue
+      }
       if (name === 'interrupt') {
+        parentStopping = true
+        for (const t of threads.values()) if (t.id !== threadId) void interruptThread(t, 'parent stop')
         if (final || turnDone) {
           remove(path)
           continue
@@ -352,127 +590,268 @@ async function main() {
         continue
       }
       if (!/^steer-.+\.json$/.test(name) || inflight.has(name)) continue
-      if (final || turnDone) {
-        remove(path)
-        ack(fileId(name), 'rejected', 'turn finished')
-        continue
-      }
-      if (!turnId) continue // hold until the turn id is known
-      let text
+      if (!turnId && !final) continue
+      let body
       try {
-        const body = JSON.parse(readFileSync(path, 'utf8'))
+        body = JSON.parse(readFileSync(path, 'utf8'))
         if (typeof body?.text !== 'string') throw new Error('no text')
-        text = body.text
       } catch {
         const n = (retries.get(name) ?? 0) + 1
         retries.set(name, n)
-        if (n >= 10) {
-          remove(path)
-          ack(fileId(name), 'rejected', 'unparseable steer file')
-        }
+        if (n >= 10 || final) { remove(path); ack(fileId(name), 'rejected', 'unparseable steer file') }
         continue
       }
       inflight.add(name)
-      handleSteer(name, path, text).finally(() => inflight.delete(name))
+      handleSteer(name, path, body).finally(() => inflight.delete(name))
     }
   }
-  const poller = setInterval(() => sweepControl(), 200)
+  const poller = setInterval(() => { ownerState(); sweepControl() }, 200)
+  ownerState()
 
   // --- translation ----------------------------------------------------------
 
   const changesOf = item =>
     (Array.isArray(item.changes) ? item.changes : [])
       .filter(c => typeof c?.path === 'string' && c.path !== '')
-      .map(c => ({ path: c.path, kind: c.kind?.type ?? 'update' }))
+      .map(c => ({ ...c }))
 
-  const handleNotification = m => {
+  const handleNotification = (m, state, replayed = false) => {
+    const threadId = state?.id ?? rootThread()
+    const turnId = state?.turnId ?? rootTurn()
+    const emit = event => state && state.id !== rootThread()
+      ? childEmit(state, event) : rootEmit(event)
     const p = m.params ?? {}
+    if (m.method === 'turn/completed') {
+      const turns = state.terminalTurns ??= new Set()
+      if (turns.has(turnId)) return
+      turns.add(turnId)
+      if (replayed) {
+        const replayedTurns = state.replayedTerminalTurns ??= new Set()
+        replayedTurns.add(turnId)
+        // A buffered start is explicit evidence that the snapshot's terminal
+        // state is stale. Do not stop a mirror reader on that projection.
+        if (state.buffer.some(n => n.method === 'turn/started' && n.params?.turn?.id === turnId &&
+          (!n.params.turn.rootTurnId || n.params.turn.rootTurnId === state.rootTurnId))) return
+      }
+    }
     if (!KNOWN_METHODS.has(m.method)) unknownMethods.add(m.method)
     const item = p.item
+    discover(item, threadId, turnId)
+    if (item?.id && ['item/started', 'item/completed'].includes(m.method)) {
+      const key = JSON.stringify([threadId, turnId, item.id, m.method])
+      if (itemLifecycles.has(key) || (m.method === 'item/started' && itemLifecycles.has(JSON.stringify([threadId, turnId, item.id, 'item/completed'])))) return
+      itemLifecycles.add(key)
+    }
     if (item && typeof item.type === 'string' && !KNOWN_ITEMS.has(item.type)) unknownItems.add(item.type)
+    // The compatibility view below keeps today's rows. This parallel record
+    // keeps the source contract, including variants without a renderer. Raw
+    // reasoning is intentionally excluded from both views and from deltas.
+    const publicItem = publicSource(item)
+    const source = { transport: 'app-server', event: m.method, threadId, turnId,
+      ...(p.startedAtMs !== undefined ? { startedAtMs: p.startedAtMs } : {}),
+      ...(p.completedAtMs !== undefined ? { completedAtMs: p.completedAtMs } : {}),
+      ...(item ? { item: publicItem } : {}),
+      data: publicSource(Object.fromEntries(Object.entries(p).filter(([key]) => key !== 'item'))) }
+    if (!['item/started', 'item/completed', 'rawResponseItem/completed', 'item/reasoning/textDelta'].includes(m.method)) {
+      emit({ type: 'codexmod.source', source })
+    }
     switch (m.method) {
       case 'thread/tokenUsage/updated': {
         const u = p.tokenUsage
-        if (u?.total) {
-          if (baseline === undefined) {
-            // total before this turn's first model call = first total - first last
-            const l = u.last ?? {}
-            baseline = {
-              inputTokens: (u.total.inputTokens ?? 0) - (l.inputTokens ?? 0),
-              cachedInputTokens: (u.total.cachedInputTokens ?? 0) - (l.cachedInputTokens ?? 0),
-              outputTokens: (u.total.outputTokens ?? 0) - (l.outputTokens ?? 0),
-            }
-          }
-          lastTotal = u.total
+        if (u?.total) state.lastTotal = u.total
+        usage.cumulative(threadId, turnId, state?.rootTurnId ?? rootTurn(), u)
+        usageSnapshot()
+        break
+      }
+      case 'rawResponse/completed':
+        usage.response(threadId, turnId, p.rootTurnId ?? state.rootTurnId ?? rootTurn(), p.responseId, p.usage)
+        usageSnapshot()
+        break
+      case 'item/started':
+        emit({ type: 'item.started', item: item?.type === 'fileChange' ? completedItem(item, changesOf) : { type: 'source_only' }, source })
+        break
+      case 'item/completed': {
+        const translated = completedItem(item, changesOf)
+        emit({ type: 'item.completed', item: translated ?? { type: 'source_only' }, source })
+        break
+      }
+      case 'turn/plan/updated':
+        emit({ type: 'item.updated', item: { type: 'plan_update', explanation: p.explanation, steps: p.plan } })
+        break
+      case 'error':
+        emit({ type: p.willRetry === false ? 'error' : 'codexmod.warning', message: p.error?.message ?? 'error' })
+        break
+      case 'warning':
+      case 'configWarning':
+      case 'deprecationNotice':
+      case 'guardianWarning':
+        emit({ type: 'codexmod.warning', message: p.message ?? p.summary ?? p.error?.message ?? JSON.stringify(p) })
+        break
+      case 'serverRequest/resolved': {
+        const token = requestIds.get(JSON.stringify(p.requestId))?.token
+        const q = questions.get(token)
+        if (q) {
+          questions.delete(token)
+          requestEvent(q, 'cancelled', { error: { code: -32800, message: 'request resolved by Codex; late answers refused' } })
         }
         break
       }
-      case 'item/started':
-        if (item?.type === 'fileChange') emit({ type: 'item.started', item: { type: 'file_change', changes: changesOf(item) } })
-        break
-      case 'item/completed':
-        if (item?.type === 'fileChange') {
-          emit({ type: 'item.completed', item: { type: 'file_change', changes: changesOf(item), status: item.status } })
-        } else if (item?.type === 'commandExecution') {
-          emit({
-            type: 'item.completed',
-            item: { type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? '', exit_code: item.exitCode ?? null },
-          })
-        } else if (item?.type === 'agentMessage') {
-          emit({ type: 'item.completed', item: { type: 'agent_message', text: item.text ?? '' } })
-        }
-        break
-      case 'error':
-        if (p.willRetry === false) emit({ type: 'error', message: p.error?.message ?? 'error' })
-        break
       case 'turn/completed': {
         const t = p.turn ?? {}
-        turnDone = true
+        state.done = true
+        if (threadId === rootThread()) { turnDone = true; rootCode = t.status === 'completed' ? 0 : 1 }
         if (t.status === 'completed') {
-          const tot = lastTotal ?? {}
-          const b = baseline ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }
+          const direct = usage.direct(threadId, state.rootTurnId)
           emit({
             type: 'turn.completed',
             usage: {
-              input_tokens: Math.max(0, (tot.inputTokens ?? 0) - b.inputTokens),
-              cached_input_tokens: Math.max(0, (tot.cachedInputTokens ?? 0) - b.cachedInputTokens),
-              output_tokens: Math.max(0, (tot.outputTokens ?? 0) - b.outputTokens),
+              input_tokens: direct.input,
+              cached_input_tokens: direct.cached,
+              output_tokens: direct.output,
             },
           })
         } else if (t.status === 'interrupted') {
-          emit({ type: 'turn.failed', error: { message: 'interrupted' } })
+          emit({ type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
         } else {
-          emit({ type: 'turn.failed', error: { message: t.error?.message ?? 'turn failed' } })
+          emit({ type: 'turn.failed', status: 'failed', error: { message: t.error?.message ?? 'turn failed' } })
         }
-        for (const w of turnWaiters.splice(0)) w()
-        finish(t.status === 'completed' ? 0 : 1)
+        if (threadId === rootThread()) for (const w of turnWaiters.splice(0)) w()
+        maybeFinish()
         break
       }
     }
   }
 
-  // Ours when it belongs to our thread and (once known) our turn.
+  const rootThread = () => threadId
+  const rootTurn = () => turnId
+  const rootEmit = emit
+  const uuid = id => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+
+  const parentEmit = (state, event) => state.parent === threadId ? emit(event) : childEmit(threads.get(state.parent), event)
+
+  const attach = async state => {
+    try {
+      const result = await send('thread/resume', { threadId: state.id, excludeTurns: true })
+      const th = result?.thread
+      if (th?.id !== state.id || th.parentThreadId !== state.parent) throw new Error('child ancestry mismatch or missing parent')
+      if (th.historyMode && !['legacy', 'paginated'].includes(th.historyMode)) throw new Error(`unsupported child history mode ${th.historyMode}`)
+      state.model = th.model ?? state.model
+      // Buffer live notifications until history has been merged. Only this
+      // source generation is replayed; fork history is not a child action.
+      let cursor
+      const cursors = new Set()
+      do {
+        const page = await send('thread/turns/list', { threadId: state.id, limit: 100, sortDirection: 'asc', itemsView: 'summary', ...(cursor ? { cursor } : {}) })
+        if (!Array.isArray(page?.data)) throw new Error('invalid child turn history')
+        for (const turn of page.data) {
+          if (turn.rootTurnId !== state.rootTurnId) continue
+          state.turnId = turn.id
+          let itemCursor
+          const itemCursors = new Set()
+          do {
+            const items = await send('thread/items/list', { threadId: state.id, turnId: turn.id, limit: 100, sortDirection: 'asc', ...(itemCursor ? { cursor: itemCursor } : {}) })
+            if (!Array.isArray(items?.data)) throw new Error('invalid child item history')
+            for (const entry of items.data) {
+              if (entry.turnId !== turn.id || entry.completedAtMs == null) continue
+              handleNotification({ method: 'item/completed', params: { ...entry, threadId: state.id, turnId: turn.id } }, state)
+            }
+            itemCursor = items.nextCursor
+            if (itemCursor && itemCursors.has(itemCursor)) throw new Error('repeated child item cursor')
+            itemCursors.add(itemCursor)
+          } while (itemCursor)
+          if (['completed', 'failed', 'interrupted'].includes(turn.status)) handleNotification({ method: 'turn/completed', params: { threadId: state.id, turn } }, state, true)
+        }
+        cursor = page.nextCursor
+        if (cursor && cursors.has(cursor)) throw new Error('repeated child turn cursor')
+        cursors.add(cursor)
+      } while (cursor)
+      state.attaching = false
+      parentEmit(state, { type: 'codexmod.child', thread_id: state.id, parent_thread_id: state.parent,
+        source_turn_id: state.spawnTurn, source_item_id: state.spawnItem, root_turn_id: state.rootTurnId, turn_id: state.turnId ?? state.buffer.find(m => m.method === 'turn/started')?.params?.turn?.id,
+        path: state.path, model: state.model, effort: state.effort, status: 'attached', generation })
+      for (const m of state.buffer.splice(0)) route(m)
+      if (parentStopping || stoppedAncestor(state)) void interruptThread(state, 'ancestor stop during attachment')
+      maybeFinish()
+    } catch (e) {
+      state.failed = true
+      state.attaching = false
+      state.buffer = []
+      parentEmit(state, { type: 'codexmod.child', thread_id: state.id, parent_thread_id: state.parent,
+        source_turn_id: state.spawnTurn, source_item_id: state.spawnItem, status: 'unavailable',
+        reason: String(e?.message ?? e), generation })
+      maybeFinish()
+    }
+  }
+
+  function discover(item, parent, spawnTurn) {
+    if (!nested || !item || ['failed', 'declined'].includes(item.status)) return
+    const ids = item.type === 'subAgentActivity' && item.kind === 'started' ? [item.agentThreadId]
+      : item.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' ? item.receiverThreadIds ?? [] : []
+    for (const id of ids) {
+      if (!uuid(id) || id === threadId || threads.has(id)) continue
+      if (!usage.edge(parent, id)) continue
+      const state = { id, parent, spawnTurn, spawnItem: item.id, rootTurnId: threads.get(parent)?.rootTurnId ?? turnId,
+        path: item.agentPath, model: item.model, effort: item.reasoningEffort, attaching: true, done: false,
+        buffer: early.get(id) ?? [] }
+      early.delete(id)
+      threads.set(id, state)
+      void attach(state)
+    }
+  }
+
   const route = m => {
+    if (m.method === 'item/started' || m.method === 'item/completed') bridge.observe(m.params?.threadId, m.params?.turnId, m.params?.item)
     const p = m.params ?? {}
-    if (p.threadId !== undefined && p.threadId !== threadId) return
-    if (m.method === 'turn/started' && !turnId && p.turn?.id) {
-      setTurn(p.turn.id)
+    if (!threadId) { buffered.push(m); return }
+    const id = p.threadId ?? p.thread?.id ?? threadId
+    if (id !== threadId) {
+      if (!nested) return
+      const state = threads.get(id)
+      if (!state) {
+        // Unsolicited data is held, never exposed without a verified edge.
+        if (uuid(id) && early.size < 32) { const q = early.get(id) ?? []; if (q.length < 256) q.push(m); early.set(id, q) }
+        return
+      }
+      if (state.failed) return
+      if (state.attaching) {
+        if (state.buffer.length >= 2048) { state.failed = true; state.buffer = []; emit({ type: 'codexmod.child', thread_id: id, parent_thread_id: state.parent, status: 'unavailable', reason: 'child replay buffer overflow' }) }
+        else state.buffer.push(m)
+        return
+      }
+      const tid = p.turnId ?? p.turn?.id
+      if (m.method === 'turn/started') {
+        if (p.turn.rootTurnId && p.turn.rootTurnId !== state.rootTurnId) return
+        if (state.terminalTurns?.has(tid)) {
+          // Only a replay projection can be superseded. A duplicate start
+          // after a live completion must not reopen an already finished turn.
+          if (!state.replayedTerminalTurns?.delete(tid)) return
+          state.terminalTurns.delete(tid)
+        }
+        if (state.turnId !== tid) state.lastTotal = undefined
+        state.turnId = tid
+        state.done = false
+        childEmit(state, { type: 'codexmod.turn', turn_id: tid })
+        if (parentStopping || stoppedAncestor(state)) void interruptThread(state, 'ancestor stop')
+      }
+      if (tid && !state.turnId) state.turnId = tid
+      if (tid && state.turnId !== tid) return
+      handleNotification(m, state)
       return
     }
+    if (m.method === 'turn/started' && !turnId && p.turn?.id) { setTurn(p.turn.id); return }
     const tid = p.turnId ?? p.turn?.id
-    if (!turnId) {
-      buffered.push(m)
-      return
-    }
+    if (!turnId) { buffered.push(m); return }
     if (tid !== undefined && tid !== turnId) return
-    handleNotification(m)
+    handleNotification(m, threads.get(threadId))
   }
 
   function setTurn(id) {
     if (turnId) return
     turnId = id
+    threads.set(threadId, { id: threadId, turnId: id, rootTurnId: id, done: false })
     emit({ type: 'codexmod.turn', turn_id: id })
     for (const m of buffered.splice(0)) route(m)
+    for (const m of bufferedRequests.splice(0)) onLine(JSON.stringify(m))
     if (pendingInterrupt) {
       pendingInterrupt = false
       void interruptAndEnd()
@@ -503,8 +882,31 @@ async function main() {
       return
     }
     if (m.id !== undefined && typeof m.method === 'string') {
+      if (!turnId && !turnDone && m.params?.threadId === threadId) {
+        bufferedRequests.push(m)
+        return
+      }
+      const key = JSON.stringify(m.id)
+      const previous = requestIds.get(key)
+      if (previous) {
+        if (previous.method !== m.method || JSON.stringify(previous.params) !== JSON.stringify(m.params)) emit({ type: 'codexmod.responseRejected', token: previous.token, message: 'RPC ID reused with different request; no answer delivered' })
+        return
+      }
+      const q = { id: m.id, token: randomUUID(), method: m.method, params: publicSource(m.params ?? {}) }
+      requestIds.set(key, q)
+      if (m.method === QUESTION_METHOD && args.questions === 'choices' && choiceQuestions(q.params) && q.params.threadId === threadId && q.params.turnId === turnId && !turnDone && !finished) {
+        questions.set(q.token, q)
+        requestEvent(q, 'pending')
+        return
+      }
+      const error = { code: -32601, message: 'unsupported by codex-mod (only enabled, non-secret bounded choice questions; approvals remain disabled)' }
+      requestEvent(q, 'unsupported', { error })
+      if (m.params?.threadId === undefined || m.params.threadId === threadId) {
+        emit({ type: 'codexmod.source', source: { transport: 'app-server', event: m.method, threadId, turnId,
+          data: publicSource({ ...m.params, requestId: m.id, response: error }) } })
+      }
       try {
-        child.stdin.write(JSON.stringify({ id: m.id, error: { code: -32601, message: 'unsupported by codex-mod' } }) + '\n')
+        child.stdin.write(JSON.stringify({ id: m.id, error }) + '\n')
       } catch {}
       return
     }
@@ -543,6 +945,7 @@ async function main() {
     stderrTail = (stderrTail + d).slice(-2000)
   })
   let out = ''
+  child.stdout.setEncoding('utf8')
   child.stdout.on('data', d => {
     out += d
     let n
@@ -553,14 +956,14 @@ async function main() {
     }
   })
   child.on('exit', (code, signal) => {
-    for (const h of pending.values()) h.reject({ code: -2, message: 'app-server exited' })
+    for (const h of pending.values()) h.reject({ code: -2, message: 'app-server exited', transport: true })
     pending.clear()
     if (out.trim() !== '') {
       const rest = out
       out = ''
       onLine(rest)
     }
-    if (!childExpectedExit && !finished && !turnDone) {
+    if (!childExpectedExit && !finished) {
       fatal(`app-server exited early (${signal ?? code}): ${stderrTail.trim()}`)
     }
   })
@@ -599,10 +1002,6 @@ async function main() {
   emit({ type: 'thread.started', thread_id: threadId })
 
   sweepControl() // an interrupt written during startup
-  if (pendingInterrupt) {
-    emit({ type: 'turn.failed', error: { message: 'interrupted' } })
-    return finish(1)
-  }
   let ts
   try {
     ts = await send('turn/start', {

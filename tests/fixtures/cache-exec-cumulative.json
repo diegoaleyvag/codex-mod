@@ -1,0 +1,6 @@
+{
+  "thread": "01a14f50-c51c-7370-9bca-f123456789ab",
+  "first": { "input": 53880, "cached": 42112, "output": 284 },
+  "followUpTotal": { "input": 98934, "cached": 86016, "output": 651 },
+  "followUpDelta": { "input": 45054, "cached": 43904, "output": 367 }
+}

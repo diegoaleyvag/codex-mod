@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
 
-# Only the runner tests run here. The hook tests (tests/codex.test.ts) import
+# The runner tests and Node 22 cache/checkpoint tests run here. Hook tests import
 # claude-code/testing, which ships with Claude Code, so `claude plugin test .`
 # and `claude plugin validate --strict .` run locally.
 jobs:
@@ -24,6 +24,9 @@ jobs:
         run: node --check scripts/codex-runner.mjs
       - name: Runner tests
         run: node --test tests/runner.test.mjs
+      - name: Cache and checkpoint tests
+        if: matrix.node == 22
+        run: node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs
       - name: JSON validity
         run: |
           node -e "

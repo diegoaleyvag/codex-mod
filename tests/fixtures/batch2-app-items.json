@@ -1,0 +1,1606 @@
+[
+  {
+    "type": "commandExecution",
+    "id": "whole",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-whole",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "empty",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-empty",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "crlf",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-crlf",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\r\ntwo\r\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "no-final-newline",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-no-final-newline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "slice-tail",
+    "command": "tail -n +3 a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-slice-tail",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "tail -n +3 a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "three\nfour\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "slice-head-eof",
+    "command": "head -n 5 a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-slice-head-eof",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "head -n 5 a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "slice-head-empty",
+    "command": "head -n 5 a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-slice-head-empty",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "head -n 5 a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "quoted",
+    "command": "cat 'a | $x; [b].txt'",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-quoted",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat 'a | $x; [b].txt'",
+        "type": "read",
+        "name": "a | $x; [b].txt",
+        "path": "a | $x; [b].txt"
+      }
+    ],
+    "aggregatedOutput": "literal\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "double-quoted",
+    "command": "cat \"a \\$x.txt\"",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-double-quoted",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat \"a \\$x.txt\"",
+        "type": "read",
+        "name": "a $x.txt",
+        "path": "a $x.txt"
+      }
+    ],
+    "aggregatedOutput": "literal\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "escaped",
+    "command": "cat a\\ b.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-escaped",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a\\ b.txt",
+        "type": "read",
+        "name": "a b.txt",
+        "path": "a b.txt"
+      }
+    ],
+    "aggregatedOutput": "literal\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "shell-wrapper",
+    "command": "/bin/zsh -lc 'cat a.txt'",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-shell-wrapper",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat a.txt",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "shell-whole-action",
+    "command": "/bin/bash -c 'cat a.txt'",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-shell-whole-action",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "/bin/bash -c 'cat a.txt'",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "shell-pipeline",
+    "command": "/bin/zsh -lc 'cat a.txt | head'",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-shell-pipeline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "symlink-parent",
+    "command": "cat link/../a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-symlink-parent",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat link/../a.txt",
+        "type": "read",
+        "name": "link/../a.txt",
+        "path": "link/../a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "slice-unknown",
+    "command": "sed -n '2,3p' a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-slice-unknown",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "sed -n '2,3p' a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "two\nthree\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "head-unknown",
+    "command": "head -n 2 a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-head-unknown",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "head -n 2 a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "tail-unknown",
+    "command": "tail -n +3 a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-tail-unknown",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "tail -n +3 a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "numbered",
+    "command": "cat -n a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-numbered",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat -n a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": " 1\tone\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "binary",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-binary",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\u0000two",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "path-mismatch",
+    "command": "cat b.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-path-mismatch",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat b.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "nonzero",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-nonzero",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "permission denied\n",
+    "exitCode": 2,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "null-exit",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-null-exit",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": null,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "timeout",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-timeout",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "partial\n",
+    "exitCode": 124,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "declined",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-declined",
+    "status": "declined",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "declined",
+    "exitCode": null,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "stderr",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-stderr",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12,
+    "stderr": "warning"
+  },
+  {
+    "type": "commandExecution",
+    "id": "clipped",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-clipped",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n[... 123 tokens truncated]",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "pipeline",
+    "command": "cat a.txt | sed -n 1p",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-pipeline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt | sed -n 1p",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "compound",
+    "command": "cat a.txt && cat b.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-compound",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt && cat b.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "redirect",
+    "command": "cat a.txt > copy.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-redirect",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt > copy.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "substitution",
+    "command": "cat \"$(echo a.txt)\"",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-substitution",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat \"$(echo a.txt)\"",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "backtick",
+    "command": "cat `echo a.txt`",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-backtick",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat `echo a.txt`",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "variable",
+    "command": "cat \"$FILE\"",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-variable",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat \"$FILE\"",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "wildcard",
+    "command": "cat *.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-wildcard",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat *.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\ntwo\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "multi-action",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-multi-action",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat a.txt",
+        "path": "a.txt"
+      },
+      {
+        "type": "read",
+        "command": "cat b.txt",
+        "path": "b.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "partial-action",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-partial-action",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "exec-missing-actions",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-exec-missing-actions",
+    "status": "completed",
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "userShell",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "userShell",
+    "processId": "pty-userShell",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "unifiedExecStartup",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "unifiedExecStartup",
+    "processId": "pty-unifiedExecStartup",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "unifiedExecInteraction",
+    "command": "cat a.txt",
+    "cwd": "/workspace",
+    "source": "unifiedExecInteraction",
+    "processId": "pty-unifiedExecInteraction",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "cat a.txt",
+        "type": "read",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "one\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "immediate-files",
+    "command": "find . -maxdepth 1 -type f -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-immediate-files",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . -maxdepth 1 -type f -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "recursive-files",
+    "command": "find . -type f -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-recursive-files",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . -type f -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "./a.txt\u0000./sub/b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "empty-list",
+    "command": "find . -type f -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-empty-list",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . -type f -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "rg-files",
+    "command": "rg --files -0 -g '*.ts' src",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-rg-files",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0 -g '*.ts' src",
+        "type": "listFiles",
+        "path": "src"
+      }
+    ],
+    "aggregatedOutput": "src/a.ts\u0000src/b.ts\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "null-root",
+    "command": "rg --files -0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-null-root",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0",
+        "type": "listFiles",
+        "path": null
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "duration-sentinel",
+    "command": "rg --files -0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-duration-sentinel",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000",
+    "exitCode": 0,
+    "durationMs": null
+  },
+  {
+    "type": "commandExecution",
+    "id": "list-metacharacters",
+    "command": "rg --files -0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-list-metacharacters",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a | $x.txt\u0000a:b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "ls-directories",
+    "command": "ls -1",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-ls-directories",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "ls -1",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\nsubdir\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "find-directories",
+    "command": "find . -type d -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-find-directories",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . -type d -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": ".\u0000./subdir\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "newline-list",
+    "command": "rg --files",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-newline-list",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\nb.txt\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "embedded-newline",
+    "command": "rg --files -0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-embedded-newline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a\nb.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "unterminated-nul",
+    "command": "rg --files -0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-unterminated-nul",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --files -0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000b.txt",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "unsupported-filter",
+    "command": "find . -name a -type f -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-unsupported-filter",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . -name a -type f -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "find-token-boundary",
+    "command": "find . '-type f' -print0",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-find-token-boundary",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "find . '-type f' -print0",
+        "type": "listFiles",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "content",
+    "command": "rg --json -n x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-content",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json -n x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"sub/b.txt\"},\"lines\":{\"text\":\"x again\\n\"},\"line_number\":3,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "json-framing",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-json-framing",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"a.txt\"}}}\n{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n{\"type\":\"end\",\"data\":{}}\n{\"type\":\"summary\",\"data\":{\"stats\":{\"matches\":1,\"matched_lines\":1}}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "multiline-result",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-multiline-result",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\nx again\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "content-no-newline",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-content-no-newline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"b.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "stdin-target",
+    "command": "rg --json x -- -",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-stdin-target",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x -- -",
+        "type": "search",
+        "query": "x",
+        "path": "-"
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"<stdin>\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "inherited-stdin",
+    "command": "rg --json x",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-inherited-stdin",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x",
+        "type": "search",
+        "query": "x",
+        "path": null
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"<stdin>\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "error-metadata",
+    "command": "rg -l -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-error-metadata",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 1,
+    "durationMs": 12,
+    "error": {
+      "message": "timeout"
+    }
+  },
+  {
+    "type": "commandExecution",
+    "id": "colon-filename-json",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-colon-filename-json",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a:1.txt\"},\"lines\":{\"text\":\"x:y\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "files",
+    "command": "rg -l -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-files",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u0000sub/b.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "count",
+    "command": "rg --count-matches -H -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-count",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --count-matches -H -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u00002\nsub/b.txt\u00003\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "fixed",
+    "command": "rg --json -F 'a.b[$]' .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-fixed",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json -F 'a.b[$]' .",
+        "type": "search",
+        "query": "a.b[$]",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"a.b[$]\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "flags",
+    "command": "rg --json -i -n -A 1 -g '*.ts' -t ts x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-flags",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json -i -n -A 1 -g '*.ts' -t ts x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.ts\"},\"lines\":{\"text\":\"X\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "no-matches-files",
+    "command": "rg -l -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-no-matches-files",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 1,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "no-matches-count",
+    "command": "rg --count-matches -H -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-no-matches-count",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --count-matches -H -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "",
+    "exitCode": 1,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "no-matches-json",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-no-matches-json",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"summary\",\"data\":{\"stats\":{\"matches\":0,\"matched_lines\":0}}}\n",
+    "exitCode": 1,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "search-failure",
+    "command": "rg -l -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-search-failure",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "permission denied\n",
+    "exitCode": 2,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "exit-one-with-error",
+    "command": "rg -l -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-exit-one-with-error",
+    "status": "failed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "error\n",
+    "exitCode": 1,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "search-timeout",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-search-timeout",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 124,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "search-null-exit",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-search-null-exit",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": null,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "search-pipeline",
+    "command": "rg x . | head",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-search-pipeline",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg x . | head",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "x\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "search-redirect",
+    "command": "rg --json x . 2>/dev/null",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-search-redirect",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x . 2>/dev/null",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "ambiguous-colons",
+    "command": "rg -n x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-ambiguous-colons",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg -n x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a:1.txt:2:x\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "line-count-not-match-count",
+    "command": "rg -c -H -0 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-line-count-not-match-count",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg -c -H -0 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "a.txt\u00002\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "unsupported-regex",
+    "command": "rg --json --pcre2 x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-unsupported-regex",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json --pcre2 x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"x\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "bad-json",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-bad-json",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{not json}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "missing-framing",
+    "command": "rg --json x .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-missing-framing",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json x .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "x\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "query-mismatch",
+    "command": "rg --json y .",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-query-mismatch",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg --json y .",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.txt\"},\"lines\":{\"text\":\"y\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":1,\"match\":{\"text\":\"x\"}}]}}\n",
+    "exitCode": 0,
+    "durationMs": 12
+  },
+  {
+    "type": "commandExecution",
+    "id": "path-mismatch-search",
+    "command": "rg -l -0 x src",
+    "cwd": "/workspace",
+    "source": "agent",
+    "processId": "pty-path-mismatch-search",
+    "status": "completed",
+    "commandActions": [
+      {
+        "command": "rg -l -0 x src",
+        "type": "search",
+        "query": "x",
+        "path": "."
+      }
+    ],
+    "aggregatedOutput": "src/a.txt\u0000",
+    "exitCode": 0,
+    "durationMs": 12
+  }
+]

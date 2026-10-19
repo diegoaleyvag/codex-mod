@@ -1,4 +1,4 @@
-// codex-mod: the agent types `codex-mod:<codex|sol|sol-high|astra-audit>` are
+// codex-mod: the generic and project-declared agent types are
 // answered by OpenAI Codex (`codex exec --json`) running on this machine,
 // never by an Anthropic model.
 //
@@ -16,16 +16,17 @@
 //   - those calls are NEVER executed: they carry a tool_use id with the prefix
 //     `toolu_codexmod_`, and this module's `tool.call` hook answers each one
 //     from the result Codex reported without calling `next`, so neither the
-//     permission path nor the tool runs. Any Bash/Edit/Write of a Codex agent
+//     permission path nor the tool runs. Any Bash/Edit/Write/WebSearch of a Codex agent
 //     (or of an agent whose type cannot be resolved) without a stored answer is
-//     refused, the hook's `.catch` refuses when the hook itself fails, and
+//     refused. Registered display tools refuse other callers too. The hook's
+//     `.catch` refuses when the hook itself fails, and
 //     `tool.check` denies such a call should it ever be reached;
 //   - when Codex ends, the step hands the answer back ONCE: as the
-//     `SubagentHandback` call (auto: the default, and whenever the
-//     conversation mentions the tool or the engine sends its
-//     `[handback-send-enforce]` nudge), else as the step's final text
-//     (`end_turn`; auto falls back to it only when the tool answers "not
-//     active for this agent", re-delivering the same answer, no Codex run).
+//     `SubagentHandback` call when the conversation mentions the tool or the
+//     engine sends its `[handback-send-enforce]` nudge, else as final text if
+//     the API form has no signal or the session has seen a not-active result.
+//     Auto still defaults to the tool on incomplete reads and falls back to
+//     text on a not-active result, re-delivering the same answer, no Codex run.
 //
 // Tasks: the conversation is read in its API form, meta rows included (the
 // rows form of `$.session.messages` leaves isMeta rows out: the host's
@@ -48,16 +49,16 @@
 // acks, protocol drift, fatal). Everything else (pump, actions, handback,
 // footer, record, launch guard) is shared. Session start checks node, `codex
 // app-server --help` and the runner; any failure falls back to exec for the
-// session, and the footer says why. The hook talks to a live runner through
-// files in its control dir (`<cache>/codex-mod/runs/<session>-<agent>-<n>/`,
-// created mode 0700 at launch since steer files carry prompt text, pruned
-// with the records): `steer-<id>.json` and `interrupt`.
+// session, and the footer says why. Each per-run sidecar exposes HTTP over a
+// private Unix socket. The host's socketPath API is probed before submission;
+// unsupported or policy-blocked hosts negotiate file controls. Submitted
+// operations never switch paths. Journals and lossless bodies stay in the
+// private run cache, with bounded host-store metadata.
 //
-// Steer (app-server only): a user/coordinator message that arrives while the
-// run is active is written as a steer file instead of being queued; an
-// accepted steer counts as that message's launch, a rejected one (or one never
-// acked) runs after the handback, as an exec follow-up does. Messages are
-// looked for at each step and, while a step waits on the runner, every 2 s.
+// Steer: scoped session.receive routes early, session.append records the
+// authoritative UUID, and conversation polling remains a recovery path.
+// Successful RPC acceptance must match the expected turn; explicit rejection
+// can queue after it. Missing acknowledgments stay uncertain without replay.
 // A coordinator's SendMessage into a running turn is no user row: the engine
 // appends it as a `queued_command` attachment rendered as a reminder block
 // ("The coordinator sent a message while you were working: ...") and promotes
@@ -81,14 +82,15 @@
 // step sees the agent is no longer running, when the agent's turn completes
 // while a run is still active, when `timeoutMinutes` elapses, and when the
 // module unloads (the engine kills every spawn of an unloaded module). An
-// app-server run is first asked to stop (`interrupt` file) and given 1.5 s.
+// app-server run is first asked to stop (the negotiated control channel) and given 1.5 s.
 //
 // Continuity: one record per agent `{ thread, model, effort, sandbox,
 // lastTask, agentName, handedBack, handback, lastAnswer, handbackLock,
 // userCount, launch-guard counters, runSeq, updatedAt }`, kept in memory and
 // in `$.store` under `agent:<sessionId>:<agentId>`, so it survives a
 // hooks-worker restart, a hot reload and a `--resume`. Records not updated for
-// `pruneDays` are pruned at session start/end.
+// `pruneDays` are pruned at session start/end. A not-active handback memo lives
+// under `session:<sessionId>:handback` in the same store with the same pruning.
 //
 // Drift: lines of an unknown type (or not JSON) are counted; a run that ends
 // with no agent message and some of them fails as "protocol changed" with the
@@ -107,7 +109,31 @@
 // so the user-level AGENTS.md is not loaded. Nothing in the real home is
 // written or deleted by this module.
 
+import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics, isMirrorAutoModeNoVerdict, prepareMirrorRetry } from './mirror-launch.ts'
+import type { MirrorAuthority } from './mirror-launch.ts'
+import { explorationAction, validExploration, literalWords } from './exploration.ts'
+import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
+import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult } from './web-tools.ts'
+import { childRows, planRows, planText, emptyDisplayState } from './plans-children.ts'
+import { captureImage, validImage, generationAction, findingsAction, literalReceipt } from './images-modes.ts'
+import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuestion } from './questions.mjs'
+import { controlRequest, queryOutcome, publishOutcome, messageStatus } from './steer.ts'
+import type { MessageOutcome } from './steer.ts'
+import { compactStoreState, flushStoreMigrations, readStoreState, writeStoreState } from './store-state.ts'
+import { fingerprint, matchesIdentity } from './fingerprint.ts'
+import type { Fingerprint } from './fingerprint.ts'
+import { journalLine, journalRead } from './child-journal.mjs'
+import { RowCache, saveRow, loadRow } from './row-cache.ts'
+import type { RowPresentation } from './row-cache.ts'
+import { boundedNames, validCapabilities, resolvePolicy, policyTask, configHash, capacityFallback } from './run-policy.ts'
+import type { RolePolicy, EffectiveConfig } from './run-policy.ts'
+import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
+import type { DisplayState, PlanInput } from './plans-children.ts'
+import type { GlobResult, GrepResult } from './exploration.ts'
+export { explorationAction, literalWords } from './exploration.ts'
 import type {
+  BuiltinToolInputs,
+  BuiltinToolResults,
   EngineInterface,
   HookStream,
   ProcessSpawnChunk,
@@ -150,19 +176,28 @@ const MAX_REDELIVER = 6
 const SLOW_AFTER = 60
 const SLOW_MS = 5000
 const MAX_ACTION_STEPS = 300
-// What one action shows at most: a command's output, a file's content.
-const OUTPUT_MAX = 30000
-const FILE_MAX = 100000
 const STORE_PREFIX = 'agent:'
+const SESSION_PREFIX = 'session:'
 const DAY_MS = 24 * 60 * 60 * 1000
 // In this host a subagent's result reaches its caller through this tool when
 // it is active for the agent; its input is `{ message }`.
 const HANDBACK_TOOL = 'SubagentHandback'
-/** Every tool_use id this module mints starts with it. */
+/** Reserved for nonexecuting display calls, including unknown future tools. */
 export const ID_PREFIX = 'toolu_codexmod_'
+export const HANDBACK_ID_PREFIX = 'toolu_codexhandback_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write'] as const
-type NativeTool = (typeof NATIVE_TOOLS)[number]
+export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'WebFetch', 'Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop', 'ReportFindings', 'AskUserQuestion'] as const
+const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop', 'ReportFindings', 'AskUserQuestion'])
+type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message' | 'codex_question'
+const displayTools: Partial<Record<DisplayTool, string>> = {}
+const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
+// Kept after the guard consumes its answer, so resolved rows still render.
+const coordinatorRows = new RowCache<{ sessionId: string; tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
+const planCards = new RowCache<PlanInput>()
+type Question = { token: string; requestId: string | number; method: string; params: any; status: string; result?: any; error?: any }
+const questionRows = new RowCache<{ session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
+const COORDINATOR_PART_MAX = 90000
+const dimNotes = new Set<string>()
 export const NOT_EXECUTED = 'codex-mod: not executed'
 // Feature flags a lean launch turns off (`-c features.<name>=false`; an
 // unknown name is ignored by Codex).
@@ -205,22 +240,68 @@ const INTERRUPT_GRACE_MS = 1500
 // ---- roles -----------------------------------------------------------------
 
 type Profile = { model: string; effort: string; sandbox: string }
-type Role = Profile & { summary: string }
+type ProjectRole = Profile & RolePolicy & { description: string }
+const PROJECT_FILE = '.claude/codex-mod.json'
 
-/** The role agents: what Codex runs each with. `codex` (the generic agent) is built from userConfig. */
-export const ROLES: Record<string, Role> = {
-  sol: {
-    model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write',
-    summary: 'Implementer for a normal, bounded coding task. The prompt must carry the full task spec (branch, allowed paths, verification command, report format); Codex sees only the prompt and the repo\'s AGENTS.md. It cannot commit in git worktrees or use the network, so the caller commits and pushes.',
-  },
-  'sol-high': {
-    model: 'gpt-6.1-sol', effort: 'xhigh', sandbox: 'workspace-write',
-    summary: 'Implementer for high-risk work or a retry after a failed attempt. The prompt must carry the full task spec (branch, allowed paths, verification command, report format); the caller commits and pushes.',
-  },
-  'astra-audit': {
-    model: 'gpt-6-astra', effort: 'xhigh', sandbox: 'read-only',
-    summary: 'Independent read-only auditor of someone else\'s change; it never edits files. Give it the diff or branch and the acceptance criteria, and it reports findings.',
-  },
+/** Validates an untrusted project file without I/O; catalog checks happen at registration. */
+export function parseProjectRoles(text: string, { allowFullAccess = false } = {}): { roles: Record<string, ProjectRole>; warnings: string[]; invalid?: true } {
+  const roles: Record<string, ProjectRole> = Object.create(null)
+  const warnings: string[] = []
+  const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { roles, warnings: ['invalid JSON; project roles ignored'], invalid: true }
+  }
+  if (!object(parsed) || !object(parsed.roles)) {
+    return { roles, warnings: ['expected an object with a roles object; project roles ignored'], invalid: true }
+  }
+  const unknown = (o: Record<string, unknown>, keys: string[], where: string) => {
+    for (const k of Object.keys(o)) if (!keys.includes(k)) warnings.push(`${where}: unknown key ${JSON.stringify(k)} ignored`)
+  }
+  unknown(parsed, ['roles'], 'project')
+  const entries = Object.entries(parsed.roles)
+  if (entries.length > 16) warnings.push('at most 16 roles allowed; extra roles skipped')
+  for (const [name, value] of entries.slice(0, 16)) {
+    const bad = (why: string) => warnings.push(`role ${JSON.stringify(name)} skipped: ${why}`)
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(name) || ['codex', 'codex-child'].includes(name)) {
+      bad('invalid or reserved name')
+      continue
+    }
+    if (!object(value)) {
+      bad('expected an object')
+      continue
+    }
+    unknown(value, ['model', 'effort', 'sandbox', 'description', 'instructions', 'lean', 'capabilities', 'fallbackModels'], `role ${name}`)
+    const { model, effort, description, instructions } = value
+    const sandbox = value.sandbox === undefined ? 'workspace-write' : value.sandbox
+    if (typeof model !== 'string' || model.trim() === '' || typeof effort !== 'string' || effort.trim() === '' || typeof description !== 'string') {
+      bad('model, effort and description must be strings (model and effort nonempty)')
+      continue
+    }
+    if (description.length > 600 || (instructions !== undefined && (typeof instructions !== 'string' || instructions.length > 2000))) {
+      bad('description must be at most 600 chars; instructions must be a string of at most 2000 chars')
+      continue
+    }
+    if (typeof sandbox !== 'string' || !SANDBOXES.includes(sandbox)) {
+      bad('invalid sandbox')
+      continue
+    }
+    if (sandbox === 'danger-full-access' && !allowFullAccess) {
+      bad('danger-full-access requires the user-level allowProjectFullAccess option')
+      continue
+    }
+    if (value.lean !== undefined && typeof value.lean !== 'boolean' || value.capabilities !== undefined && !validCapabilities(value.capabilities) || value.fallbackModels !== undefined && !boundedNames(value.fallbackModels)) {
+      bad('invalid lean, capabilities or fallbackModels schema')
+      continue
+    }
+    roles[name] = { model, effort, sandbox, description, ...(instructions !== undefined ? { instructions } : {}),
+      ...(value.lean !== undefined ? { lean: value.lean as boolean } : {}),
+      ...(value.capabilities !== undefined ? { capabilities: value.capabilities as RolePolicy['capabilities'] } : {}),
+      ...(value.fallbackModels !== undefined ? { fallbackModels: value.fallbackModels as string[] } : {}) }
+  }
+  return { roles, warnings }
 }
 const GENERIC_SUMMARY = 'Delegates the task to OpenAI Codex (codex exec) running locally in the session\'s working directory. Use for a self-contained coding or research task you want done by Codex rather than Claude. The prompt is sent to Codex verbatim.'
 const PLACEHOLDER_PROMPT = 'You are a placeholder. The codex-mod plugin answers this agent\'s turns with OpenAI Codex and no Anthropic request is sent. If you are reading this, the plugin\'s turn.step hook did not run: reply with exactly "codex-mod: hook not active; no Codex run was made." and nothing else. Do not call any tool.'
@@ -239,7 +320,12 @@ export type Config = {
   lean: boolean
   globalRules: boolean
   generic: Profile
-  roles: string[]
+  projectRoles: boolean
+  modelAgents: boolean
+  allowProjectFullAccess: boolean
+  allowProjectNonLean: boolean
+  projectCapabilityAllowlist: string[]
+  capacityFallback: string[]
   extraConfig: string[]
   intervalMs: number
   maxActionsPerStep: number
@@ -250,6 +336,8 @@ export type Config = {
   /** Launch guard: the most Codex launches per agent in WINDOW_MS. */
   maxRunsPerWindow: number
   nativeActions: boolean
+  richRows: boolean
+  nestedAgents: boolean
   ttlMs: number
   /** What a run is launched with; `app-server` falls back to exec when its checks fail. */
   transport: Transport
@@ -258,8 +346,6 @@ export type Config = {
   /** Option values that were refused (the default was used), for the debug log. */
   warnings: string[]
 }
-
-const DEFAULT_ROLES = Object.keys(ROLES)
 
 /** Validates the userConfig values; a refused value falls back to its default with a warning. */
 export function parseConfig(raw: unknown): Config {
@@ -301,11 +387,7 @@ export function parseConfig(raw: unknown): Config {
   const model = str('defaultModel', '')
   if (model !== '' && !/^[\w.:-]+$/.test(model)) bad('defaultModel', 'not a model name')
   const effort = str('defaultEffort', FALLBACK_EFFORT).toLowerCase()
-  const roles = list('roles', DEFAULT_ROLES).filter(r => {
-    if (r in ROLES) return true
-    warnings.push(`roles: unknown role "${r}" ignored`)
-    return false
-  })
+  if (Object.prototype.hasOwnProperty.call(o, 'roles')) warnings.push('roles: removed in 1.2; declare roles in .claude/codex-mod.json')
   const extraConfig = list('extraConfig', []).filter(kv => {
     const m = /^([A-Za-z0-9_.\-"]+)=([\s\S]+)$/.exec(kv)
     if (!m) return warnings.push(`extraConfig: "${kv}" is not key=value; ignored`), false
@@ -324,7 +406,19 @@ export function parseConfig(raw: unknown): Config {
       effort: /^[a-z]+$/.test(effort) ? effort : (bad('defaultEffort', 'not an effort name'), FALLBACK_EFFORT),
       sandbox: oneOf('defaultSandbox', 'workspace-write', SANDBOXES),
     },
-    roles,
+    projectRoles: bool('projectRoles', true),
+    modelAgents: bool('modelAgents', true),
+    allowProjectFullAccess: bool('allowProjectFullAccess', false),
+    allowProjectNonLean: bool('allowProjectNonLean', false),
+    projectCapabilityAllowlist: list('projectCapabilityAllowlist', []).filter((s, i) => {
+      const valid = i < 32 && /^(?:webSearch:(?:cached|live)|mcp:[A-Za-z0-9_-]{1,64}|multiAgent|skillsInstructions|apps|plugins|images)$/.test(s)
+      if (!valid) warnings.push(`projectCapabilityAllowlist: invalid grant ${JSON.stringify(s)} ignored`)
+      return valid
+    }),
+    capacityFallback: (() => {
+      const names = list('capacityFallback', ['gpt-6-sol', 'gpt-5.6-sol'])
+      return boundedNames(names) ? names : (bad('capacityFallback', 'expected at most 32 unique model names'), ['gpt-6-sol', 'gpt-5.6-sol'])
+    })(),
     extraConfig,
     intervalMs: int('progressIntervalMs', 1000, 0, 60000),
     maxActionsPerStep: int('maxActionsPerStep', 10, 1, 50),
@@ -333,6 +427,8 @@ export function parseConfig(raw: unknown): Config {
     timeoutMs: int('timeoutMinutes', 0, 0, 1440) * 60000,
     maxRunsPerWindow: int('maxRunsPerWindow', 3, 1, 100),
     nativeActions: bool('nativeActions', true),
+    richRows: bool('richRows', false),
+    nestedAgents: bool('nestedAgents', true),
     ttlMs: int('pruneDays', 2, 1, 365) * DAY_MS,
     transport: oneOf<Transport>('transport', 'exec', ['exec', 'app-server']),
     nodeOverride: nodePath === '' ? undefined : nodePath,
@@ -343,7 +439,21 @@ export function parseConfig(raw: unknown): Config {
 /** Kept per agent between steps, runs, worker restarts and resumes. */
 export type AgentRecord = Profile & {
   agentName: string
+  // Only small row identity/profile metadata belongs in the host store.
+  selection?: { session: string; toolUseId: string; type: string; launchModel: string; launchEffort: string; note?: string }
+  modelRowIds?: string[]
   thread?: string
+  effectiveConfig?: EffectiveConfig
+  effectiveFingerprint?: string
+  fallbackModels?: string[]
+  capacityRetryKey?: string
+  lastTaskFingerprint?: Fingerprint
+  launchKeyFingerprint?: Fingerprint
+  capacityRetryKeyFingerprint?: Fingerprint
+  guardTripKeyFingerprint?: Fingerprint
+  recoveryUnavailable?: boolean
+  // A missing total after interruption invalidates the next exec baseline.
+  threadUsage?: { thread: string; total: Usage; valid: boolean }
   lastTask?: string
   handedBack?: boolean
   // true when the host delivers this agent's report through SubagentHandback
@@ -361,11 +471,18 @@ export type AgentRecord = Profile & {
   launches?: number[]
   launchKey?: string
   launchesSinceNew?: number
-  guardTrip?: { key: string; reason: string }
+  guardTrip?: { key?: string; reason: string }
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
+  // Receipt IDs are bounded in the store; bodies recover from private cache files.
+  coordinator?: { received: string[]; pending: { uuid: string; text: string; messageId?: string; sourceUuid?: string; mirrorClaimed?: true }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string; messageId?: string }> ; outcomes?: Record<string, MessageOutcome>; sources?: Record<string, string>; authoritative?: true; ingress?: { messageId: string; senderToolUseId: string; count: number; fromSend?: true; text?: string }[] }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
+  // Runtime/cache only: never put lossless source evidence in the host store.
+  wire?: { records: SourceRecord[]; rows: Record<string, SourceRecord | null> }
+  display?: DisplayState
+  mirror?: ChildMirror
+  playback?: { segment?: number; cursor: number; prefix: string; texts: string[]; queue: Queued[]; actions: number; usage?: Usage; usageCanonical?: boolean; usagePartial?: boolean; turnId?: string }
   updatedAt: number
 }
 
@@ -375,30 +492,229 @@ export type AgentRecord = Profile & {
  * an attachment, not a user row (see `deliveries`), also has the row's `uuid`
  * and shares the count of the message it interrupted.
  */
-export type FollowUp = { text: string; count: number; uuid?: string }
+export type FollowUp = { text: string; count: number; uuid?: string; messageId?: string; senderToolUseId?: string }
 
-export type FileChange = { path: string; kind: string }
+export type FileChange = { path: string; kind: string | { type: string; move_path?: string | null }; move_path?: string | null; diff?: string; status?: string }
+
+/** Public source evidence, independent of the current choice of display row. */
+export type SourceRecord = {
+  transport: Transport
+  event: string
+  threadId?: string
+  turnId?: string
+  itemId?: string
+  cwd?: string
+  startedAtMs?: number
+  completedAtMs?: number
+  item?: Record<string, any>
+  data?: Record<string, any>
+  envelope?: Record<string, unknown>
+}
+
+/** Turn/thread snapshots can contain reasoning items too, not only item events. */
+function publicSource(value: any): any {
+  if (Array.isArray(value)) return value.map(publicSource)
+  if (value === null || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => value.type !== 'reasoning' || key !== 'content')
+    .map(([key, child]) => [key, publicSource(child)]))
+}
+
+const ITEM_TYPES: Record<string, string> = {
+  user_message: 'userMessage', hook_prompt: 'hookPrompt', agent_message: 'agentMessage',
+  function_call_output: 'functionCallOutput', proposed_plan: 'plan', reasoning: 'reasoning',
+  command_execution: 'commandExecution', file_change: 'fileChange', mcp_tool_call: 'mcpToolCall',
+  dynamic_tool_call: 'dynamicToolCall', collab_tool_call: 'collabAgentToolCall',
+  sub_agent_activity: 'subAgentActivity', web_search: 'webSearch', image_view: 'imageView',
+  sleep: 'sleep', image_generation: 'imageGeneration', entered_review_mode: 'enteredReviewMode',
+  exited_review_mode: 'exitedReviewMode', context_compaction: 'contextCompaction',
+}
+const SOURCE_FIELDS = ['aggregatedOutput', 'exitCode', 'commandActions', 'processId', 'durationMs',
+  'senderThreadId', 'receiverThreadIds', 'agentsStates', 'reasoningEffort', 'contentItems',
+  'agentThreadId', 'agentPath', 'revisedPrompt', 'savedPath', 'transparentBackground', 'memoryCitation',
+  'clientId', 'pluginId', 'scriptPath', 'appContext', 'mcpAppUi', 'mcpAppResourceUri', 'readOnlyHint']
+const snake = (key: string) => key.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`)
+
+/** Preserve unknown fields too; only private reasoning is deliberately removed. */
+export function normalizeSource(line: string, context: { transport?: Transport; threadId?: string; turnId?: string; cwd?: string } = {}): SourceRecord | undefined {
+  let ev: any
+  try { ev = publicSource(JSON.parse(line)) } catch { return undefined }
+  if (ev === null || typeof ev !== 'object') return undefined
+  const src = ev.source
+  const raw = src?.item ?? ev.item
+  const item = raw && typeof raw === 'object' ? { ...raw, sourceType: raw.type, type: ITEM_TYPES[raw.type] ?? raw.type } : undefined
+  if (item) {
+    for (const key of SOURCE_FIELDS) if (key in raw || snake(key) in raw) item[key] = key in raw ? raw[key] : raw[snake(key)]
+    if (item.type === 'reasoning') delete item.content
+    if (typeof item.status === 'string') {
+      item.sourceStatus = item.status
+      if (item.status === 'in_progress') item.status = 'inProgress'
+    }
+    if (Array.isArray(item.changes)) item.changes = item.changes.map((c: any) => ({ ...c,
+      kind: typeof c.kind === 'string' ? { type: c.kind, ...(c.move_path !== undefined ? { move_path: c.move_path } : {}) } : c.kind }))
+  }
+  if (!src && !item && typeof ev.type !== 'string') return undefined
+  return {
+    transport: src?.transport ?? context.transport ?? 'exec',
+    event: src?.event ?? ev.type,
+    threadId: src?.threadId ?? ev.thread_id ?? context.threadId,
+    turnId: src?.turnId ?? ev.turn_id ?? context.turnId,
+    itemId: typeof item?.id === 'string' ? item.id : src?.data?.itemId,
+    cwd: item?.cwd ?? context.cwd,
+    ...(typeof src?.startedAtMs === 'number' ? { startedAtMs: src.startedAtMs } : {}),
+    ...(typeof src?.completedAtMs === 'number' ? { completedAtMs: src.completedAtMs } : {}),
+    ...(item ? { item, ...(src?.data ? { data: src.data } : {}) } : { data: src?.data ?? ev }),
+    ...(!src ? { envelope: Object.fromEntries(Object.entries(ev).filter(([key]) => !['item', 'source'].includes(key))) } : {}),
+  }
+}
+
+/** One lifecycle per source identity. Deltas are evidence, never new actions. */
+export class SourceLedger {
+  records: SourceRecord[] = []
+  items = new Map<string, SourceRecord>()
+  private completed = new Set<string>()
+  private started = new Set<string>()
+  private plans = new Map<string, string>()
+  private usageTurns = new Set<string>()
+
+  capture(record: SourceRecord): { record: SourceRecord; render: boolean } {
+    const key = JSON.stringify([record.threadId, record.turnId, record.itemId])
+    if (record.event === 'turn.completed') {
+      const turn = JSON.stringify([record.threadId, record.turnId])
+      if (this.usageTurns.has(turn)) return { record, render: false }
+      this.usageTurns.add(turn)
+    }
+    const end = ['item.completed', 'item/completed'].includes(record.event)
+    const start = ['item.started', 'item/started'].includes(record.event)
+    if (record.itemId && ((end && this.completed.has(key)) || (start && (this.started.has(key) || this.completed.has(key))))) return { record: this.items.get(key) ?? record, render: false }
+    if (record.itemId) {
+      const previous = this.items.get(key)
+      record = { ...previous, ...record, ...(record.item ? { item: { ...previous?.item, ...record.item } } : {}) }
+      if (end && record.item?.type === 'fileChange' && !record.item.changes?.length && previous?.item?.changes?.length) record.item.changes = previous.item.changes
+      if (end && record.item?.type === 'fileChange' && previous?.item?.changes) {
+        record.item.changes = record.item.changes?.map((c: any) => ({ ...previous.item!.changes.find((p: any) => p.path === c.path), ...c }))
+      }
+      if (record.event === 'item/fileChange/patchUpdated') record.item = { ...previous?.item, type: 'fileChange', id: record.itemId, changes: record.data?.changes }
+      this.items.set(key, record)
+      if (end) this.completed.add(key)
+      if (start) this.started.add(key)
+    }
+    this.records.push(record)
+    // Exec todos can repeat the same snapshot at started/updated/completed.
+    if (['todo_list', 'plan_update'].includes(record.item?.type)) {
+      const planKey = JSON.stringify([record.threadId, record.turnId, record.itemId, record.item?.type])
+      const value = stableJSON(record.item)
+      if (this.plans.get(planKey) === value) return { record, render: false }
+      this.plans.set(planKey, value)
+    }
+    return { record, render: true }
+  }
+}
 
 /** What one `codex exec --json` line means to us. */
 export type CodexEvent =
   | { kind: 'message'; text: string }
+  | { kind: 'thinking' | 'interim'; text: string }
+  | { kind: 'note'; text: string; dim?: true }
+  | { kind: 'action'; action: Action; display?: DisplayTool }
   | { kind: 'thread'; id: string }
   | { kind: 'command'; command: string; output: string; exitCode: number | null }
   | { kind: 'fileStart'; changes: FileChange[] }
   | { kind: 'files'; changes: FileChange[] }
   | { kind: 'usage'; input: number; cached: number; output: number }
   | { kind: 'error'; text: string }
+  | { kind: 'warning'; text: string }
+  | { kind: 'question'; question: Question }
   // runner-only lines (app-server transport)
   | { kind: 'turn'; id: string }
-  | { kind: 'steer'; id: string; accepted: boolean; reason?: string }
+  | { kind: 'steer'; id: string; accepted: boolean; reason?: string; outcome: MessageOutcome }
   | { kind: 'protocol'; types: string[] }
   | { kind: 'fatal'; text: string }
   // a line that is not JSON, or of a type `codex exec --json` does not print
   | { kind: 'unknown'; type: string }
   | { kind: 'other' }
 
-/** One of Codex's actions as a built-in tool call, and the result it is answered with. */
-export type Action = { tool: NativeTool; input: Record<string, unknown>; result: Record<string, unknown> }
+type ActionResult = Record<string, unknown> | { type: 'text'; text: string }[]
+
+/** One of Codex's actions as a tool call, and the result it is answered with. */
+export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord; patchPath?: string; mirror?: string }
+
+type NativeName = typeof NATIVE_TOOLS[number]
+type NativeResult = BuiltinToolResults[Exclude<NativeName, 'Glob' | 'Grep'>] | GlobResult | GrepResult
+type DisplayResult = { type: 'text'; text: string }[]
+type GuardAnswer = { result: NativeResult | DisplayResult } | { deny: string }
+const object = (v: unknown): v is Record<string, any> => v !== null && typeof v === 'object' && !Array.isArray(v)
+const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(s => typeof s === 'string')
+const number = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+const keysOnly = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).every(key => keys.includes(key))
+const textBlocks = (v: unknown): v is DisplayResult => Array.isArray(v) && v.every(b => object(b) && keysOnly(b, ['type', 'text']) && b.type === 'text' && typeof b.text === 'string')
+const hunks = (v: unknown): boolean => Array.isArray(v) && v.every(h => object(h) &&
+  keysOnly(h, ['oldStart', 'oldLines', 'newStart', 'newLines', 'lines']) &&
+  ['oldStart', 'oldLines', 'newStart', 'newLines'].every(k => number(h[k]) && Number.isInteger(h[k])) && strings(h.lines))
+const todos = (v: unknown): boolean => Array.isArray(v) && v.every(t => object(t) &&
+  keysOnly(t, ['content', 'status', 'activeForm']) && typeof t.content === 'string' && typeof t.activeForm === 'string' && ['pending', 'in_progress', 'completed'].includes(t.status))
+
+/** Canonical, collision-free JSON binding, including nested display arguments. */
+const stableJSON = (value: unknown): string => JSON.stringify(value, (_key, v) =>
+  object(v) ? Object.fromEntries(Object.keys(v).sort().map(key => [key, v[key]])) : v)
+
+/** Validate our deliberately bounded result subset before emission AND consumption. */
+export function validAction(a: Action): a is Action & { result: NativeResult | DisplayResult } {
+  const i = a.input
+  const r = a.result
+  if (!object(i)) return false
+  if (a.tool === 'Read' && validImage(a)) return true
+  if (['Read', 'Glob', 'Grep'].includes(a.tool)) return a.error === undefined && validExploration(a)
+  if (a.tool === 'AskUserQuestion') return a.error === undefined && validAnsweredQuestion(a)
+  if (a.tool === 'ReportFindings') {
+    const expected = findingsAction(i)
+    return expected !== undefined && keysOnly(i, ['findings', 'level']) && stableJSON(r) === stableJSON(expected.result)
+  }
+  let inputOK = false
+  if (a.tool === 'Bash') inputOK = keysOnly(i, ['command', 'description']) && typeof i.command === 'string' && typeof i.description === 'string'
+  else if (a.tool === 'Edit') inputOK = keysOnly(i, ['file_path', 'old_string', 'new_string', 'replace_all']) && ['file_path', 'old_string', 'new_string'].every(k => typeof i[k] === 'string') && (i.replace_all === undefined || i.replace_all === false)
+  else if (a.tool === 'Write') inputOK = keysOnly(i, ['file_path', 'content']) && typeof i.file_path === 'string' && typeof i.content === 'string'
+  else if (a.tool === 'WebSearch') inputOK = keysOnly(i, ['query', 'mode']) && typeof i.query === 'string' && i.query !== '' && ['standard', 'extended'].includes(i.mode)
+  else if (a.tool === 'WebFetch') inputOK = keysOnly(i, ['url', 'prompt']) && typeof i.url === 'string' && i.url !== '' && typeof i.prompt === 'string'
+  else if (a.tool === 'Agent') inputOK = keysOnly(i, ['description', 'prompt', 'subagent_type']) && typeof i.description === 'string' && typeof i.prompt === 'string' && (i.subagent_type === 'codex-mod:codex' || i.subagent_type === 'codex-mod:codex-child' && validMirrorLink(a))
+  else if (a.tool === 'TodoWrite') inputOK = keysOnly(i, ['todos']) && todos(i.todos)
+  else if (a.tool === 'TaskCreate') inputOK = keysOnly(i, ['subject', 'description', 'activeForm', 'metadata']) && typeof i.subject === 'string' && i.subject.startsWith('Codex plan: ') && typeof i.description === 'string' && typeof i.activeForm === 'string' && object(i.metadata) && keysOnly(i.metadata, ['codexPlan', 'sourceThread', 'sourceRevision']) && i.metadata.codexPlan === true && typeof i.metadata.sourceThread === 'string' && Number.isInteger(i.metadata.sourceRevision) && i.metadata.sourceRevision > 0
+  else if (a.tool === 'TaskUpdate') inputOK = keysOnly(i, ['taskId', 'status', 'description']) && typeof i.taskId === 'string' && i.taskId.startsWith('codex-plan-') && (i.status === undefined || ['pending', 'in_progress', 'completed', 'deleted'].includes(i.status)) && (i.description === undefined || typeof i.description === 'string') && Object.keys(i).length > 1
+  else if (a.tool === 'TaskStop') inputOK = keysOnly(i, ['task_id']) && typeof i.task_id === 'string' && i.task_id.startsWith('codex-display-')
+  else if (a.tool === 'SendMessage') inputOK = keysOnly(i, ['to', 'message', 'summary']) && object(i.to) && keysOnly(i.to, ['agentId']) && typeof i.to.agentId === 'string' && i.to.agentId.startsWith('codex-display-') && typeof i.message === 'string' && i.message !== '' && typeof i.summary === 'string'
+  else if (isDisplay(a.tool) || a.tool === 'codex_tool') inputOK = keysOnly(i, ['server', 'name', 'arguments']) && typeof i.server === 'string' && typeof i.name === 'string' && 'arguments' in i
+  // Display names are host-owned; use their registered identity to choose the input schema.
+  if (a.tool === displayTools.codex_plan || a.tool === 'codex_plan') inputOK = keysOnly(i, ['steps', 'explanation']) && (i.explanation === undefined || typeof i.explanation === 'string') && Array.isArray(i.steps) && i.steps.every(s => object(s) && keysOnly(s, ['step', 'status']) && typeof s.step === 'string' && ['pending', 'in_progress', 'completed'].includes(s.status))
+  if (a.tool === displayTools.coordinator_message) inputOK = keysOnly(i, ['sourceUuid', 'text']) && typeof i.sourceUuid === 'string' && typeof i.text === 'string'
+  if (!inputOK) return false
+  if (a.error !== undefined) return typeof a.error === 'string' && a.error !== ''
+  if (!isNative(a.tool)) return textBlocks(r)
+  if (!object(r)) return false
+  switch (a.tool) {
+    case 'Bash': {
+      const d = r.bashEditDiff
+      return keysOnly(r, ['stdout', 'stderr', 'interrupted', 'bashEditDiff']) && typeof r.stdout === 'string' && typeof r.stderr === 'string' && typeof r.interrupted === 'boolean' &&
+        (d === undefined || (object(d) && keysOnly(d, ['files', 'moreFiles', 'changedFiles']) && d.moreFiles === 0 && strings(d.changedFiles) && Array.isArray(d.files) &&
+          d.files.every(f => object(f) && keysOnly(f, ['filePath', 'hunks', 'created', 'deleted']) && typeof f.filePath === 'string' && hunks(f.hunks) &&
+            (f.created === undefined || f.created === true) && (f.deleted === undefined || f.deleted === true) && !(f.created && f.deleted)) &&
+          stableJSON(d.changedFiles) === stableJSON(d.files.map(f => f.filePath))))
+    }
+    case 'Edit': return keysOnly(r, ['filePath', 'oldString', 'newString', 'originalFile', 'structuredPatch', 'userModified', 'replaceAll']) && r.filePath === i.file_path && r.oldString === i.old_string && r.newString === i.new_string && (r.originalFile === null || typeof r.originalFile === 'string') && hunks(r.structuredPatch) && r.userModified === false && r.replaceAll === false
+    case 'Write': return keysOnly(r, ['type', 'filePath', 'content', 'structuredPatch', 'originalFile']) && ['create', 'update'].includes(r.type) && r.filePath === i.file_path && r.content === i.content && hunks(r.structuredPatch) && (r.originalFile === null || typeof r.originalFile === 'string')
+    case 'WebSearch': return keysOnly(r, ['query', 'results', 'durationSeconds']) && r.query === i.query && number(r.durationSeconds) && Array.isArray(r.results) && r.results.every(s => typeof s === 'string' || (object(s) && keysOnly(s, ['tool_use_id', 'content']) && typeof s.tool_use_id === 'string' && s.tool_use_id !== '' && Array.isArray(s.content) && s.content.every(c => object(c) && keysOnly(c, ['title', 'url', 'snippet']) && typeof c.title === 'string' && typeof c.url === 'string' && (c.snippet === undefined || typeof c.snippet === 'string'))))
+    case 'WebFetch': return validFetchResult(r, i.url)
+    case 'TodoWrite': return keysOnly(r, ['oldTodos', 'newTodos']) && todos(r.oldTodos) && todos(r.newTodos) && stableJSON(r.newTodos) === stableJSON(i.todos)
+    case 'TaskCreate': return keysOnly(r, ['task']) && object(r.task) && keysOnly(r.task, ['id', 'subject']) && typeof r.task.id === 'string' && r.task.id.startsWith('codex-plan-') && r.task.subject === i.subject
+    case 'TaskUpdate': return keysOnly(r, ['success', 'taskId', 'updatedFields', 'statusChange']) && r.success === true && r.taskId === i.taskId && stableJSON(r.updatedFields) === stableJSON(Object.keys(i).filter(k => k !== 'taskId')) && (r.statusChange === undefined || (object(r.statusChange) && keysOnly(r.statusChange, ['from', 'to']) && ['pending', 'in_progress', 'completed'].includes(r.statusChange.from) && r.statusChange.to === i.status))
+    case 'TaskStop': return keysOnly(r, ['message', 'task_id', 'task_type']) && r.task_id === i.task_id && r.task_type === 'codex' && typeof r.message === 'string' && r.message !== ''
+    case 'SendMessage': return keysOnly(r, ['status', 'agentsStates']) && r.status === 'completed' && object(r.agentsStates)
+    case 'Agent': {
+      const u = r.usage
+      return keysOnly(r, ['agentId', 'agentType', 'status', 'prompt', 'content', 'canContinueAgent', 'totalToolUseCount', 'totalDurationMs', 'totalTokens', 'usage', 'resolvedModel']) && typeof r.agentId === 'string' && r.agentType === i.subagent_type && r.status === 'completed' && r.prompt === i.prompt && textBlocks(r.content) && r.canContinueAgent === false && ['totalToolUseCount', 'totalDurationMs', 'totalTokens'].every(k => r[k] === 0) && (r.resolvedModel === undefined || typeof r.resolvedModel === 'string') && object(u) && keysOnly(u, ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'server_tool_use', 'service_tier', 'cache_creation']) && u.input_tokens === 0 && u.output_tokens === 0 && ['cache_creation_input_tokens', 'cache_read_input_tokens', 'server_tool_use', 'service_tier', 'cache_creation'].every(k => u[k] === null)
+    }
+  }
+  return false
+}
 
 type Usage = { input: number; cached: number; output: number }
 
@@ -409,14 +725,14 @@ const oneLine = (text: string, max = 160): string => {
 
 const changesOf = (item: any): FileChange[] =>
   Array.isArray(item?.changes)
-    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ path: c.path, kind: String(c.kind ?? 'update') }))
+    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ ...c }))
     : []
 
 /**
  * Maps one JSONL line of `codex exec --json` (verified on codex-cli 0.163), or
  * a `codexmod.*` line of the app-server runner.
  */
-export function parseCodexLine(line: string): CodexEvent {
+export function parseCodexLine(line: string, richRows = false, todoWriteAvailable = false): CodexEvent {
   let ev: any
   try {
     ev = JSON.parse(line)
@@ -425,9 +741,11 @@ export function parseCodexLine(line: string): CodexEvent {
   }
   const type = typeof ev?.type === 'string' ? ev.type : undefined
   if (type?.startsWith('codexmod.')) {
+    if (type === 'codexmod.request' && typeof ev.token === 'string' && typeof ev.method === 'string') return { kind: 'question', question: ev }
+    if (type === 'codexmod.warning' || type === 'codexmod.responseRejected') return { kind: 'warning', text: String(ev.message ?? 'warning') }
     if (type === 'codexmod.turn' && typeof ev.turn_id === 'string') return { kind: 'turn', id: ev.turn_id }
     if (type === 'codexmod.steer' && (typeof ev.id === 'string' || typeof ev.id === 'number')) {
-      return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted', ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
+      return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted' || ev.status === 'observed', outcome: ev as unknown as MessageOutcome, ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
     }
     if (type === 'codexmod.protocol') {
       const names = (v: unknown, tag: string) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').map(x => `${tag} ${x}`) : [])
@@ -440,7 +758,7 @@ export function parseCodexLine(line: string): CodexEvent {
   const item = ev?.item
   if (ev?.type === 'thread.started' && typeof ev.thread_id === 'string') return { kind: 'thread', id: ev.thread_id }
   if (ev?.type === 'item.completed' && item?.type === 'agent_message' && typeof item.text === 'string') {
-    return { kind: 'message', text: item.text }
+    return { kind: ['commentary', 'partial_answer'].includes(item.phase) ? 'interim' : 'message', text: item.text }
   }
   if (ev?.type === 'item.completed' && item?.type === 'command_execution') {
     return {
@@ -452,6 +770,43 @@ export function parseCodexLine(line: string): CodexEvent {
   }
   if (ev?.type === 'item.started' && item?.type === 'file_change') return { kind: 'fileStart', changes: changesOf(item) }
   if (ev?.type === 'item.completed' && item?.type === 'file_change') return { kind: 'files', changes: changesOf(item) }
+  if (ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'item.updated') {
+    if (item?.type === 'todo_list' || item?.type === 'plan_update') {
+      const steps: { step: string; status: 'pending' | 'in_progress' | 'completed' }[] = item.type === 'todo_list'
+        ? (Array.isArray(item.items) ? item.items : []).map((s: any) => ({ step: String(s?.text ?? ''), status: s?.completed ? 'completed' : 'pending' }))
+        : (Array.isArray(item.steps) ? item.steps : []).map((s: any) => ({ step: String(s?.step ?? ''), status: s?.status === 'inProgress' ? 'in_progress' : ['pending', 'in_progress', 'completed'].includes(s?.status) ? s.status : 'pending' }))
+      const input = { ...(typeof item.explanation === 'string' ? { explanation: item.explanation } : {}), steps }
+      if (richRows && todoWriteAvailable) {
+        // BuiltinToolInputs['TodoWrite'] requires activeForm on every entry.
+        const todos = steps.map(({ step, status }) => ({ content: step, status, activeForm: step }))
+        // These are display snapshots of Codex's plan, never the host's todo state.
+        const result: BuiltinToolResults['TodoWrite'] = { oldTodos: [], newTodos: todos }
+        return { kind: 'action', action: { tool: 'TodoWrite', input: { todos }, result } }
+      }
+      return { kind: 'action', display: 'codex_plan', action: { tool: 'codex_plan', input, result: [{ type: 'text', text: planText(input) }] } }
+    }
+  }
+  // Only completed items have reliable queries and tool results. JSON.parse
+  // keeps exec's last repeated id key; the source ledger deduplicates that id.
+  if (ev.type === 'item.completed') {
+    if (item?.type === 'reasoning') {
+      const text = Array.isArray(item.summary) ? item.summary.filter((s: unknown) => typeof s === 'string').join('\n\n') : typeof item.text === 'string' ? item.text : ''
+      return text.trim() ? { kind: 'thinking', text } : { kind: 'other' }
+    }
+    if (item?.type === 'web_search') {
+      const action = webAction(ev.source?.item ?? item)
+      return { kind: 'action', action, ...(action.tool === 'codex_tool' ? { display: 'codex_tool' as const } : {}) }
+    }
+    if (item?.type === 'mcp_tool_call' || item?.type === 'dynamic_tool_call') {
+      return { kind: 'action', display: 'codex_tool', action: toolFallback(ev.source?.item ?? item, 'Host input schema and verified server binding unavailable; replacement contract unknown.') }
+    }
+    if (item?.type === 'proposed_plan' && typeof item.text === 'string') return { kind: 'interim', text: `Proposed plan:\n${item.text}` }
+    if (item?.type === 'error') return { kind: 'warning', text: String(item.message ?? 'Codex warning') }
+    if (item?.type === 'note' && typeof item.text === 'string') return { kind: 'note', text: `↪ ${oneLine(item.text, 300)}`, ...(item.dim === true ? { dim: true as const } : {}) }
+    if (item?.type === 'collab_tool_call' || item?.type === 'collabAgentToolCall') {
+      return childRows(item, emptyDisplayState(), { session: 'unreported', agent: 'unreported', thread: 'unreported', rich: richRows, tools: new Set(richRows ? ['Agent'] : []) })[0] ?? { kind: 'other' }
+    }
+  }
   if (ev?.type === 'turn.completed' && ev.usage) {
     return {
       kind: 'usage',
@@ -462,6 +817,7 @@ export function parseCodexLine(line: string): CodexEvent {
   }
   if (ev?.type === 'turn.failed') return { kind: 'error', text: String(ev.error?.message ?? 'turn failed') }
   if (ev?.type === 'error') return { kind: 'error', text: String(ev.message ?? 'error') }
+  if (item && ![...Object.keys(ITEM_TYPES), ...Object.values(ITEM_TYPES), 'note', 'todo_list', 'plan_update', 'source_only', 'error'].includes(item.type)) return { kind: 'unknown', type: `item ${String(item.type)}` }
   return { kind: 'other' }
 }
 
@@ -478,7 +834,14 @@ export function stripCoordinator(text: string): string {
  * "sent a message while you were working" included. A bare delivery (no
  * wrapper) is `cleanText`'s to unwrap.
  */
-export function coordinatorPayload(text: string): string | undefined {
+export function coordinatorPayload(text: string, verbatim = false): string | undefined {
+  // Match the host's closing tag (including its id), beyond any tags in the body.
+  const raw = /<system-reminder(\s[^>]*)?>\nThe coordinator sent a message while you were working:[ \t]*\n([\s\S]*)<\/system-reminder\1>/.exec(text)?.[2]
+  if (raw !== undefined) {
+    const suffix = '\n\nAddress this before completing your current task.\n'
+    const body = raw.endsWith(suffix) ? raw.slice(0, -suffix.length) : raw.endsWith('\n') ? raw.slice(0, -1) : raw
+    return verbatim ? body : body.trim()
+  }
   for (const block of text.match(REMINDER) ?? []) {
     const inner = REMINDER_WRAP.exec(block.trim())?.[1] ?? ''
     const m = COORDINATOR.exec(inner)
@@ -551,10 +914,12 @@ export function itemsFromRows(rows: readonly SessionMessage[]): ConvItem[] {
 export type Reading = {
   /** The latest handback signal: a reminder/mention/enforce nudge (tool) or a countermand/not-active result (text). */
   signal?: 'tool' | 'text'
+  /** Any failed/not-active handback result, even if later blocks supersede the signal. */
+  handbackFailed: boolean
   /** An engine `[handback-send-enforce]` nudge is in the conversation. */
   enforce: boolean
   /** The newest genuine user message (cleaned) and how many genuine user messages there are. */
-  latest?: { text: string; count: number }
+  latest?: { text: string; count: number; coordinator?: true }
   /** Tool results after the last assistant block, each with the tool it answers when known. */
   results: { id: string; tool?: string; text: string; isError: boolean }[]
   /** A genuine user message follows those results. */
@@ -567,6 +932,7 @@ export type Reading = {
 export function readConversation(items: readonly ConvItem[]): Reading {
   const toolOf = new Map<string, string>()
   let signal: Reading['signal']
+  let handbackFailed = false
   let enforce = false
   let latest: Reading['latest']
   let count = 0
@@ -587,7 +953,10 @@ export function readConversation(items: readonly ConvItem[]): Reading {
     if (it.kind === 'result') {
       const tool = toolOf.get(it.id)
       results.push({ id: it.id, tool, text: it.text, isError: it.isError })
-      if (tool === HANDBACK_TOOL && (it.isError || NOT_ACTIVE.test(it.text))) signal = 'text'
+      if (tool === HANDBACK_TOOL && (it.isError || NOT_ACTIVE.test(it.text))) {
+        signal = 'text'
+        handbackFailed = true
+      }
       continue
     }
     if (COUNTERMAND.test(it.text)) signal = 'text'
@@ -597,16 +966,26 @@ export function readConversation(items: readonly ConvItem[]): Reading {
     }
     else if (HANDBACK_MENTION.test(it.text)) signal = 'tool'
     // a coordinator's delivery rendered as a reminder block is a message, not engine prose
-    const text = coordinatorPayload(it.text) ?? cleanText(it.text)
+    const payload = coordinatorPayload(it.text)
+    const text = payload ?? cleanText(it.text)
     if (text === '') {
       if (sawAssistant) nudged = true
       continue
     }
     count++
-    latest = { text, count }
+    latest = { text, count, ...(payload !== undefined ? { coordinator: true as const } : {}) }
     if (results.length > 0) textAfterResults = true
   }
-  return { signal, enforce, latest, results, textAfterResults, nudged }
+  return { signal, handbackFailed, enforce, latest, results, textAfterResults, nudged }
+}
+
+type ConversationSource = 'api' | 'rows' | 'denied'
+
+/** A missing signal is evidence for text only in the API form, which preserves meta reminders. */
+export function chooseHandback(mode: HandbackMode, source: ConversationSource, signal?: Reading['signal'], lock?: Reading['signal'], sessionInactive = false): boolean {
+  if (mode === 'tool') return true
+  if (mode === 'text') return false
+  return (signal ?? lock ?? (sessionInactive || source === 'api' ? 'text' : 'tool')) === 'tool'
 }
 
 /** True for a compaction summary / continuation notice (no flag on the row type). */
@@ -634,21 +1013,29 @@ export function compact(n: number): string {
 }
 
 /**
- * The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`;
+ * The footer line retains the full thread ID; token counts are rounded for display.
  * an app-server run adds `app-server` (and `N steers`) after the sandbox, a fallback run why it is exec.
  */
-export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number }, mode: FooterMode = 'full'): string {
+export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number; usagePartial?: boolean; treeUsage?: TreeSnapshot; configNote?: string }, mode: FooterMode = 'full'): string {
   if (mode === 'off') return ''
-  if (mode === 'short') return [p.agent, p.model, p.effort].join(' · ')
+  if (mode === 'short') return [p.agent, p.model, p.effort, p.configNote].filter(Boolean).join(' · ')
   const parts = [p.agent, p.model, p.effort, p.sandbox]
   if (p.transport !== undefined) parts.push(p.transport)
   if (p.steers !== undefined && p.steers > 0) parts.push(`${p.steers} steer${p.steers === 1 ? '' : 's'}`)
   parts.push(`${p.actions} action${p.actions === 1 ? '' : 's'}`)
-  if (p.usage !== undefined) {
+  if (p.patches) parts.push(`${p.patches} patch${p.patches === 1 ? '' : 'es'} / ${p.patchRows} file row${p.patchRows === 1 ? '' : 's'}`)
+  if (p.usagePartial) parts.push('direct usage partial/unknown')
+  else if (p.usage !== undefined) {
     const fresh = Math.max(0, p.usage.input - p.usage.cached)
     parts.push(`${compact(fresh)} new tokens (${compact(p.usage.cached)} cached, ${compact(p.usage.output)} out)`)
   }
-  if (p.thread !== undefined) parts.push(`thread ${p.thread.slice(0, 8)}`)
+  if (p.treeUsage) {
+    const t = p.treeUsage
+    const exact = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+    parts.push(`tree ${exact(t.tree.input + t.tree.output)} tokens (direct ${exact(t.direct.input + t.direct.output)}; children ${exact(t.tree.input + t.tree.output - t.direct.input - t.direct.output)}) · new ${compact(t.tree.input - t.tree.cached)} / cached ${compact(t.tree.cached)} / out ${compact(t.tree.output)}${t.active || t.missing ? ` (partial: ${t.active} active, ${t.missing} missing)` : ''}`)
+  }
+  if (p.thread !== undefined) parts.push(`thread ${p.thread}`)
+  if (p.configNote) parts.push(p.configNote)
   return parts.join(' · ')
 }
 
@@ -693,6 +1080,31 @@ export function checkProfile(catalog: readonly ModelInfo[] | undefined, model: s
 export function catalogLine(catalog: readonly ModelInfo[]): string {
   return catalog.map(m => (m.efforts.length > 0 ? `${m.slug} (${m.efforts.join('|')})` : m.slug)).join(', ')
 }
+
+/** One resolver for spawn presentation and execution. Explicit prompt errors
+ * still fail the run; an unsupported native Agent effort uses the default. */
+export function resolveProfile(base: Profile, task: string, list?: readonly ModelInfo[], nativeEffort?: unknown): { profile: Profile; rest: string; note?: string; invalid?: string } {
+  const o = parseOverrides(task)
+  const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
+  const info = list?.find(m => m.slug === model)
+  const defaultEffort = base.effort || info?.defaultEffort || FALLBACK_EFFORT
+  let effort = o.effort ?? defaultEffort
+  let note: string | undefined
+  if (o.effort === undefined && nativeEffort !== undefined) {
+    const supported = info?.efforts.length ? info.efforts : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+    if (typeof nativeEffort === 'string' && supported.includes(nativeEffort)) effort = nativeEffort
+    else {
+      effort = supported.includes(defaultEffort) ? defaultEffort
+        : info?.defaultEffort && supported.includes(info.defaultEffort) ? info.defaultEffort : supported[0]!
+      const supplied = typeof nativeEffort === 'string' ? oneLine(nativeEffort, 80) : typeof nativeEffort
+      note = `Agent effort ${JSON.stringify(supplied)} is not supported by ${model}; using default ${effort}`
+    }
+  }
+  return { profile: { model, effort, sandbox: base.sandbox }, rest: o.rest, note, invalid: checkProfile(list, model, effort) }
+}
+
+export const modelTitle = (profile: Pick<Profile, 'model' | 'effort'>, description: string): string =>
+  `Codex ${profile.model} · ${profile.effort} · ${description}`
 
 // ---- actions ---------------------------------------------------------------
 
@@ -750,126 +1162,98 @@ const DESCRIBE: Record<string, string> = {
   python: 'Run Python', python3: 'Run Python', node: 'Run Node.js', test: 'Check a condition', which: 'Locate a program',
 }
 
-/** A short, active description of a command, as Claude's own Bash calls carry. */
-export function describeCommand(command: string): string {
-  const words = command.trim().replace(/^cd\s+\S+\s*&&\s*/, '').split(/\s+/)
-  const prog = (words[0] ?? '').split('/').pop() ?? ''
-  if (prog === 'sed') return words.includes('-i') ? 'Edit file in place' : 'Read part of a file'
-  if (['git', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'cargo', 'go', 'make', 'uv', 'pip', 'swift', 'gh'].includes(prog)) {
-    const sub = words.slice(1).find(w => !w.startsWith('-'))
-    return sub ? `Run ${prog} ${sub}` : `Run ${prog}`
+// Labels alone use this bounded scanner. It never evaluates shell syntax or
+// supplies evidence for the separate, stricter native exploration classifier.
+function shellLabelParts(command: string): string[] | undefined {
+  if (command.length > 8192) return undefined
+  const parts: string[] = []
+  let quote = '', start = 0
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!
+    if (quote === "'") { if (c === "'") quote = ''; continue }
+    if (c === '\\') { if (i + 1 >= command.length || command[i + 1] === '\n') return undefined; i++; continue }
+    if (quote === '"') {
+      if (c === '"') quote = ''
+      else if ('$`'.includes(c)) return undefined
+      continue
+    }
+    if (c === "'" || c === '"') { quote = c; continue }
+    if ('\r\0<>($`){}#'.includes(c)) return undefined
+    if (';|&\n'.includes(c)) {
+      const part = command.slice(start, i).trim()
+      if (part) parts.push(part)
+      if (parts.length > 6) return undefined
+      start = i + 1
+    }
   }
+  if (quote) return undefined
+  const tail = command.slice(start).trim()
+  if (tail) parts.push(tail)
+  return parts.length && parts.length <= 6 ? parts : undefined
+}
+
+const COMMAND_FAMILIES = ['git', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'cargo', 'go', 'make', 'uv', 'pip', 'swift', 'gh']
+const commandProgram = (words: string[]) => {
+  const prog = (words[0] ?? '').split('/').pop() ?? ''
+  return /^[\w.+-]{1,40}$/.test(prog) ? prog : undefined
+}
+const commandName = (words: string[], prog: string) => {
+  const sub = COMMAND_FAMILIES.includes(prog) ? words.slice(1).find(w => !w.startsWith('-')) : undefined
+  return sub && /^[\w.+-]{1,40}$/.test(sub) ? `${prog} ${sub}` : prog
+}
+
+/** A short description of the whole command, without inferring its result. */
+export function describeCommand(command: string): string {
+  if (/^\s*(?:if|case)\b/.test(command)) return 'Run conditional shell command'
+  if (/^\s*(?:for|while|until|select|function)\b/.test(command)) return 'Run compound shell command'
+  const parts = shellLabelParts(command)
+  if (!parts) return 'Run shell command'
+  if (parts.some(p => /^(?:if|elif|then|else|fi|case|esac)\b/.test(p))) return 'Run conditional shell command'
+  if (parts.some(p => /^(?:for|while|until|do|done|select|function)\b/.test(p))) return 'Run compound shell command'
+  const commands = parts.map(p => literalWords(p))
+  if (commands.some(words => !words || !commandProgram(words))) return 'Run shell command'
+  if (commands.length > 1) return `Run shell commands: ${commands.map(words => commandName(words!, commandProgram(words!)!)).join(', ')}`
+  const words = commands[0]!
+  const prog = commandProgram(words)!
+  if (prog === 'sed') return words.includes('-i') ? 'Edit file in place' : 'Read part of a file'
+  if (COMMAND_FAMILIES.includes(prog)) return `Run ${commandName(words, prog)}`
   return DESCRIBE[prog] ?? (prog ? `Run ${prog}` : 'Run a command')
 }
 
-const clipTail = (text: string, max: number): string =>
-  text.length > max ? `[... ${text.length - max} earlier characters not shown]\n${text.slice(-max)}` : text
-const clipHead = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max)}\n[... ${text.length - max} more characters not shown]` : text
-
 /** A finished command as a `Bash` call answered with Codex's output and exit code. */
-export function commandAction(command: string, output: string, exitCode: number | null): Action {
+export function commandAction(command: string, output: string, exitCode: number | null, status?: string): Action {
   const inner = unwrapShell(command)
   return {
     tool: 'Bash',
-    input: { command: inner, description: describeCommand(inner) },
+    input: { command: inner, description: `${describeCommand(inner)}${exitCode === null ? ' (exit unreported)' : ''}` },
     result: {
-      stdout: clipTail(output.replace(/\n$/, ''), OUTPUT_MAX),
-      stderr: exitCode !== null && exitCode !== 0 ? `Exit code ${exitCode}` : '',
+      stdout: output,
+      stderr: '',
       interrupted: false,
-    },
-  }
-}
-
-type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }
-
-/** The changed region of `before` -> `after` as Edit's old/new strings and one hunk (3 lines of context). */
-export function diffEdit(before: string, after: string): { oldString: string; newString: string; hunk: Hunk } | undefined {
-  if (before === after || before === '') return undefined
-  const a = before.split('\n')
-  const b = after.split('\n')
-  let p = 0
-  while (p < a.length && p < b.length && a[p] === b[p]) p++
-  let s = 0
-  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++
-  // a pure insertion: take one neighbouring line in, so old_string is not empty
-  if (a.length - s - p === 0) {
-    if (p > 0) p--
-    else if (s > 0) s--
-  }
-  const oldMid = a.slice(p, a.length - s)
-  const newMid = b.slice(p, b.length - s)
-  const pre = a.slice(Math.max(0, p - 3), p)
-  const post = a.slice(a.length - s, Math.min(a.length, a.length - s + 3))
-  const start = p - pre.length + 1
-  return {
-    oldString: oldMid.join('\n'),
-    newString: newMid.join('\n'),
-    hunk: {
-      oldStart: start,
-      oldLines: pre.length + oldMid.length + post.length,
-      newStart: start,
-      newLines: pre.length + newMid.length + post.length,
-      lines: [...pre.map(l => ` ${l}`), ...oldMid.map(l => `-${l}`), ...newMid.map(l => `+${l}`), ...post.map(l => ` ${l}`)],
-    },
-  }
-}
-
-const shellQuote = (s: string) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
-
-/**
- * One file change as a call: an added file (or an update whose previous text
- * is unknown) as `Write` with its content now; an update with a known
- * previous text as `Edit`; a deletion, or a file that cannot be read as text,
- * as a `Bash` row whose command is a shell comment.
- */
-export function fileAction(change: FileChange, rel: string, before: string | undefined, after: string | undefined): Action {
-  const path = change.path
-  const note = (what: string, description: string): Action => ({
-    tool: 'Bash',
-    input: { command: `# codex apply_patch: ${what} ${shellQuote(rel)}`, description },
-    result: { stdout: '', stderr: '', interrupted: false },
-  })
-  if (change.kind === 'delete') return note('delete', 'Delete file')
-  if (after === undefined || after.includes('\u0000')) return note(change.kind, change.kind === 'add' ? 'Create file' : 'Edit file')
-  const edit = change.kind === 'add' || before === undefined ? undefined : diffEdit(before, after)
-  if (edit !== undefined && edit.oldString.length <= FILE_MAX && edit.newString.length <= FILE_MAX) {
-    return {
-      tool: 'Edit',
-      input: { file_path: path, old_string: edit.oldString, new_string: edit.newString },
-      result: {
-        filePath: path,
-        oldString: edit.oldString,
-        newString: edit.newString,
-        originalFile: before!.length <= FILE_MAX ? before! : null,
-        structuredPatch: [edit.hunk],
-        userModified: false,
-        replaceAll: false,
-      },
-    }
-  }
-  const content = clipHead(after, FILE_MAX)
-  return {
-    tool: 'Write',
-    input: { file_path: path, content },
-    result: {
-      type: change.kind === 'add' ? 'create' : 'update',
-      filePath: path,
-      content,
-      structuredPatch: [],
-      originalFile: before !== undefined && before.length <= FILE_MAX ? before : null,
-    },
+    } satisfies BuiltinToolResults['Bash'],
+    ...((exitCode !== null && exitCode !== 0) || ['failed', 'declined'].includes(status ?? '') ? {
+      error: `Codex command ${status === 'declined' ? 'was declined' : 'failed'}${exitCode !== null ? ` (exit code ${exitCode})` : ''}:\n${output}`,
+    } : {}),
   }
 }
 
 /** One action as a plain text line (nativeActions off). */
 export function actionLine(a: Action): string {
+  if (['Read', 'Glob', 'Grep'].includes(a.tool)) return `$ ${oneLine(String(a.source?.item?.command), 300)} (${a.tool}, cwd ${String(a.source?.cwd)})`
   if (a.tool === 'Edit') return `Edited ${String(a.input.file_path)}`
-  if (a.tool === 'Write') return `${a.result.type === 'create' ? 'Created' : 'Wrote'} ${String(a.input.file_path)}`
+  if (a.tool === 'TodoWrite') return planText({ ...(typeof a.source?.item?.explanation === 'string' ? { explanation: a.source.item.explanation } : {}), steps: (a.input.todos as { content: string; status: 'pending' | 'in_progress' | 'completed' }[]).map(t => ({ step: t.content, status: t.status })) })
+  if (['Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop'].includes(a.tool)) return `Codex ${a.tool} (display only):\n${JSON.stringify(a.input)}\n${a.error ?? JSON.stringify(a.result)}`
+  if (a.tool === 'WebFetch') return `Codex ${a.source?.item?.action?.type ?? 'openPage'}: ${String(a.input.url)}\n${a.error ?? JSON.stringify(a.result)}`
+  if (a.tool === 'WebSearch') return `Searched by Codex: ${String(a.input.query)}\n${a.error ?? JSON.stringify(a.result)}${sourceDuration(a.source) === undefined ? '\nDuration unreported (0-second display sentinel).' : ''}`
+  if ('server' in a.input) return `Codex called ${oneLine(String(a.input.server))}.${oneLine(String(a.input.name))}\n${a.error ?? (Array.isArray(a.result) ? a.result.map(b => b.text).join('\n') : JSON.stringify(a.result))}`
+  if ('steps' in a.input) return planText(a.input as PlanInput)
+  const result = Array.isArray(a.result) ? {} : a.result
+  if (a.tool === 'Write') return `${result.type === 'create' ? 'Created' : 'Wrote'} ${String(a.input.file_path)}`
   const cmd = String(a.input.command)
-  if (cmd.startsWith('# codex apply_patch: ')) return `${String(a.input.description)}: ${cmd.slice('# codex apply_patch: '.length).replace(/^\S+\s+/, '')}`
-  const err = String(a.result.stderr ?? '')
-  return `$ ${oneLine(cmd, 300)}${err !== '' ? ` (${err.toLowerCase()})` : ''}`
+  if (cmd.startsWith('# Codex apply_patch: ')) return `${String(a.input.description)}\n${a.error ?? result.stdout}`
+  const err = String(result.stderr ?? '')
+  const status = a.error ? /exit code \d+/.exec(a.error)?.[0] ?? 'failed or declined' : err.toLowerCase()
+  return `$ ${oneLine(cmd, 300)}${status !== '' ? ` (${status})` : ''}`
 }
 
 // ---- launch ------------------------------------------------------------------
@@ -969,6 +1353,8 @@ export function runnerArgv(p: {
   lean: string[]
   extra: readonly string[]
   control: string
+  questions?: boolean
+  nestedAgents?: boolean
 }): string[] {
   const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra]
   return [
@@ -977,6 +1363,8 @@ export function runnerArgv(p: {
     ...(p.resume ? ['--thread', p.resume] : []),
     ...overrides.flatMap(kv => ['--config', kv]),
     '--control', p.control,
+    ...(p.questions ? ['--questions', 'choices'] : []),
+    ...(p.nestedAgents === false ? ['--nested', 'false'] : []),
   ]
 }
 
@@ -1015,20 +1403,24 @@ const runsDir = async ($: EngineInterface): Promise<string> => `${await cacheDir
 
 /** The `$.store` key of an agent's record. */
 export const recordKey = (sessionId: string, agentId: string): string => `${STORE_PREFIX}${sessionId}:${agentId}`
+const sessionHandbackKey = (sessionId: string): string => `${SESSION_PREFIX}${sessionId}:handback`
 
 // `note`: a `↪` line of ours about a mid-run message; shown like a message, but
 // never standing in for Codex's final answer.
-type Queued = { kind: 'text' | 'note'; text: string } | { kind: 'action'; action: Action }
+type Queued = { kind: 'text' | 'note' | 'interim' | 'thinking'; text: string; dim?: true } | { kind: 'action'; action: Action }
 
 /** The `↪` line shown for a mid-run message: what codex-mod did with it. */
-export function steerNote(what: 'accepted' | 'finished' | 'queued', text = ''): string {
-  if (what === 'accepted') return `↪ steer delivered to Codex mid-turn: "${oneLine(parseOverrides(text).rest, 80)}"`
+export function steerNote(what: 'accepted' | 'finished' | 'queued'): string {
+  if (what === 'accepted') return '↪ steer delivered to Codex mid-turn'
   if (what === 'finished') return '↪ Codex had already finished; this message runs next, on the same thread'
   return '↪ queued: runs after this turn (exec transport has no mid-turn steer)'
 }
 
 /** One Codex child and what has been read from it so far. */
 type Run = {
+  sessionId: string
+  ledger: SourceLedger
+  rows: Record<string, SourceRecord | null>
   agentId: string
   name: string
   prof: Profile
@@ -1046,6 +1438,8 @@ type Run = {
   // file text as last seen, for Edit's old/new strings
   snapshots: Map<string, string>
   actions: number
+  patches: number
+  patchRows: number
   actionSteps: number
   lastEmit: number
   ended: boolean
@@ -1076,6 +1470,22 @@ type Run = {
   unknown: number
   unknownTypes: string[]
   fatal?: string
+  mirror?: ChildMirror
+  treeUsage?: TreeSnapshot
+  usageCanonical?: boolean
+  usagePartial?: boolean
+  execBaseline?: Usage
+  execTotal?: Usage
+  policy?: EffectiveConfig
+  configNote?: string
+  capacityRetried?: boolean
+  rawTask?: string
+  messageCount?: number
+  delivery?: string
+  spawnDetected?: Set<string>
+  observedChildren?: Set<string>
+  childSources?: Map<string, SourceRecord>
+  compactions?: Map<string, { notification: boolean; items: string[] }>
 }
 
 /** What session start found for the app-server transport: the launch, or why runs fall back to exec. */
@@ -1092,10 +1502,22 @@ const runs = new Map<string, Run>()
 // block, role system), which `$.session.messages` does not carry as user rows:
 // `session.append` records them here, the next look for messages takes them.
 // In memory only: a hooks-worker restart loses one not taken yet.
-const deliveries = new Map<string, { uuid: string; text: string }[]>()
+const deliveries = new Map<string, { uuid: string; text: string; messageId?: string }[]>()
+// Scope native sends per target. Receive has no UUID: only a scoped delivery
+// gets early control; append-only/uncorrelated ingress uses its source UUID.
+// Parent assistant rows are persisted before tool dispatch, including parallel
+// tool blocks sharing a UUID. Tool IDs distinguish those source messages.
+const nativeSources = new Map<string, { uuid: string; text: string }>()
+const nativeSends = new Map<string, { id: string; received?: string }>()
+const sendGates = new Map<string, Promise<void>>()
+let statusTool: string | undefined
 const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
-const answers = new Map<string, { agentId: string; tool: string; result: Record<string, unknown> }>()
+type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
+const answers = new Map<string, HeldAnswer>()
+// Only pending guard bindings stay resident. History presentation is loaded
+// lazily from fixed-size private disk slots, never as executor capabilities.
+const sourceRows = new RowCache<RowPresentation>()
 let seq = 0
 // Set by session.start when Codex is missing or logged out.
 let preflight: string | undefined
@@ -1103,6 +1525,19 @@ let preflight: string | undefined
 let catalog: ModelInfo[] | null | undefined
 // The config of the loaded module (set by register).
 let cfg: Config = parseConfig({})
+// Unavailable until registration confirms the session offers it; guards stay on.
+let todoWriteAvailable = false
+let availableTools: Set<string> | undefined
+const agentTools = new Map<string, Set<string>>()
+// Session-start snapshot, refreshed only when registration is retried, never on cwd changes.
+let projectRoles = new Map<string, ProjectRole>()
+let modelProfiles = new Map<string, Profile>()
+type ModelLaunch = { session: string; toolUseId: string; type: string; parent?: string; description: string; prompt?: string;
+  profile: Profile; recordProfile: Profile; note?: string; host?: string }
+// Pending launch bodies stay in memory only. Durable rows bind to agent records.
+const modelLaunches = new Map<string, ModelLaunch>()
+const agentEfforts = new Map<string, unknown>()
+const projectNotified = new Set<string>()
 // False after a session start whose agent registration failed: retried once on the next main-loop step.
 let agentsReady = true
 // The app-server transport as checked (session start, else the first launch); undefined: not checked.
@@ -1117,28 +1552,603 @@ const budgets = new WeakMap<AbortSignal, () => number>()
 /** True when the loop is an agent this module answers (known from its first step). */
 const isCodexAgent = (agentId: unknown): boolean => typeof agentId === 'string' && known.get(agentId) !== undefined
 const hasPrefix = (id: unknown): boolean => typeof id === 'string' && id.startsWith(ID_PREFIX)
+// Guard rich tools even when disabled, including stale calls after a worker restart.
 const isNative = (tool: unknown): boolean => (NATIVE_TOOLS as readonly unknown[]).includes(tool)
-/** A Bash/Edit/Write call this module must answer or refuse: never one the engine may run. */
+const isDisplay = (tool: unknown): boolean => typeof tool === 'string' && displayNames.has(tool)
+/** A display call this module must answer or refuse: never one the engine may run. */
 const guarded = (e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): boolean =>
-  isNative(e.tool) && (hasPrefix(e.tool_use_id) || isCodexAgent(e.agentId))
-/** A Bash/Edit/Write call of a subagent whose type is not resolved yet. */
+  hasPrefix(e.tool_use_id) || isDisplay(e.tool) || (isNative(e.tool) && isCodexAgent(e.agentId))
+/** A built-in display call of a subagent whose type is not resolved yet. */
 const unresolved = (e: { tool?: unknown; agentId?: unknown }): boolean =>
   isNative(e.tool) && typeof e.agentId === 'string' && !known.has(e.agentId)
 
 /** The answer to a guarded call: the stored result of our own action, else a refusal. Never runs anything. */
-export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): { result: Record<string, unknown> } | { deny: string } {
+export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown; [key: string]: unknown }, sid: string): GuardAnswer {
   const id = typeof e.tool_use_id === 'string' ? e.tool_use_id : ''
   const held = hasPrefix(id) ? answers.get(id) : undefined
-  if (held === undefined || held.agentId !== e.agentId || held.tool !== e.tool || !isCodexAgent(e.agentId)) {
-    return { deny: `${NOT_EXECUTED} (a ${String(e.tool)} call of a Codex agent is only ever a record of what Codex did)` }
+  // e.tool is the dispatch name, distinct from codex_tool's input.name.
+  const row = sourceRows.get(id)
+  const input = Object.fromEntries(Object.entries(e).filter(([key]) => !['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'].includes(key)))
+  if (held === undefined || held.sessionId !== sid || held.agentId !== e.agentId || held.action.tool !== e.tool || !isCodexAgent(e.agentId) ||
+    row?.sessionId !== sid || row.agentId !== e.agentId || row.tool !== e.tool || stableJSON(input) !== held.inputDigest || row.sourceDigest !== held.sourceDigest || !validAction(held.action)) {
+    return { deny: `${NOT_EXECUTED} (${String(e.tool)} is display-only for Codex agents; only a stored Codex result can answer this call)` }
   }
   answers.delete(id)
-  return { result: held.result }
+  sourceRows.delete(id)
+  planCards.delete(id)
+  return held.action.error !== undefined ? { deny: held.action.error } : { result: held.action.result }
+}
+
+function holdAnswer(id: string, sid: string, agentId: string, action: Action): boolean {
+  if (!validAction(action)) return false
+  if (action.tool === 'WebSearch' && !Array.isArray(action.result) && (action.result.results as any[]).some(r => object(r) && r.tool_use_id !== id)) return false
+  const status = action.source?.item?.status
+  const patch = action.source?.item?.type === 'fileChange'
+  const file = patch && action.patchPath !== undefined ? changesOf(action.source!.item).find(c =>
+    absolute(action.source!.cwd ?? '', c.path) === action.patchPath) : undefined
+  const completedFile = file?.status === 'completed'
+  if (['Write', 'Edit'].includes(action.tool)) {
+    const kind = typeof file?.kind === 'string' ? file.kind : file?.kind?.type
+    const move = typeof file?.kind === 'object' ? file.kind?.move_path : file?.move_path
+    if (!file || action.patchPath !== action.input.file_path || move || kind !== (action.tool === 'Write' ? 'add' : 'update')) return false
+  }
+  // Unconfirmed patches still need native error rows. Individual success must
+  // be explicitly reported for this file; a sampled filesystem change cannot grant it.
+  if (patch && !action.error && status !== 'completed' && !completedFile) return false
+  const generation = action.source?.item?.type === 'imageGeneration' && action.tool === displayTools.codex_tool
+  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status) && !completedFile && !(patch && action.error) && !generation) return false
+  const noMatches = ['Grep', 'Bash'].includes(action.tool) && action.source?.item?.exitCode === 1 && explorationAction(action.source)?.tool === 'Grep'
+  if (['failed', 'declined'].includes(status) && !action.error && !noMatches && !completedFile && !(status === 'failed' && action.tool === 'WebFetch' && !Array.isArray(action.result) && Number(action.result.code) >= 400)) return false
+  // Snapshot before handing anything to core; later caller/input mutations must
+  // never alter the answer or its source binding.
+  const snapshot: Action = JSON.parse(JSON.stringify(action))
+  const source = snapshot.source
+  const sourceDigest = fingerprint(stableJSON(source ?? null)).sha256
+  const item = source?.item
+  const receivers = item?.receiverThreadIds ?? item?.receiver_thread_ids
+  const states = item?.agentsStates ?? item?.agents_states
+  const short = (v: unknown) => typeof v === 'string' ? v.slice(0, 256) : undefined
+  const label = item?.type === 'webSearch' ? `Codex web.${item.action?.type ?? 'other'}`
+    : item && ['mcpToolCall', 'dynamicToolCall'].includes(item.type) ? `Codex ${item.server ?? item.namespace ?? 'dynamic'}.${item.tool}` : undefined
+  sourceRows.set(id, { sessionId: sid, agentId, tool: snapshot.tool, sourceDigest, label: short(label), childThread: short(source?.data?.thread_id),
+    model: short(item?.model ?? states?.[receivers?.[0]]?.model), effort: short(item?.reasoningEffort ?? item?.reasoning_effort) })
+  answers.set(id, { sessionId: sid, agentId, action: snapshot, inputDigest: stableJSON(snapshot.input), sourceDigest })
+  return true
 }
 
 /** The profile of an agent type name; undefined for a name this module does not define. */
-const profileOf = (name: string): Profile | undefined =>
-  name === 'codex' ? { ...cfg.generic } : name in ROLES ? { model: ROLES[name]!.model, effort: ROLES[name]!.effort, sandbox: ROLES[name]!.sandbox } : undefined
+const profileOf = (name: string): Profile | undefined => {
+  if (name === 'codex') return { ...cfg.generic }
+  const role = projectRoles.get(name) ?? modelProfiles.get(name)
+  return role === undefined ? undefined : { model: role.model, effort: role.effort, sandbox: role.sandbox }
+}
+
+function ownedSpawn($: EngineInterface, e: any): string | undefined {
+  const prefix = `${$.plugin.name}:`
+  if (typeof e.subagentType !== 'string' || !e.subagentType.startsWith(prefix)) return
+  const provider = e.provider?.plugin
+  if (provider !== $.plugin.name && !(typeof provider === 'string' && provider.startsWith(`${$.plugin.name}@`))) return
+  return e.subagentType.slice(prefix.length)
+}
+
+async function bindModelLaunch($: EngineInterface, launch: ModelLaunch, host: string): Promise<void> {
+  const alreadyBound = launch.host === host
+  launch.host = host
+  const rec = await loadRecord($, host) ?? { ...launch.recordProfile, agentName: launch.type.slice(launch.type.indexOf(':') + 1), updatedAt: 0 }
+  if (!alreadyBound && !runs.has(host)) Object.assign(rec, launch.recordProfile)
+  rec.selection ??= { session: launch.session, toolUseId: launch.toolUseId, type: launch.type,
+    launchModel: launch.profile.model, launchEffort: launch.profile.effort, note: launch.note }
+  rec.selection.session = launch.session
+  const ids = [...new Set([...(rec.modelRowIds ?? [rec.selection.toolUseId]), launch.toolUseId])].filter(id => id.length <= 128)
+  rec.modelRowIds = [ids[0]!, ...ids.slice(1).slice(-7)].filter(Boolean)
+  delete launch.prompt
+  known.set(host, rec.agentName)
+  await saveRecord($, host, rec)
+  $.ui.invalidate('ui.render')
+}
+
+/** Core may start the first step before its spawn acknowledgement. Bind only
+ * a unique pending launch with the host's actual type/title/parent identity. */
+async function bindPendingModelLaunch($: EngineInterface, host: string, text?: string): Promise<void> {
+  if ((await loadRecord($, host))?.selection) return
+  const sid = await sessionId($)
+  const pending = [...modelLaunches.values()].filter(l => l.session === sid && !l.host && (text === undefined || l.prompt === text))
+  if (!pending.length) return
+  const info = (await $.agent.list()).find(a => a.id === host)
+  if (!info) return
+  const matches = pending.filter(l => l.type === info.type && l.description === info.description && l.parent === info.parentId)
+  if (matches.length === 1) await bindModelLaunch($, matches[0]!, host)
+  else if (matches.length > 1 && matches.every(l => stableJSON(l.recordProfile) === stableJSON(matches[0]!.recordProfile)) && !await loadRecord($, host)) {
+    // Identical concurrent titles cannot establish a row ID before the ack.
+    // Their agreed profile is still safe to checkpoint before the first step.
+    const name = info.type.slice(info.type.indexOf(':') + 1)
+    known.set(host, name)
+    await saveRecord($, host, { ...matches[0]!.recordProfile, agentName: name, updatedAt: 0 })
+  }
+}
+
+async function agentRowProfile($: EngineInterface, id: string): Promise<{ model: string; effort: string; note?: string } | undefined> {
+  const sid = await sessionId($)
+  const launch = modelLaunches.get(id)
+  if (launch?.session === sid) {
+    const rec = launch.host ? await loadRecord($, launch.host) : undefined
+    return { ...(rec ?? launch.profile), note: launch.note }
+  }
+  // A reopened row has no live launch or held executor capability.
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
+    const value = await $.store.get(key)
+    if (!isRecord(value) || value.selection?.session !== sid || value.selection.toolUseId !== id && !value.modelRowIds?.includes(id)) continue
+    const host = key.slice(`${STORE_PREFIX}${sid}:`.length)
+    const rec = await loadRecord($, host)
+    if (rec) return { ...rec, note: rec.selection?.note }
+  }
+  const owned = sourceRows.get(id) ?? (await loadRow($, id, sid))?.row
+  if (!owned || owned.sessionId !== sid || owned.tool !== 'Agent') return
+  const mirror = owned.childThread ? mirrors.get(mirrorKey(sid, owned.childThread)) : undefined
+  if (mirror) return { model: mirror.model, effort: mirror.effort }
+  if (owned.model) return { model: owned.model, effort: owned.effort ?? 'unreported effort' }
+}
+
+/** Shared by launches and live steers; instructions never enter task records or rendered notes. */
+const roleTask = (name: string, text: string, policy?: EffectiveConfig): string =>
+  policyTask(policy ?? { instructions: projectRoles.get(name)?.instructions, multiAgent: !cfg.lean }, text)
+
+type TreeSnapshot = { direct: Usage; tree: Usage; children: number; missing: number; active: number }
+type ChildMirror = {
+  version: 1; session: string; thread: string; parentThread: string; parentHost: string
+  host?: string; hostToolId?: string; displayToolId?: string
+  sourceTurn?: string; sourceItem?: string; rootTurn?: string
+  control: string; generation: string; token: string; inputDigest: string; node: string; reader: string; activeTurn?: string; cwd?: string
+  depth: number; model: string; effort: string; sandbox: string; path?: string
+  launch: 'reserved' | 'launching' | 'bound' | 'refused' | 'uncertain'
+  state: 'waiting' | 'running' | 'stopping' | 'completed' | 'failed' | 'aborted'
+  messages?: { id: string; status: 'submitted' | 'accepted' | 'rejected' | 'unknown' }[]
+  reason?: string; stopSent?: boolean; updatedAt: number
+}
+const mirrors = new Map<string, ChildMirror>()
+// Only a live source step can authorize infrastructure; disk records alone cannot.
+const mirrorAuthorities = new Map<string, MirrorAuthority>()
+const mirrorDiagnostics = new MirrorDiagnostics()
+const flushMirrorDiagnostics = ($: EngineInterface) => mirrorDiagnostics.flush(line => $.ui.log(line, { to: 'debug' }))
+const mirrorKey = (sid: string, thread: string) => `mirror:${sid}:${thread}`
+const validThreadId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+const isMirror = (m: any): m is ChildMirror => m?.version === 1 && validThreadId(m.thread) && typeof m.parentHost === 'string' &&
+  typeof m.session === 'string' && typeof m.control === 'string' && typeof m.token === 'string' && typeof m.generation === 'string' && [2, 3, 4].includes(m.depth)
+
+async function hydrateMirrors($: EngineInterface): Promise<void> {
+  const sid = await sessionId($)
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(`mirror:${sid}:`) || mirrors.has(key)) continue
+    const stored = await $.store.get(key)
+    const value = stored && await readStoreState($, key, stored)
+    // A simultaneous abort/receipt may have published a newer reservation
+    // while this store read was in flight. Never overwrite that live state.
+    if (isMirror(value) && !mirrors.has(key)) mirrors.set(key, value)
+  }
+}
+
+async function saveMirror($: EngineInterface, m: ChildMirror): Promise<boolean> {
+  m.updatedAt = await $.clock.now()
+  mirrors.set(mirrorKey(m.session, m.thread), m)
+  // Launch reservations must be durable before core can create a host loop.
+  const saved = await writeStoreState($, mirrorKey(m.session, m.thread), m)
+  if (m.host) {
+    const rec = records.get(m.host)
+    if (rec) { rec.mirror = m; await saveRecord($, m.host, rec) }
+  }
+  return saved
+}
+
+async function bindMirror($: EngineInterface, m: ChildMirror, host: string): Promise<void> {
+  const firstBind = m.launch !== 'bound'
+  const info = (await $.agent.list()).find(a => a.id === host)
+  const verdict = mirrorHostMatches(m, host, info, mirrorAuthorities.get(m.token)?.spawned === true)
+  if (verdict !== 'admit') {
+    mirrorDiagnostics.add(mirrorLaunchDiagnostic('bind', verdict, info ?? {}, 'codex-mod', m))
+    flushMirrorDiagnostics($)
+    throw new Error(`mirror host identity mismatch: ${verdict}`)
+  }
+  m.host = host
+  m.launch = 'bound'
+  if (m.state === 'waiting') m.state = 'running'
+  known.set(host, 'codex-child')
+  const loaded = await loadRecord($, host)
+  const rec: AgentRecord = loaded ?? { model: m.model, effort: m.effort, sandbox: m.sandbox, agentName: 'codex-child', thread: m.thread, updatedAt: 0 }
+  rec.mirror = m
+  records.set(host, rec)
+  await saveMirror($, m)
+  if (firstBind) $.ui.log(`codex-mod: mirror bound: host=${host}; sourceParent=${m.parentHost}; thread=${m.thread}`, { to: 'debug' })
+}
+
+/** An API launch may traverse tool guards. Only its exact held capability
+ * and plugin origin allow infrastructure through; source actions never do. */
+function heldMirrorCall(e: any, origin: string, phase: 'call' | 'check' = 'call'): boolean {
+  const prompt = phase === 'check' && object(e.input) ? e.input.prompt : e.prompt
+  const m = [...mirrors.values()].find(m => m.token === prompt)
+  // The nested dispatch carries the exact capability in prompt. No event
+  // loop ID or async-local context participates in the authority lookup.
+  const verdict = admitMirrorLaunch(m, mirrorAuthorities.get(prompt), e, origin, phase)
+  const input = phase === 'check' && object(e.input) ? e.input : e
+  if (m || input.subagent_type === 'codex-mod:codex-child') mirrorDiagnostics.add(mirrorLaunchDiagnostic(phase, verdict, e, origin, m))
+  return verdict === 'admit'
+}
+
+function heldMirrorSpawn(e: any, origin: string): ChildMirror | undefined {
+  const m = [...mirrors.values()].find(m => m.token === e.prompt)
+  const verdict = admitMirrorLaunch(m, mirrorAuthorities.get(e.prompt), e, origin, 'spawn')
+  mirrorDiagnostics.add(mirrorLaunchDiagnostic('spawn', verdict, e, origin, m))
+  return verdict === 'admit' ? m : undefined
+}
+
+function validMirrorLink(a: Action): boolean {
+  if (!a.mirror || !object(a.result)) return false
+  const m = mirrors.get(a.mirror)
+  return !!m && m.launch === 'bound' && m.host === a.result.agentId && a.input.prompt === `Observe existing Codex child ${m.thread}` &&
+    a.source?.threadId === m.parentThread && a.source?.data?.thread_id === m.thread
+}
+
+function mirrorFallbackStatus(reason: string, launch?: ChildMirror['launch'], attachmentStatus?: string): string {
+  const afterRetry = 'auto mode could not evaluate observer launch after one unchanged retry: '
+  const withoutRetry = 'auto mode could not evaluate observer launch: '
+  if (reason.startsWith(afterRetry) && isMirrorAutoModeNoVerdict(reason.slice(afterRetry.length))) return 'Auto mode could not evaluate the observer after one retry.'
+  if (reason.startsWith(withoutRetry) && isMirrorAutoModeNoVerdict(reason.slice(withoutRetry.length))) return 'Auto mode could not evaluate the observer; no retry.'
+  if (reason.startsWith('host creation outcome unknown: ') || launch === 'uncertain') return 'Observer launch outcome unknown; no retry.'
+  if (reason.includes('checkpoint unavailable')) return 'Observer launch unavailable; no retry.'
+  if (reason === 'host returned no agentId') return 'Observer identity unavailable; no retry.'
+  if (reason === 'observer dispatch depth limit 3') return 'Observer nesting limit reached.'
+  if (attachmentStatus && attachmentStatus !== 'attached' || reason.includes('attachment')) return 'Observer attachment incomplete.'
+  if (reason.includes('no relaunch') || reason.startsWith('previous launch ')) return 'Observer recovery unavailable; no relaunch.'
+  return launch === 'refused' ? 'Observer launch declined.' : 'Observer unavailable.'
+}
+
+async function mirrorFallback($: EngineInterface, run: Run, data: any, reason: string): Promise<void> {
+  const m = mirrors.get(mirrorKey(run.sessionId, data.thread_id))
+  const summary = mirrorFallbackStatus(reason, m?.launch, data.status)
+  const child = validThreadId(data.thread_id) ? data.thread_id.slice(-8) : oneLine(String(data.thread_id ?? 'unknown'), 12)
+  const text = `↪ Codex child ${child}: observer transcript unavailable. ${summary} Showing reported child activity.`
+  run.queue.push({ kind: 'note', text })
+  $.ui.log(`codex-mod: ↪ Codex child ${data.thread_id}: mirror unavailable (${reason}); using Batch 5 lifecycle/report view. Child transcript unavailable.`, { to: 'debug' })
+  const source = run.childSources?.get(data.thread_id)
+  run.childSources?.delete(data.thread_id)
+  if (source?.item) {
+    const rec = records.get(run.agentId)
+    if (rec) {
+      const state = rec.display ??= emptyDisplayState()
+      const tools = agentTools.get(run.name) ?? new Set<string>()
+      for (const row of childRows(source.item, state, { session: run.sessionId, agent: run.agentId, thread: run.thread!, turn: source.turnId, rich: cfg.richRows, tools })) await handle($, run, row, source)
+    }
+  }
+}
+
+async function launchMirror($: EngineInterface, run: Run, data: any): Promise<void> {
+  if (!cfg.nestedAgents || run.transport !== 'app-server' || !run.control || data.parent_thread_id !== run.thread || !validThreadId(data.thread_id)) return
+  if (data.status !== 'attached') return mirrorFallback($, run, data, data.reason ?? 'child attachment failed')
+  await hydrateMirrors($)
+  const key = mirrorKey(run.sessionId, data.thread_id)
+  let m = mirrors.get(key)
+  if (m) {
+    if (m.launch !== 'bound') return mirrorFallback($, run, data, m.reason ?? `previous launch ${m.launch}; creation outcome not retried`)
+    const info = (await $.agent.list()).find(a => a.id === m!.host)
+    const verdict = mirrorHostMatches(m, m.host!, info)
+    if (verdict !== 'admit') {
+      mirrorDiagnostics.add(mirrorLaunchDiagnostic('recover', verdict, info ?? {}, 'codex-mod', m))
+      flushMirrorDiagnostics($)
+    }
+    if (m.parentHost !== run.agentId || verdict !== 'admit' || m.generation !== data.generation) return mirrorFallback($, run, data, 'previous host or broker unavailable; no relaunch')
+    if (!m.displayToolId && !run.queue.some(q => q.kind === 'action' && q.action.mirror === key)) return mirrorFallback($, run, data, `existing host ${m.host}; launch row recovery incomplete; no relaunch`)
+    return
+  }
+  const list = await $.agent.list()
+  let depth = run.mirror?.depth ?? 1
+  let parent = list.find(a => a.id === run.agentId)
+  const seen = new Set<string>()
+  while (!run.mirror && parent?.parentId) {
+    if (seen.has(parent.id)) return mirrorFallback($, run, data, 'host ancestry cycle')
+    seen.add(parent.id)
+    depth++
+    parent = list.find(a => a.id === parent!.parentId)
+    if (!parent) return mirrorFallback($, run, data, 'host ancestry unavailable')
+  }
+  // Plugin API spawns in 2.1.302 use the session context (depth 1, no
+  // parent). Preserve the source relation in both supported title surfaces.
+  const parentTitle = oneLine(list.find(a => a.id === run.agentId)?.description || run.agentId, 100)
+  const description = modelTitle({ model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort }, `Codex child of ${parentTitle} · ${oneLine(data.path ?? data.thread_id, 120)}`)
+  const token = `codex-mirror:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}:${Math.random().toString(36).slice(2)}`
+  const input = { subagentType: `${$.plugin.name}:codex-child`, prompt: token, description, name: `codex-${data.thread_id}`, cwd: run.cwd }
+  m = { version: 1, session: run.sessionId, thread: data.thread_id, parentThread: run.thread!, parentHost: run.agentId,
+    sourceTurn: data.source_turn_id, sourceItem: data.source_item_id, rootTurn: data.root_turn_id,
+    control: run.control, node: appServer && 'node' in appServer ? appServer.node : 'node', reader: appServer && 'runner' in appServer ? appServer.runner : `${$.plugin.root}/${RUNNER}`, activeTurn: data.turn_id, generation: data.generation, token, inputDigest: mirrorLaunchDigest(input), cwd: run.cwd, depth: depth + 1,
+    model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort, sandbox: run.prof.sandbox,
+    path: data.path, launch: 'reserved', state: 'waiting', updatedAt: 0 }
+  if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror identity checkpoint unavailable; no host launched')
+  if (m.depth > 3) {
+    m.launch = 'refused'; m.reason = 'observer dispatch depth limit 3'
+    await saveMirror($, m)
+    return mirrorFallback($, run, data, m.reason)
+  }
+  m.launch = 'launching'
+  if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror launch checkpoint unavailable; no host launched')
+  const authority: MirrorAuthority = { parentHost: run.agentId, session: run.sessionId, spawned: false }
+  mirrorAuthorities.set(token, authority)
+  let retried = false
+  try {
+    // Only the source relation is ours: core chooses host parent/depth.
+    // This creates an observer for the already running Codex child.
+    let result = await $.agent.spawn(input)
+    const live = () => mirrors.get(key) === m && mirrorAuthorities.get(token) === authority && runs.get(run.agentId) === run && !run.killed &&
+      m.launch === 'launching' && m.host === undefined && m.parentHost === run.agentId && m.session === run.sessionId &&
+      authority.parentHost === run.agentId && authority.session === run.sessionId && authority.spawned === false
+    if (isMirrorAutoModeNoVerdict(result.deny) && live() && await $.session.id().catch(() => undefined) === run.sessionId &&
+      live() && prepareMirrorRetry(m, authority, result, input, run.agentId, run.sessionId)) {
+      // Retire the denied core ID before any await: delayed first-attempt
+      // events cannot claim the fresh ID used by the unchanged API request.
+      if (!await saveMirror($, m)) {
+        m.launch = 'refused'; m.reason = 'mirror retry checkpoint unavailable; no retry'
+        await saveMirror($, m)
+        return mirrorFallback($, run, data, m.reason)
+      }
+      if (await $.session.id().catch(() => undefined) === run.sessionId && live() &&
+        authority.toolUseId === undefined && m.hostToolId === undefined) {
+        retried = true
+        result = await $.agent.spawn(input)
+      }
+    }
+    // turn.start may bind a core identity before the launch call resolves.
+    // Reconcile that verified identity when a host omits it from the ack.
+    const early = mirrors.get(key)
+    const host = result.agentId ?? (early?.launch === 'bound' ? early.host : undefined)
+    if (result.deny || !host) {
+      m.launch = m.host ? 'uncertain' : 'refused'
+      m.reason = isMirrorAutoModeNoVerdict(result.deny)
+        ? `auto mode could not evaluate observer launch${retried ? ' after one unchanged retry' : ''}: ${result.deny}`
+        : result.deny ?? 'host returned no agentId'
+      await saveMirror($, m)
+      return mirrorFallback($, run, data, m.reason)
+    }
+    await bindMirror($, m, host)
+  } catch (err) {
+    // Core may already have created a task. An unknown outcome is never
+    // retried automatically, even after a worker restart.
+    m.launch = 'uncertain'; m.reason = errText(err)
+    await saveMirror($, m)
+    return mirrorFallback($, run, data, `host creation outcome unknown: ${m.reason}`)
+  } finally {
+    mirrorAuthorities.delete(token)
+    flushMirrorDiagnostics($)
+  }
+  run.childSources?.delete(data.thread_id)
+  const source = normalizeSource(JSON.stringify(data), { transport: 'app-server', threadId: run.thread, turnId: run.turnId, cwd: run.cwd })!
+  source.threadId = run.thread
+  source.data = data
+  const prompt = `Observe existing Codex child ${m.thread}`
+  const action: Action = { tool: 'Agent', mirror: key, input: { description, prompt, subagent_type: 'codex-mod:codex-child' }, source,
+    result: { agentId: m.host, agentType: 'codex-mod:codex-child', status: 'completed', prompt, canContinueAgent: false,
+      content: [{ type: 'text', text: `Observation link to real host agent ${m.host} for Codex child ${m.thread}, child of ${parentTitle} (host ${run.agentId}). Host launch ${m.hostToolId ?? 'ID unavailable'}; child lifecycle and transcript belong to that host task. Plugin API spawns may appear at depth 1 without a native parent. This completed link operation reports no host usage; Codex source usage is in the direct/tree footer.` }],
+      resolvedModel: m.model, totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, server_tool_use: null, service_tier: null, cache_creation: null } } }
+  run.queue.push({ kind: 'action', action })
+}
+
+async function stopMirror($: EngineInterface, m: ChildMirror): Promise<void> {
+  m = mirrors.get(mirrorKey(m.session, m.thread)) ?? m
+  if (m.stopSent || !['waiting', 'running'].includes(m.state)) return
+  const run = m.host ? runs.get(m.host) : undefined
+  const turnId = run?.turnId ?? (m.host ? records.get(m.host)?.playback?.turnId : undefined) ?? m.activeTurn
+  m.stopSent = true
+  m.state = 'stopping'
+  // Reserve before awaiting: abort and turn.complete can arrive together.
+  if (!await saveMirror($, m)) {
+    $.ui.log(`codex-mod: mirror stop unknown: checkpoint unavailable; thread=${m.thread}; no retry`, { to: 'debug' })
+    return
+  }
+  if (!turnId) {
+    $.ui.log(`codex-mod: mirror stop unknown: active turn unavailable; thread=${m.thread}; no retry`, { to: 'debug' })
+    return
+  }
+  try {
+    await controlRequest($, m.control, '/interrupt', { threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }, `interrupt-${m.thread}.json`)
+    $.ui.log(`codex-mod: mirror stop submitted: host=${m.host}; thread=${m.thread}; turn=${turnId}; awaiting source terminal`, { to: 'debug' })
+  } catch (err) {
+    $.ui.log(`codex-mod: mirror stop unknown: thread=${m.thread}; ${errText(err)}; no retry`, { to: 'debug' })
+  }
+}
+
+/** Host tasks can be siblings. Cascade by our verified source ownership,
+ * including recovered observers, rather than trusting native host nesting. */
+async function stopMirrorDescendants($: EngineInterface, parentHost: string): Promise<void> {
+  try {
+    await hydrateMirrors($)
+  } catch (err) {
+    // Store recovery must not prevent cancellation of already known targets
+    // or the owning runner. Unknown descendants remain explicitly unresolved.
+    $.ui.log(`codex-mod: mirror cascade recovery unavailable: ${errText(err)}; stopping known descendants`, { to: 'debug' })
+  }
+  const sid = await sessionId($)
+  const hosts = new Set([parentHost])
+  const targets = new Set<ChildMirror>()
+  for (let changed = true; changed;) {
+    changed = false
+    for (const m of mirrors.values()) {
+      if (m.session !== sid || !hosts.has(m.parentHost) || targets.has(m)) continue
+      targets.add(m)
+      if (m.host) hosts.add(m.host)
+      changed = true
+    }
+  }
+  for (const m of targets) try {
+    await stopMirror($, m)
+  } catch (err) {
+    $.ui.log(`codex-mod: mirror cascade stop unknown: thread=${m.thread}; ${errText(err)}`, { to: 'debug' })
+  }
+}
+
+/** A journal consumer owns no process. Every pull settles inside one step;
+ * a worker reload resumes its cursor or reports a source gap, never executes. */
+function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessSpawnChunk, ProcessSpawnResult> {
+  const m = rec.mirror!
+  let segment = rec.playback?.segment ?? 0
+  let cursor = rec.playback?.cursor ?? 0
+  let prefix = rec.playback?.prefix ?? ''
+  let ended = false
+  let code = 0
+  let quiet = 0
+  let settle: (r: ProcessSpawnResult) => void
+  const result = new Promise<ProcessSpawnResult>(resolve => { settle = resolve })
+  const done = () => { ended = true; const value = { code, signal: null } as ProcessSpawnResult; settle(value); return { done: true as const, value } }
+  return {
+    result,
+    [Symbol.asyncIterator]() { return this },
+    async next() {
+      if (ended) return done()
+      let drained = false
+      for (;;) {
+        const entry = await journalLine($, m.control, m.thread, { segment, cursor, prefix })
+        if (entry) {
+          quiet = 0
+          const { line } = entry
+          segment = entry.segment
+          cursor = entry.cursor
+          prefix = entry.prefix
+          const ev = JSON.parse(line)
+          if (ev.type === 'codexmod.child' ? ev.parent_thread_id !== m.thread : ev.thread_id !== m.thread) throw new Error('foreign child journal identity')
+          if (ev.type === 'turn.failed') code = 1
+          if (ev.type === 'codexmod.turn' && !m.stopSent) m.state = 'running'
+          const run = m.host ? runs.get(m.host) : undefined
+          if (run && ['turn.completed', 'turn.failed'].includes(ev.type)) {
+            // Source terminal evidence settles the observer; do not echo a stop.
+            m.state = ev.status === 'interrupted' || ev.error?.message === 'interrupted' ? 'aborted' : code ? 'failed' : 'completed'
+            $.ui.log(`codex-mod: mirror source terminal: host=${m.host}; thread=${m.thread}; state=${m.state}`, { to: 'debug' })
+          }
+          if (ev.type === 'codexmod.steer') {
+            const message = m.messages?.find(message => message.id === String(ev.id))
+            if (message && message.status === 'submitted') message.status = ev.status === 'accepted' ? 'accepted' : ev.status === 'rejected' ? 'rejected' : 'unknown'
+            $.ui.log(`codex-mod: mirror steer acknowledgement: host=${m.host}; thread=${m.thread}; id=${ev.id}; status=${message?.status ?? 'unmatched'}`, { to: 'debug' })
+          }
+          rec.playback = { segment, cursor, prefix, texts: run?.texts ?? [], queue: run?.queue ?? [], actions: run?.actions ?? 0, usage: run?.usage, usageCanonical: run?.usageCanonical, usagePartial: run?.usagePartial, turnId: ev.turn_id ?? run?.turnId }
+          return { done: false as const, value: { stream: 'stdout' as const, text: line + '\n' } }
+        }
+        const owner = JSON.parse(await journalRead($, `${m.control}/owner.json`))
+        // The owner can finish between our index read and this read. Drain
+        // once more against its final index before deciding the journal ended.
+        if (owner.ended && !drained) {
+          drained = true
+          continue
+        }
+        if (owner.generation !== m.generation || owner.ended || !Number.isFinite(owner.updatedAt) || Date.now() - owner.updatedAt > 15000) {
+          if (!['completed', 'failed', 'aborted'].includes(m.state)) throw new Error('child source owner unavailable; partial transcript, no relaunch')
+          return done()
+        }
+        const run = m.host ? runs.get(m.host) : undefined
+        if (['completed', 'failed', 'aborted'].includes(m.state) && ++quiet >= 2) return done()
+        if (run?.killed || m.state === 'stopping') return done()
+        await mirrorMessages($, rec, run)
+        // A bounded read-only wait in the host keeps polling out of the
+        // dispatch's CPU/sleep budget. It starts no Codex or provider work.
+        await $.process.run([m.node, m.reader, 'observe', '--control', m.control, '--thread', m.thread, '--segment', String(segment), '--cursor', String(cursor), '--generation', m.generation], { timeoutMs: 3000 })
+      }
+    },
+    async return() { return done() },
+  } as HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+}
+
+async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): Promise<void> {
+  const m = rec.mirror!
+  const c = await conversation($, m.host!)
+  const read = readConversation(c.items)
+  const count = read.latest?.count ?? rec.userCount ?? 0
+  // Presentation owns this queue and removes a receipt only after emission.
+  // Claim delivery separately so a long pending display cannot resend it
+  // after the bounded received-ID window has rolled over.
+  const received = [...(rec.coordinator?.pending ?? []).filter(p => !p.mirrorClaimed).map(p => ({ ...p, count })), ...takeDeliveries(m.host!, count)]
+  const latest = read.latest
+  if (latest && latest.text !== m.token && latest.text !== rec.lastTask && latest.count > (rec.userCount ?? 0)) received.push({ text: latest.text, count: latest.count })
+  for (const message of received) {
+    const receipt = rec.coordinator?.pending.find(p => p.uuid === message.uuid)
+    if (receipt) receipt.mirrorClaimed = true
+    const id = steerFileId(message)
+    const control = (rec.coordinator ??= { received: [], pending: [] })
+    const key = `mirror:${id}`
+    if (control.received.includes(key)) continue
+    control.received.push(key)
+    // Journal intent first. A crash after this write has an unknown outcome,
+    // so recovery does not send it twice or convert it to a new run.
+    rec.lastTask = message.text; rec.userCount = message.count
+    if (rec.handedBack || m.state !== 'running' || !(run?.turnId ?? rec.playback?.turnId ?? m.activeTurn)) {
+      const note = '↪ child message rejected: source turn idle, terminal or unknown; no new turn started'
+      if (run) run.queue.push({ kind: 'note', text: note })
+      else rec.lastAnswer = [rec.lastAnswer, note].filter(Boolean).join('\n\n')
+      await saveRecord($, m.host!, rec)
+      continue
+    }
+    const delivery: NonNullable<ChildMirror['messages']>[number] = { id: `${m.thread}-${id}`, status: 'submitted' }
+    m.messages = [...(m.messages ?? []).slice(-127), delivery]
+    if (!await saveRecord($, m.host!, rec)) {
+      delivery.status = 'unknown'
+      $.ui.log(`codex-mod: mirror steer unknown: checkpoint unavailable; thread=${m.thread}; id=${delivery.id}; no retry`, { to: 'debug' })
+      continue
+    }
+    try {
+      const o: MessageOutcome = { messageId: message.uuid ?? `${m.thread}:${id}`, id: delivery.id, sourceUuid: message.uuid,
+        sessionId: m.session, agentId: m.host!, runId: m.control, threadId: m.thread,
+        expectedTurnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn, status: 'pending', receivedAt: Date.now() }
+      await recordOutcome($, m.host!, o)
+      const outcome = await controlRequest($, m.control, '/messages', { ...o, text: roleTask(rec.agentName, parseOverrides(message.text).rest.trim(), rec.effectiveConfig), turnId: o.expectedTurnId }, `steer-${m.thread}-${id}.json`)
+      if (outcome) { await recordOutcome($, m.host!, outcome); delivery.status = ['accepted', 'observed'].includes(outcome.status) ? 'accepted' : outcome.status === 'rejected' ? 'rejected' : outcome.status === 'unknown' ? 'unknown' : 'submitted' }
+      $.ui.log(`codex-mod: mirror steer submitted: host=${m.host}; thread=${m.thread}; id=${delivery.id}`, { to: 'debug' })
+    } catch (err) {
+      delivery.status = 'unknown'
+      await recordOutcome($, m.host!, { messageId: message.uuid ?? `${m.thread}:${id}`, sourceUuid: message.uuid, status: 'unknown', receivedAt: Date.now(), reason: 'control outcome unavailable; no retry' })
+      await saveRecord($, m.host!, rec)
+      $.ui.log(`codex-mod: mirror steer unknown: thread=${m.thread}; id=${delivery.id}; ${errText(err)}; no retry`, { to: 'debug' })
+      continue
+    }
+    if (run) run.queue.push({ kind: 'note', text: `↪ child message submitted (${message.uuid ?? id}); awaiting Codex acknowledgement` })
+  }
+}
+
+async function checkpointMirror($: EngineInterface, run: Run): Promise<void> {
+  if (!run.mirror) return
+  const rec = records.get(run.agentId)
+  if (!rec?.playback) return
+  Object.assign(rec.playback, { texts: run.texts, queue: run.queue, actions: run.actions, usage: run.usage, usageCanonical: run.usageCanonical, usagePartial: run.usagePartial, turnId: run.turnId })
+  rec.wire = { records: run.ledger.records, rows: run.rows }
+  await saveMirror($, run.mirror)
+}
+
+async function* answerMirror($: EngineInterface, e: TurnStepInput, signal: AbortSignal, rec: AgentRecord): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  if (rec.recoveryUnavailable) return yield* handBack($, e, 'codex failed: recovery state unavailable', '', false)
+  const m = rec.mirror!
+  if (!isMirror(m) || m.host !== e.agentId) return yield* failStep(e, 'codex-child', 'codex failed: unowned mirror; no run launched', false)
+  mirrors.set(mirrorKey(m.session, m.thread), m)
+  const c = await conversation($, e.agentId!)
+  const read = readConversation(c.items)
+  const handback = handbackFor(e.agentId!, read.signal, c.source)
+  if (rec.handedBack) {
+    await mirrorMessages($, rec)
+    return yield* redeliver($, e, e.agentId!, rec, handback)
+  }
+  let run = runs.get(e.agentId!)
+  if (!run) {
+    const ledger = new SourceLedger()
+    for (const source of rec.wire?.records ?? []) ledger.capture(source)
+    const p = rec.playback
+    run = { sessionId: m.session, ledger, rows: rec.wire?.rows ?? {}, agentId: e.agentId!, name: 'codex-child', prof: rec,
+      cwd: m.cwd ?? await $.session.cwd(), child: mirrorStream($, rec), thread: m.thread, turnId: p?.turnId, buffered: '', stderrTail: '',
+      texts: p?.texts ?? [], queue: p?.queue ?? [], errors: [], snapshots: new Map(), actions: p?.actions ?? 0, usage: p?.usage, usageCanonical: p?.usageCanonical, usagePartial: p?.usagePartial,
+      patches: 0, patchRows: 0, actionSteps: 0, lastEmit: -Infinity, ended: false, killed: false, timedOut: false,
+      handback, followUps: [], transport: 'app-server', control: m.control, transportNote: 'app-server mirror', pendingSteers: [], steers: 0,
+      unknown: 0, unknownTypes: [], mirror: m }
+    runs.set(e.agentId!, run)
+  } else {
+    // Engine interfaces belong to a dispatch. Replace only the inert reader
+    // between steps so all filesystem/control calls use this step's interface.
+    await run.child.return(undefined as unknown as ProcessSpawnResult)
+    run.child = mirrorStream($, rec)
+  }
+  await mirrorMessages($, rec, run)
+  return yield* pump($, e, signal, run)
+}
 
 export const register: Register = (on, options) => {
   cfg = parseConfig(options)
@@ -1167,6 +2177,7 @@ export const register: Register = (on, options) => {
     }
     appServer = undefined
     if (config.transport === 'app-server') appServer = await checkAppServer($, config)
+    await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
     agentsReady = await registerAgents($, config)
     return next(e)
   })
@@ -1174,39 +2185,343 @@ export const register: Register = (on, options) => {
   // Pruning only: a running child dies with the module (process exit) or with
   // its agent's turn (turn.complete below); a /clear also ends the session.
   on('session.end', async ($, e, next) => {
+    answers.clear()
+    sourceRows.clear()
+    planCards.clear()
+    questionRows.clear()
+    coordinatorRows.clear()
     await pruneRecords($, config.ttlMs)
     await pruneRuns($, config.ttlMs)
     return next(e)
   })
 
-  // GUARD 1. Bash/Edit/Write calls of a Codex agent, or carrying our id
+  // GUARD 1. Built-in display calls of a Codex agent, or carrying our id
   // prefix, are answered here and never reach `next` (no permission path, no
   // tool run): our own action calls get the result Codex reported, anything
   // else is refused. A subagent not seen yet (after a worker restart, say) has
   // its type resolved first; if that fails, `.catch` refuses the call.
-  on('tool.call', { tool: ['Bash', 'Edit', 'Write'] }, async ($, e, next) => {
-    if (guarded(e)) return answerGuarded(e) as never
-    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e) as never
+  on('tool.call', async ($, e, next) => {
+    const held = heldMirrorCall(e, next.origin.plugin)
+    flushMirrorDiagnostics($)
+    if (held) return next(e)
+    if (e.tool === statusTool) {
+      if (e.agentId !== undefined || hasPrefix(e.tool_use_id)) return { deny: NOT_EXECUTED }
+      const agentId = (e as any).targetAgentId
+      const messageId = (e as any).messageId
+      if (typeof agentId !== 'string' || typeof messageId !== 'string' || await agentName($, agentId) === undefined) return { deny: 'codex-mod: unknown target or message' }
+      const rec = await loadRecord($, agentId)
+      const sourceId = rec?.coordinator?.sources?.[messageId] ?? messageId
+      const matches = Object.values(rec?.coordinator?.outcomes ?? {}).filter(v => v.sourceUuid === sourceId || v.senderToolUseId === messageId)
+      if (!rec?.coordinator?.outcomes?.[sourceId] && matches.length > 1) return { result: [{ type: 'text', text: JSON.stringify({ messageId, status: 'unknown', reason: 'source row contains multiple messages; use a message ID or sender tool-use ID' }) }] }
+      let o = rec?.coordinator?.outcomes?.[sourceId] ?? matches[0]
+      if (o?.runId && ['pending', 'received', 'unknown'].includes(o.status)) {
+        const updated = await queryOutcome($, o.runId, o.messageId).catch(() => undefined)
+        if (updated) { await recordOutcome($, agentId, updated); o = records.get(agentId)?.coordinator?.outcomes?.[o.messageId] }
+      }
+      if (!o && rec?.coordinator?.received.includes(sourceId)) o = { messageId: sourceId, sourceUuid: sourceId, status: 'received', receivedAt: rec.updatedAt }
+      return { result: [{ type: 'text', text: JSON.stringify(o ?? { messageId, status: 'unknown', reason: 'no owned receipt' }) }] }
+    }
+    if (guarded(e)) return answerGuarded(e, await sessionId($))
+    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
+    // The current host omits effort from agent.spawn but exposes the Agent
+    // input here. Keep it scoped to this real call's lifetime and tool ID.
+    if (e.tool === 'Agent' && typeof (e as any).subagent_type === 'string' && (e as any).subagent_type.startsWith(`${$.plugin.name}:`) && typeof e.tool_use_id === 'string') {
+      agentEfforts.set(e.tool_use_id, (e as any).effort)
+      try { return await next(e) } finally { agentEfforts.delete(e.tool_use_id) }
+    }
+    if (e.tool === 'SendMessage' && e.agentId === undefined && typeof (e as any).message === 'string' && (e as any).message !== '') {
+      const target = await nativeTarget($, (e as any).to)
+      if (target) {
+        const previous = sendGates.get(target)
+        let release!: () => void
+        const gate = new Promise<void>(resolve => { release = resolve })
+        sendGates.set(target, gate)
+        await previous
+        const ticket = { id: e.tool_use_id, received: undefined as string | undefined }
+        nativeSends.set(target, ticket)
+        try {
+          const result = await next(e)
+          if (result.deny !== undefined || result.isError) return result
+          const receipt = nativeSources.get(ticket.id)
+          // CLI 2.1.302 raises receive only when the child's next tool round
+          // drains its inbox. A long step cannot wait for that callback.
+          const pin = nativeSendPin(result)
+          const run = runs.get(target)
+          if (receipt && pin === target && run && !run.ended && !run.killed && !run.mirror &&
+              !Object.values(records.get(target)?.coordinator?.outcomes ?? {}).some(o => o.senderToolUseId === ticket.id)) {
+            const rec = records.get(target)!
+            const c = rec.coordinator ??= { received: [], pending: [] }
+            const messageId = `${await sessionId($)}:${ticket.id}`
+            ticket.received = messageId
+            c.authoritative = true
+            c.received.push(receipt.uuid)
+            c.pending.push({ uuid: messageId, sourceUuid: receipt.uuid, messageId, text: receipt.text })
+            c.ingress ??= []
+            c.ingress.push({ messageId, senderToolUseId: ticket.id, count: rec.userCount ?? 0, fromSend: true, text: receipt.text })
+            // UUID and tool ID come from the stored parent row; pin comes from
+            // the native result. No body marker or second native send is used.
+            await foldIn($, run, { uuid: receipt.uuid, messageId, senderToolUseId: ticket.id, text: receipt.text, count: rec.userCount ?? 0 })
+            $.ui.log(`codex-mod: steer v2 sender receipt target=${target} message=${messageId} source=${receipt.uuid}`, { to: 'debug' })
+          }
+          let o = Object.values(records.get(target)?.coordinator?.outcomes ?? {}).find(o => o.senderToolUseId === ticket.id)
+          // The sidecar independently advances this finite query, even when the
+          // child view has not pulled its next stdout chunk.
+          if (o?.runId && ['received', 'pending'].includes(o.status)) {
+            const updated = await queryOutcome($, o.runId, o.messageId).catch(() => undefined)
+            if (updated) { await recordOutcome($, target, updated); o = records.get(target)?.coordinator?.outcomes?.[o.messageId] }
+          }
+          const feedback = o ? `${messageStatus(o)} (messageId=${o.messageId}; targetAgentId=${target})`
+            : `Codex acknowledgment pending; query codex_message_status with targetAgentId=${target}, messageId=${ticket.received ?? ticket.id}`
+          return { ...result, context: [...(result.context ?? []), feedback] }
+        } finally {
+          nativeSends.delete(target)
+          release()
+          if (sendGates.get(target) === gate) sendGates.delete(target)
+        }
+      }
+    }
     return next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { deny: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => {
+    if (e.tool === statusTool) return { deny: NOT_EXECUTED }
+    if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
+    if (!guarded(e) && !unresolved(e)) return next(e)
+    const held = typeof e.tool_use_id === 'string' ? answers.get(e.tool_use_id) : undefined
+    return held ? answerGuarded(e, held.sessionId) : { deny: NOT_EXECUTED }
+  })
 
   // GUARD 2. `tool.check` runs inside `tool.call`'s `next`, which guard 1
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
-  on('tool.check', { tool: ['Bash', 'Edit', 'Write'] }, async ($, e, next) => {
-    if (unresolved(e)) await agentName($, e.agentId!)
+  on('tool.check', async ($, e, next) => {
+    if (e.tool === statusTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
+    const held = heldMirrorCall(e, next.origin.plugin, 'check')
+    flushMirrorDiagnostics($)
+    if (held) return next(e)
+    if (!hasPrefix(e.tool_use_id) && !isDisplay(e.tool) && unresolved(e)) await agentName($, e.agentId!)
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => {
+    if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin, 'check')) return next(e)
+    return guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
+  })
+
+  on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
+    if (!dimNotes.has(e.props.text)) return next(e)
+    return $.ui.resolve(e).Text({ dimColor: true, children: e.props.text })
+  }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const id = e.props.tool_use_id
+    const sid = hasPrefix(id) ? await sessionId($) : undefined
+    const saved = hasPrefix(id) && !sourceRows.has(id) ? await loadRow($, id, sid!) : undefined
+    const owned = hasPrefix(id) ? sourceRows.get(id) ?? saved?.row : undefined
+    if (e.props.tool === 'Agent') {
+      const profile = await agentRowProfile($, id)
+      if (profile) {
+        const { Box, Text } = $.ui.resolve(e)
+        // Retain the host tree, including status, navigation and accessibility.
+        const native = await next(e)
+        return Box({ flexDirection: 'column', children: [
+          Text({ weight: 'semibold', children: `Codex ${profile.model} · ${profile.effort}` }),
+          ...(profile.note ? [Text({ children: profile.note })] : []), native,
+        ] })
+      }
+    }
+    let row = hasPrefix(id) ? coordinatorRows.get(id) : undefined
+    if (row?.sessionId !== sid) row = undefined
+    // Reopened history need not have called turn.step or consumed a guard.
+    // A matching row cache and received receipt attest a host-returned name
+    // even before registration. Restore presentation only, never an answer.
+    const legacyCoordinatorTool = e.props.tool === `mcp__${$.plugin.name}__coordinator_message`
+    const owner = owned?.sessionId === sid && owned?.tool === e.props.tool && typeof owned?.agentId === 'string' && owned.agentId !== '' ? owned.agentId : undefined
+    if (!row && hasPrefix(id) && (legacyCoordinatorTool || owner !== undefined)) {
+      for (const key of await $.store.keys()) {
+        if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
+        if (!legacyCoordinatorTool && key !== `${STORE_PREFIX}${sid}:${owner}`) continue
+        const stored = await $.store.get(key)
+        const rec = stored && await readStoreState($, key, stored)
+        if (!isRecord(rec)) continue
+        const saved = rec.coordinator?.rows?.[id]
+        if (saved && saved.tool === e.props.tool && rec.coordinator!.received.includes(saved.sourceUuid)) {
+          row = { ...saved, sessionId: sid!, outcome: saved.messageId ? rec.coordinator?.outcomes?.[saved.messageId] : undefined }
+          coordinatorRows.set(id, row)
+          break
+        }
+      }
+    }
+    const questionRow = questionRows.get(id)
+    if (questionRow && e.props.tool === displayTools.codex_question && owned?.tool === e.props.tool && questionRow.session === await sessionId($)) {
+      const { Box, Text, Button } = $.ui.resolve(e)
+      const q = questionRow.question
+      const send = async (cancel = false) => {
+        const run = runs.get(questionRow.agent)
+        if (q.status !== 'pending' || !run || run.ended || run.killed || run.control !== questionRow.control || run.thread !== q.params.threadId || run.turnId !== q.params.turnId) return
+        const result = { answers: Object.fromEntries(q.params.questions.map((v: any) => [v.id, { answers: [questionRow.selected[v.id]] }])) }
+        if (!cancel && q.params.questions.some((v: any) => !v.options.some((o: any) => o.label === questionRow.selected[v.id]))) return
+        q.status = 'submitting'
+        $.ui.invalidate('ui.render')
+        try {
+          await $.fs.write(`${questionRow.control}/response-${q.token}.json`, JSON.stringify({ token: q.token, requestId: q.requestId,
+            threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, ...(cancel ? { cancel: true } : { result }) }))
+        } catch {
+          q.status = 'pending'
+          $.ui.invalidate('ui.render')
+        }
+      }
+      return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: 'Codex question' }),
+        Text({ children: `${q.status}; receipt is not an answer or approval` }),
+        ...q.params.questions.flatMap((v: any) => [Text({ children: v.question }), ...v.options.map((o: any) =>
+          q.status === 'pending' ? Button({ key: `${q.token}:${v.id}:${o.label}`, label: `${questionRow.selected[v.id] === o.label ? '✓ ' : ''}${o.label}: ${o.description}`,
+            onPress: () => {
+              if (q.status === 'pending') {
+                questionRow.selected[v.id] = o.label
+                $.ui.invalidate('ui.render')
+              }
+            } }) : Text({ children: `${o.label}: ${o.description}` }))]),
+        ...(q.status === 'pending' ? [Button({ key: `${q.token}:submit`, label: 'Send selected answers', onPress: () => { void send() } }),
+          Button({ key: `${q.token}:cancel`, label: 'Cancel question', onPress: () => { void send(true) } })] : []),
+        ...(q.result ? [Text({ children: JSON.stringify(q.result) })] : []),
+        ...(q.error ? [Text({ children: JSON.stringify(q.error) })] : []),
+      ] })
+    }
+    const plan = planCards.get(e.props.tool_use_id) ?? saved?.plan
+    if (plan && owned && owned.tool === displayTools.codex_plan && e.props.tool === owned.tool) {
+      const { Box, Text } = $.ui.resolve(e)
+      return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: 'Codex plan (display only)' }),
+        ...(plan.explanation === undefined ? [] : [Text({ children: plan.explanation })]),
+        ...plan.steps.map(s => Text({ children: `${s.status === 'completed' ? '☑' : s.status === 'in_progress' ? '◐' : '☐'} ${s.step}` })),
+        ...(plan.steps.length ? [] : [Text({ children: '(empty checklist)' })]),
+      ] })
+    }
+    if (owned && owned.tool === displayTools.codex_tool && e.props.tool === owned.tool && owned.label) {
+      const label = owned.label
+      // Keep the host's expansion, errors and controls under an owned identity label.
+      const { Box, Text } = $.ui.resolve(e)
+      return next(e).then(child => Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: label }), child] }))
+    }
+    if (row === undefined || e.props.tool !== row.tool) return next(e)
+    let outcome = row.outcome
+    if (row.messageId) {
+      try { outcome = (await $.state.get({ plugin: 'codex-mod', key: 'messageStatus', id: row.messageId })).value ?? outcome } catch {
+        // Saved receipt status remains useful when the live state is absent.
+      }
+    }
+    const { Box, Text } = $.ui.resolve(e)
+    const labels: Record<MessageOutcome['status'], string> = {
+      received: 'Received · pending Codex acknowledgment', pending: 'Pending Codex acknowledgment',
+      accepted: 'Accepted into turn', observed: 'Observed in Codex input', queued: 'Queued for Codex',
+      rejected: 'Rejected', unknown: 'Delivery uncertain',
+    }
+    let status = outcome ? labels[outcome.status] ?? labels.received : labels.received
+    if (outcome?.status === 'queued' && outcome.queuedAfterTurnId) status = 'Queued after turn'
+    if (outcome?.status === 'accepted' && outcome.echoedItemId) status += ' · observed in input'
+    const reason = outcome?.reason ?? outcome?.error?.message ?? (outcome?.status === 'rejected' ? 'no reason supplied' : undefined)
+    if (reason) status += ` · ${reason}`
+    const details = [
+      ['Message', row.messageId ?? outcome?.messageId], ['Turn', outcome?.turnId], ['Accepted turn', outcome?.acceptedTurnId],
+      ['Expected turn', outcome?.expectedTurnId], ['Queued after turn', outcome?.queuedAfterTurnId],
+    ].filter(([, value]) => value !== undefined).map(([label, value]) => `${label}: ${value}`)
+    return Box({ flexDirection: 'column', children: [
+      Text({ weight: 'semibold', children: 'Coordinator' }),
+      Text({ children: row.text }),
+      Text({ children: status }),
+      ...(details.length ? [Text({ dimColor: true, children: details.join(' · ') })] : []),
+    ] })
+  }).catch(($, e, next) => next(e))
+
+  on('session.receive', async ($, e, next) => {
+    const target = e.agentId
+    const ticket = target && nativeSends.get(target)
+    const run = target && runs.get(target)
+    if (target && e.origin.kind === 'coordinator' && !('plugin' in e.origin) &&
+        await reconcileNativeCopy($, target, e.text)) {
+      return { consumed: 'codex-mod: coordinator message already owned by its recorded SendMessage operation' }
+    }
+    if (target && ticket && !ticket.received && run && e.origin.kind === 'coordinator' && !('plugin' in e.origin) && !run.mirror) {
+      const rec = records.get(target)
+      if (rec) {
+        const c = rec.coordinator ??= { received: [], pending: [] }
+        const messageId = `${await sessionId($)}:${ticket.id}`
+        ticket.received = messageId
+        // Native sends are serialized per target; keep their receive order as
+        // well as tool IDs, so identical bodies never identify operations.
+        c.ingress ??= []
+        c.ingress.push({ messageId, senderToolUseId: ticket.id, count: rec.userCount ?? 0 })
+        await saveRecord($, target, rec)
+        await foldIn($, run, { text: e.text, count: rec.userCount ?? 0, messageId, senderToolUseId: ticket.id })
+      }
+    }
+    const result = await next(e)
+    if (target && ticket?.received && result.consumed !== undefined) {
+      const rec = records.get(target)
+      if (rec?.coordinator) {
+        rec.coordinator.ingress = rec.coordinator.ingress?.filter(i => i.messageId !== ticket.received)
+        await saveRecord($, target, rec)
+      }
+    }
+    return result
+  }).catch(($, e, next) => next(e))
 
   // A coordinator's message delivered into an agent's running turn is an
   // attachment row (`queued_command`), promoted to a system turn in the
   // request, so the conversation read never shows it: it is recorded here, as
   // the row is appended, for the next look for messages. Always relayed as is.
   on('session.append', async ($, e, next) => {
+    if (e.agentId === undefined && e.origin.kind === 'model' && e.message.type === 'assistant') {
+      for (const block of e.message.content) {
+        if (block.type !== 'tool_use' || block.name !== 'SendMessage' || typeof block.id !== 'string' ||
+            !object(block.input) || typeof block.input.message !== 'string') continue
+        nativeSources.set(block.id, { uuid: e.uuid, text: block.input.message })
+        while (nativeSources.size > 128) nativeSources.delete(nativeSources.keys().next().value!)
+      }
+    }
     // only the doors a delivery comes in by: a prompt row the API form carries is read there
-    if (e.agentId !== undefined && (e.door === 'attachment' || e.door === 'delivery')) {
-      const text = coordinatorPayload(rowText(e.message.content))
-      if (text !== undefined && text !== '') {
+    if (e.agentId !== undefined && e.origin.kind === 'coordinator' && (e.door === 'attachment' || e.door === 'delivery' || e.door === 'prompt' && runs.has(e.agentId))) {
+      const content = rowText(e.message.content)
+      const text = coordinatorPayload(content) ?? (e.door === 'delivery' || e.door === 'prompt' ? content : undefined)
+      const name = text === undefined ? undefined : await agentName($, e.agentId)
+      if (text !== undefined && text !== '' && name !== undefined) {
+        const loaded = await loadRecord($, e.agentId)
+        const rec = records.get(e.agentId) ?? loaded ?? { ...profileOf(name)!, agentName: name, updatedAt: 0 }
+        // Unknown retired roles need an existing valid record, just as their steps do.
+        if (!isRecord(rec)) return next(e)
+        const coordinator = rec.coordinator ??= { received: [], pending: [] }
+        if (coordinator.received.includes(e.uuid)) return next(e)
+        // Older hosts may append without receive. Reconcile the known native
+        // copy by target FIFO plus its recorded source/tool identity and body.
+        if (await reconcileNativeCopy($, e.agentId, coordinatorPayload(content, true) ?? content, e.uuid)) return next(e)
+        const sender = !('plugin' in e.origin) ? nativeSends.get(e.agentId) : undefined
+        if (sender) {
+          sender.received ??= e.uuid
+          coordinator.sources = Object.fromEntries([...Object.entries(coordinator.sources ?? {}).filter(([id]) => id !== sender.id), [sender.id, e.uuid]].slice(-128))
+        }
+        coordinator.authoritative = true
+        coordinator.received.push(e.uuid)
+        coordinator.pending.push({ uuid: e.uuid, text: coordinatorPayload(content, true) ?? content })
+        const ordinal = sender?.received ? coordinator.ingress?.findIndex(i => i.messageId === sender.received) ?? -1 : 0
+        const ingress = !('plugin' in e.origin) && ordinal >= 0 ? coordinator.ingress?.splice(ordinal, 1)[0] : undefined
+        if (ingress) {
+          const outcome = coordinator.outcomes?.[ingress.messageId]
+          if (outcome) {
+            outcome.sourceUuid = e.uuid
+            await publishOutcome($, outcome)
+          }
+        }
+        // Publish without an await so simultaneous first receipts share state.
+        records.set(e.agentId, rec)
+        await saveRecord($, e.agentId, rec, true)
+        if (rec.mirror) { await mirrorMessages($, rec, runs.get(e.agentId)); return next(e) }
+        $.ui.log(`codex-mod: agent ${e.agentId}: coordinator message delivered mid-run (${e.door}${e.message.name ? ` ${e.message.name}` : ''}, row ${e.uuid})`, { to: 'debug' })
+        const run = runs.get(e.agentId)
+        if (ingress) {
+          for (const f of [...(run?.pendingSteers ?? []), ...(run?.followUps ?? [])]) if (f.messageId === ingress.messageId) f.uuid = e.uuid
+          await saveRecord($, e.agentId, rec, true)
+          return next(e)
+        }
+        const message = { uuid: e.uuid, text }
+        if (run && !run.ended && !run.killed) {
+          await foldIn($, run, { ...message, count: rec.userCount ?? 0 })
+          return next(e)
+        }
         const list = deliveries.get(e.agentId) ?? []
         if (!list.some(d => d.uuid === e.uuid)) list.push({ uuid: e.uuid, text })
         deliveries.set(e.agentId, list.slice(-MAX_DELIVERIES))
@@ -1216,14 +2531,81 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : next(e)))
 
+  on('agent.offer', ($, e, next) => e.agent === `${$.plugin.name}:codex-child` ? { isOffered: false } : next(e))
+    .catch(($, e, next) => e.agent.endsWith(':codex-child') ? { isOffered: false } : next(e))
+
+  on('agent.spawn', async ($, e, next) => {
+    if (e.subagentType !== `${$.plugin.name}:codex-child`) {
+      const name = ownedSpawn($, e)
+      if (!name || e.fork) return next(e)
+      await loadCatalog($)
+      const base = e.resume ? await loadRecord($, e.resume.agentId) : undefined
+      const defaults = base ?? profileOf(name)
+      if (!defaults) return next(e)
+      const spawnEffort = (e as any).effort
+      const native = spawnEffort !== undefined ? spawnEffort : agentEfforts.get(e.tool_use_id)
+      const resolved = resolveProfile(defaults, e.prompt, catalog ?? undefined, native)
+      const tag = (v: unknown) => v === undefined ? 'absent' : typeof v === 'string' && /^[a-z]+$/.test(v) ? v : 'other'
+      $.ui.log(`codex-mod: model selection: spawn keys=${Object.keys(e).sort().join(',')}; spawn.effort=${tag((e as any).effort)}; Agent.effort=${tag(agentEfforts.get(e.tool_use_id))}; resolved=${resolved.profile.model}/${resolved.profile.effort}${resolved.note ? `; ${resolved.note}` : ''}`, { to: 'debug' })
+      // Workflow/resume content is fixed by core. Their row/footer can still
+      // show the selected profile without attempting a forbidden title edit.
+      const description = e.resume || e.workflow ? e.description : modelTitle(resolved.profile, e.description)
+      const launch: ModelLaunch = { session: await sessionId($), toolUseId: e.tool_use_id, type: e.subagentType,
+        parent: e.parentAgentId, description, prompt: e.prompt, profile: resolved.profile,
+        recordProfile: resolved.invalid ? resolveProfile(defaults, '', catalog ?? undefined).profile : resolved.profile, note: resolved.note }
+      modelLaunches.set(e.tool_use_id, launch)
+      try {
+        if (e.resume) await bindModelLaunch($, launch, e.resume.agentId)
+        const result = await next(description === e.description ? e : { ...e, description })
+        if (result.agentId) await bindModelLaunch($, launch, result.agentId)
+        else modelLaunches.delete(e.tool_use_id)
+        return result
+      } catch (err) {
+        modelLaunches.delete(e.tool_use_id)
+        throw err
+      }
+    }
+    const held = heldMirrorSpawn(e, next.origin.plugin)
+    flushMirrorDiagnostics($)
+    if (!held) return { deny: 'codex-mod: unowned or unsupported mirror launch' }
+    if (!await saveMirror($, held)) return { deny: 'codex-mod: mirror launch checkpoint unavailable' }
+    return next(e)
+  }).catch(($, e, next) => {
+    if (!e.subagentType.endsWith(':codex-child')) return next(e)
+    const held = next.error.kind === 're-entry' ? heldMirrorSpawn(e, next.origin.plugin) : undefined
+    if (!held) return { deny: 'codex-mod: mirror launch failed closed' }
+    // The ancestor's spawn observer is inherited by grandchildren. Its
+    // pure guard can admit only another held observer, without engine APIs.
+    held.hostToolId = e.tool_use_id
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    flushMirrorDiagnostics($)
+    if (!e.agentId) return next(e)
+    await hydrateMirrors($)
+    const held = [...mirrors.values()].find(m => m.token === e.text && m.launch === 'launching')
+    if (held) await bindMirror($, held, e.agentId)
+    else await bindPendingModelLaunch($, e.agentId, e.text)
+    return next(e)
+  })
+
   // A turn that ends while its Codex run is still active (interrupted, an
   // error, maxTurns reached) kills the child.
   on('turn.complete', async ($, e, next) => {
     const run = e.agentId === undefined ? undefined : runs.get(e.agentId)
+    const mirror = e.agentId ? (await loadRecord($, e.agentId))?.mirror : undefined
+    if (mirror && !run && e.isAborted && !['completed', 'failed', 'aborted'].includes(mirror.state)) await stopMirror($, mirror)
+    if (e.agentId && e.isAborted) await stopMirrorDescendants($, e.agentId)
+    if (run?.mirror && !e.isAborted && (e.reason === 'answer' || (e.reason as string) === 'end_turn')) {
+      await killRun(run)
+      return next(e)
+    }
     if (run !== undefined) {
       $.ui.log(`codex-mod: agent ${run.agentId} turn ended (${e.reason}) while Codex ran; killing it`, { to: 'debug' })
       await stopRun($, run)
     }
+    if (e.agentId) dropAnswers(e.agentId)
     // deliveries to an agent that is not ours are nobody's
     if (e.agentId !== undefined && known.has(e.agentId) && known.get(e.agentId) === undefined) deliveries.delete(e.agentId)
     return next(e)
@@ -1239,6 +2621,7 @@ export const register: Register = (on, options) => {
       }
       return yield* next(e)
     }
+    await bindPendingModelLaunch($, e.agentId)
     let name: string | undefined
     try {
       name = await agentName($, e.agentId)
@@ -1248,22 +2631,53 @@ export const register: Register = (on, options) => {
       if (name === undefined) throw err
       known.set(e.agentId, name)
     }
-    if (name === undefined) return yield* next(e)
-    if (profileOf(name) === undefined) {
-      return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not defined by this version of the plugin`, handbackFor(e.agentId, undefined))
+    if (name === undefined || name === 'codex-child') return yield* next(e)
+    if (profileOf(name) === undefined && await loadRecord($, e.agentId) === undefined) {
+      return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not declared by this project (.claude/codex-mod.json) or this version of the plugin`, handbackFor(e.agentId, undefined))
     }
     budgets.set(next.signal, () => next.budget.remainingMs)
-    return yield* answerWithCodex($, e, next.signal, config, name)
+    return yield* withCoordinatorMessages($, e, answerWithCodex($, e, next.signal, config, name))
   }).catch(async function* ($, e, next) {
     if (next.called) return yield* next(e)
     const agentId = e.agentId
     const name = agentId === undefined ? undefined : (known.get(agentId) ?? records.get(agentId)?.agentName)
+    if (name === 'codex-child') {
+      if (next.error.kind === 're-entry') return yield* next(e)
+      return yield* failStep(e, name, 'codex failed: mirror dispatch failed closed', false)
+    }
     if (agentId === undefined || name === undefined) return yield* next(e)
     const run = runs.get(agentId)
     if (run !== undefined) void killRun(run)
     const rec = records.get(agentId)
     if (rec !== undefined) rec.handedBack = true
     return yield* failStep(e, name, `codex failed: ${failureText(next.error)}`, handbackFor(agentId, undefined))
+  })
+
+  // A spawning hook is skipped by the loop it creates. Separate consumers
+  // for two source child generations keep grandchildren intercepted too;
+  // these dispatch depths do not assert native host nesting.
+  for (const depth of [2, 3]) on('turn.step', { agentId: depth === 2 ? /.+/ : /[\s\S]+/ }, async function* ($, e, next) {
+    if (!e.agentId) return yield* next(e)
+    const saved = await loadRecord($, e.agentId)
+    if (saved?.mirror) known.set(e.agentId, 'codex-child')
+    if (await agentName($, e.agentId) !== 'codex-child') return yield* next(e)
+    const rec = await loadRecord($, e.agentId)
+    if (!rec?.mirror || !isMirror(rec.mirror) || ![2, 3].includes(rec.mirror.depth)) return yield* failStep(e, 'codex-child', 'codex failed: mirror identity unavailable; no run launched', false)
+    if (rec.mirror.depth !== depth) return yield* next(e)
+    budgets.set(next.signal, () => next.budget.remainingMs)
+    return yield* withCoordinatorMessages($, e, answerMirror($, e, next.signal, rec))
+  }).catch(async function* ($, e, next) {
+    // No engine APIs here: a failure must never fall through to a provider.
+    const mirror = e.agentId ? records.get(e.agentId)?.mirror : undefined
+    if (mirror && mirror.depth !== depth && [2, 3].includes(mirror.depth) && next.error.kind === 're-entry') return yield* next(e)
+    if (e.agentId && (known.get(e.agentId) === 'codex-child' || mirror)) {
+      if (mirror) mirror.state = 'failed'
+      const run = runs.get(e.agentId)
+      if (run) void killRun(run)
+      return yield* failStep(e, 'codex-child', 'codex failed: mirror consumer failed closed; no run launched', false)
+    }
+    if (e.agentId && !known.has(e.agentId)) return yield* failStep(e, 'codex-child', 'codex failed: mirror ownership unavailable', false)
+    return yield* next(e)
   })
 }
 
@@ -1385,7 +2799,8 @@ async function pruneRuns($: EngineInterface, ttlMs: number): Promise<void> {
     const now = await $.clock.now()
     for (const ent of await $.fs.list(dir)) {
       if (ent.kind !== 'dir') continue
-      const st = await $.fs.stat(`${dir}/${ent.name}`)
+      // Recovery files are updated in place; their directory mtime may be old.
+      const st = await $.fs.stat(`${dir}/${ent.name}${ent.name.startsWith('state-') ? '/record.json' : ''}`)
       if (!(now - st.mtimeMs < ttlMs)) await $.process.run(['rm', '-rf', `${dir}/${ent.name}`], { timeoutMs: 10000 })
     }
   } catch (err) {
@@ -1393,48 +2808,156 @@ async function pruneRuns($: EngineInterface, ttlMs: number): Promise<void> {
   }
 }
 
-/** Registers the generic agent and each enabled role whose model Codex lists. */
+/** Reads relative to the session cwd, only at registration; a missing file is normal. */
+async function loadProjectRoles($: EngineInterface, config: Config): Promise<void> {
+  projectRoles = new Map()
+  if (!config.projectRoles) return
+  let text: string
+  try {
+    text = await $.fs.read(PROJECT_FILE)
+  } catch {
+    // The file is optional; a failed read must leave the generic agent usable.
+    return
+  }
+  const parsed = parseProjectRoles(text, { allowFullAccess: config.allowProjectFullAccess })
+  for (const w of parsed.warnings) $.ui.log(`codex-mod: ${PROJECT_FILE}: ${w}`, { to: 'debug' })
+  projectRoles = new Map(Object.entries(parsed.roles).filter(([name, role]) => {
+    const why = checkProfile(catalog ?? undefined, role.model, role.effort)
+    if (why === undefined) return true
+    $.ui.log(`codex-mod: role ${name} not registered: ${why}`, { to: 'debug' })
+    return false
+  }))
+  if (parsed.invalid) {
+    const sid = await sessionId($)
+    if (projectNotified.has(sid)) return
+    projectNotified.add(sid)
+    const notice = `codex-mod: ${PROJECT_FILE}: ${parsed.warnings[0]}; the generic codex agent is still available`
+    const sent = await $.ui.notify(notice).catch(() => ({ isSent: false as const }))
+    if (!sent.isSent) {
+      try {
+        $.ui.toast(notice, { timeoutMs: 10000 })
+      } catch {
+        // UI availability must not prevent generic agent registration either.
+      }
+    }
+  }
+}
+
+/**
+ * The API owns full names. These tools have no executor, only the guards above.
+ * Inputs must not shadow the host's flat envelope (tool, tool_use_id,
+ * agentId, requestMeta, consent) or tool-check fields.
+ */
+async function registerDisplayTools($: EngineInterface): Promise<void> {
+  for (const name of ['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'] as const) {
+    if (displayTools[name]) continue
+    const tool = name === 'codex_tool' || name === 'codex_question'
+    const coordinator = name === 'coordinator_message'
+    const registered = await $.tool.register({
+      name,
+      description: name === 'codex_question'
+        ? 'Display-only question controls for a pending Codex question. Only an explicit human answer or cancel submits a response. Never call this tool: all other calls are refused and it performs no work.'
+        : `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
+      ...(coordinator || name === 'codex_question' ? { isDeferred: false } : {}),
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: coordinator ? { sourceUuid: { type: 'string' }, text: { type: 'string' } } : tool ? { server: { type: 'string' }, name: { type: 'string' }, arguments: {} } : {
+          explanation: { type: 'string' },
+          steps: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { step: { type: 'string' }, status: { enum: ['pending', 'in_progress', 'completed'] } }, required: ['step', 'status'] } },
+        },
+        required: coordinator ? ['sourceUuid', 'text'] : tool ? ['server', 'name', 'arguments'] : ['steps'],
+      },
+    })
+    displayTools[name] = registered.tool
+    displayNames.add(registered.tool)
+  }
+  if (!statusTool) {
+    const registered = await $.tool.register({ name: 'codex_message_status', isDeferred: false,
+      description: 'Read a Codex coordinator message outcome. Use the target agent ID and message ID, source UUID or SendMessage tool use ID. Never sends messages or starts work.',
+      inputSchema: { type: 'object', additionalProperties: false,
+        properties: { targetAgentId: { type: 'string' }, messageId: { type: 'string' } }, required: ['targetAgentId', 'messageId'] } })
+    statusTool = registered.tool
+  }
+}
+
+/** Registers generic, project and optional catalog types; all use haiku as
+ * the host execution placeholder, never a GPT provider model ID. */
 async function registerAgents($: EngineInterface, config: Config): Promise<boolean> {
+  // without the display tools their rows degrade to text; the agents must still register
+  await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
+  await loadProjectRoles($, config)
+  await loadCapabilities($, true)
   let failed = false
   const list = catalog ?? undefined
   const models = list !== undefined ? ` Codex models available here: ${catalogLine(list)}.` : ''
   const override = ' Start the prompt with a line "codex-model: <model>" and/or "codex-effort: <effort>" to override the defaults.'
-  const specs: { name: string; description: string }[] = []
+  const specs: { name: string; description: string; profile?: Profile }[] = []
   const g = config.generic
   specs.push({
     name: 'codex',
     description: `${GENERIC_SUMMARY} Defaults: ${g.model || list?.[0]?.slug || FALLBACK_MODEL} at ${g.effort} reasoning, sandbox ${g.sandbox}.${override}${models}`,
   })
-  for (const name of config.roles) {
-    const r = ROLES[name]!
-    const why = checkProfile(list, r.model, r.effort)
-    if (why !== undefined) {
-      $.ui.log(`codex-mod: role ${name} not registered: ${why}`, { to: 'debug' })
+  for (const [name, r] of projectRoles) {
+    specs.push({ name, description: `${r.description} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox (declared by this project).${override}${models}` })
+  }
+  modelProfiles = new Map()
+  if (config.modelAgents) for (const info of list ?? []) {
+    const alias = info.slug.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64)
+    if (projectRoles.has(info.slug) || projectRoles.has(alias)) {
+      $.ui.log(`codex-mod: model agent ${info.slug} not registered: project role wins name collision`, { to: 'debug' })
       continue
     }
-    specs.push({ name, description: `${r.summary} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox.${override}${models}` })
+    if (['codex', 'codex-child'].includes(info.slug)) continue
+    specs.push({ name: info.slug, profile: { model: info.slug, effort: info.defaultEffort || info.efforts[0] || FALLBACK_EFFORT, sandbox: g.sandbox },
+      description: `OpenAI Codex ${info.slug}; pass effort to choose reasoning (${info.efforts.join(', ') || 'not reported'})` })
   }
+  specs.push({ name: 'codex-child', description: 'Internal observation loop for an existing Codex child. Never dispatch directly.' })
   for (const s of specs) {
     try {
-      await $.agent.register({
+      const tools = [...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (config.richRows || tool === 'Agent' && config.nestedAgents || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)]
+      const spec = {
         name: s.name,
         description: s.description,
         prompt: PLACEHOLDER_PROMPT,
         // the tools Codex's actions are drawn as must be the agent's own, or
         // the engine refuses them before the tool.call guard answers them
-        tools: ['Read', 'Bash', 'Edit', 'Write'],
+        tools,
         model: 'haiku',
         effort: 'low',
         maxTurns: 400,
         background: true,
         omitClaudeMd: true,
-      })
+      }
+      try {
+        await $.agent.register(spec)
+      } catch (err) {
+        // 2.1.302 rejects dots at the API boundary, before registration hooks.
+        // Try the literal slug first so a future host can support exact names.
+        const alias = s.name.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64)
+        if (!s.profile || alias === s.name || !alias || modelProfiles.has(alias) || ['codex', 'codex-child'].includes(alias)) throw err
+        $.ui.log(`codex-mod: model type ${s.name} refused (${errText(err)}); registering ${alias} for Codex ${s.profile.model}`, { to: 'debug' })
+        spec.name = alias
+        await $.agent.register(spec)
+      }
+      if (s.profile) modelProfiles.set(spec.name, s.profile)
+      agentTools.set(spec.name, new Set(tools))
     } catch (err) {
       failed = true
       $.ui.log(`codex-mod: agent ${s.name} not registered: ${errText(err)}`, { to: 'debug' })
     }
   }
   return !failed
+}
+
+async function loadCapabilities($: EngineInterface, refresh = false): Promise<void> {
+  if (availableTools !== undefined && !refresh) return
+  availableTools = new Set()
+  try {
+    availableTools = new Set((await $.tool.list()).map(tool => tool.name))
+  } catch (err) {
+    $.ui.log(`codex-mod: tool availability unknown (${errText(err)}); native rows use display fallback`, { to: 'debug' })
+  }
+  todoWriteAvailable = cfg.richRows && availableTools.has('TodoWrite')
 }
 
 /**
@@ -1448,12 +2971,22 @@ async function agentName($: EngineInterface, agentId: string): Promise<string | 
   try {
     list = await $.agent.list()
   } catch {
-    list = await $.agent.list()
+    try { list = await $.agent.list() } catch {
+      const rec = await loadRecord($, agentId)
+      if (rec !== undefined) {
+        known.set(agentId, rec.agentName)
+        return rec.agentName
+      }
+      throw new Error('agent ownership unavailable')
+    }
   }
   const info = list.find(a => a.id === agentId)
   if (info === undefined) {
     // not listed (dropped already): one we ran before still has its record
-    return (await loadRecord($, agentId))?.agentName
+    const rec = await loadRecord($, agentId)
+    if (rec === undefined) throw new Error('agent ownership unavailable')
+    known.set(agentId, rec.agentName)
+    return rec.agentName
   }
   const prefix = `${$.plugin.name}:`
   const mine = info.type.startsWith(prefix) ? info.type.slice(prefix.length) : undefined
@@ -1463,27 +2996,62 @@ async function agentName($: EngineInterface, agentId: string): Promise<string | 
 
 /**
  * Whether this agent's report goes through SubagentHandback: the option, else
- * the conversation's latest signal, else the stored one; auto defaults to the
- * tool (a "not active" result then re-delivers the same answer as text).
+ * the conversation's latest signal, else the stored one. Unknown reads still
+ * default to the tool; a complete API read without a signal defaults to text.
  */
-function handbackFor(agentId: string, signal?: 'tool' | 'text'): boolean {
-  if (cfg.handbackMode === 'tool') return true
-  if (cfg.handbackMode === 'text') return false
-  return (signal ?? records.get(agentId)?.handbackLock) !== 'text'
+function handbackFor(agentId: string, signal?: Reading['signal'], source: ConversationSource = 'denied', sessionInactive = false): boolean {
+  return chooseHandback(cfg.handbackMode, source, signal, records.get(agentId)?.handbackLock, sessionInactive)
 }
 
 /** The agent's conversation, meta rows included (API form), else the rows; `denied` when neither reads. */
-async function conversation($: EngineInterface, agentId: string): Promise<{ items: ConvItem[]; denied?: string }> {
+async function conversation($: EngineInterface, agentId: string): Promise<{ items: ConvItem[]; source: ConversationSource; denied?: string }> {
   const api = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
-  if (Array.isArray(api)) return { items: itemsFromApi(api) }
+  if (Array.isArray(api)) return { items: itemsFromApi(api), source: 'api' }
   const rows = await $.session.messages({ agentId })
-  if (Array.isArray(rows)) return { items: itemsFromRows(rows) }
-  return { items: [], denied: rows.deny }
+  if (Array.isArray(rows)) return { items: itemsFromRows(rows), source: 'rows' }
+  return { items: [], source: 'denied', denied: rows.deny }
 }
 
 /** Old records kept follow-ups as plain strings. */
 const followUpsOf = (rec: AgentRecord | undefined): FollowUp[] =>
   (rec?.followUps ?? []).map(f => (typeof f === 'string' ? { text: f, count: rec?.userCount ?? 0 } : f))
+
+/** Only a native success pin confirms which local recipient was queued. */
+function nativeSendPin(answer: { result?: unknown; text?: string }): string | undefined {
+  let result = answer.result
+  if (!object(result) && typeof answer.text === 'string') {
+    try { result = JSON.parse(answer.text) } catch { return }
+  }
+  return object(result) && result.success === true && object(result.pin) && typeof result.pin.id === 'string' ? result.pin.id : undefined
+}
+
+/** Receive order is per owned target and all matching native sends are
+ * serialized. Text is an integrity check, never the identity of an operation. */
+async function reconcileNativeCopy($: EngineInterface, agentId: string, text: string, deliveryUuid?: string): Promise<boolean> {
+  const rec = records.get(agentId) ?? await loadRecord($, agentId)
+  const c = rec?.coordinator
+  const head = c?.ingress?.[0]
+  const o = head && c?.outcomes?.[head.messageId]
+  if (!rec || !c || !head?.fromSend || head.text !== text || !o || o.senderToolUseId !== head.senderToolUseId) return false
+  c.ingress!.shift()
+  if (deliveryUuid) {
+    c.received.push(deliveryUuid)
+    c.sources = Object.fromEntries([...Object.entries(c.sources ?? {}), [deliveryUuid, head.messageId]].slice(-128))
+    o.deliveryUuid = deliveryUuid
+  }
+  await saveRecord($, agentId, rec)
+  $.ui.log(`codex-mod: steer v2 native copy reconciled target=${agentId} message=${head.messageId}${deliveryUuid ? ` row=${deliveryUuid}` : ''}`, { to: 'debug' })
+  return true
+}
+
+async function nativeTarget($: EngineInterface, to: unknown): Promise<string | undefined> {
+  const value = typeof to === 'string' ? to : object(to) && typeof to.agentId === 'string' ? to.agentId : undefined
+  if (!value) return
+  const list = await $.agent.list()
+  const matches = list.filter(a => a.id === value || a.name === value)
+  if (matches.length !== 1) return
+  return await agentName($, matches[0]!.id) !== undefined ? matches[0]!.id : undefined
+}
 
 /** The text of a row's blocks: API text blocks, or an attachment's recorded rendering (`{ content }`). */
 const rowText = (content: unknown): string =>
@@ -1492,20 +3060,20 @@ const rowText = (content: unknown): string =>
 /**
  * The coordinator deliveries recorded for the agent, taken (each once) as
  * follow-ups under `count`, the count of the message they interrupted; one
- * whose text the transcript shows as the newest message anyway is dropped.
+ * identified by source UUID rather than by body text.
  */
-function takeDeliveries(agentId: string, count: number, shown?: string): FollowUp[] {
+function takeDeliveries(agentId: string, count: number): FollowUp[] {
   const list = deliveries.get(agentId)
   if (list === undefined || list.length === 0) return []
   deliveries.delete(agentId)
-  return list.filter(d => d.text !== shown).map(d => ({ text: d.text, count, uuid: d.uuid }))
+  return list.map(d => ({ ...d, count }))
 }
 
 /** Two follow-ups are the same message: by row for a delivery, by count for a transcript message. */
-const sameFollowUp = (a: FollowUp) => (b: FollowUp) => (a.uuid !== undefined || b.uuid !== undefined ? a.uuid === b.uuid : a.count === b.count)
+const sameFollowUp = (a: FollowUp) => (b: FollowUp) => a.messageId && b.messageId ? a.messageId === b.messageId : (a.uuid !== undefined || b.uuid !== undefined ? a.uuid === b.uuid : a.count === b.count)
 
 /** The file id of a steer: the message count, zero-padded so the runner's name order is arrival order; a delivery adds its row id. */
-const steerFileId = (f: FollowUp) => (f.uuid === undefined ? steerId(f.count) : `${steerId(f.count)}-${f.uuid.replace(/[^A-Za-z0-9_-]/g, '_')}`)
+const steerFileId = (f: FollowUp) => (f.uuid === undefined ? f.senderToolUseId ? `${steerId(f.count)}-${f.senderToolUseId.replace(/[^A-Za-z0-9_-]/g, '_')}` : steerId(f.count) : `${steerId(f.count)}-${f.uuid.replace(/[^A-Za-z0-9_-]/g, '_')}`)
 
 // ---- records ---------------------------------------------------------------
 
@@ -1523,13 +3091,36 @@ const isRecord = (v: unknown): v is AgentRecord =>
   typeof v === 'object' && v !== null && typeof (v as any).model === 'string' && typeof (v as any).effort === 'string' &&
   typeof (v as any).sandbox === 'string' && typeof (v as any).agentName === 'string'
 
+type HandbackMemo = { handbackLock: 'text'; updatedAt: number }
+const isHandbackMemo = (v: unknown): v is HandbackMemo =>
+  typeof v === 'object' && v !== null && (v as any).handbackLock === 'text' && typeof (v as any).updatedAt === 'number'
+
+/** A failed handback teaches later agents in this session; explicit agent signals still win. */
+async function sessionHandbackInactive($: EngineInterface, failed: boolean): Promise<boolean> {
+  try {
+    const key = sessionHandbackKey(await sessionId($))
+    if (failed) {
+      await writeStoreState($, key, { handbackLock: 'text', updatedAt: await $.clock.now() })
+      return true
+    }
+    return isHandbackMemo(await $.store.get(key))
+  } catch (err) {
+    $.ui.log(`codex-mod: session handback memo failed: ${errText(err)}`, { to: 'debug' })
+    return failed
+  }
+}
+
 /** The agent's record: memory first, then `$.store` (this session's key, then any session's). */
 async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRecord | undefined> {
   const held = records.get(agentId)
   if (held !== undefined) return held
   try {
     const sid = await sessionId($)
-    const own = await $.store.get(recordKey(sid, agentId))
+    const key = recordKey(sid, agentId)
+    const stored = await $.store.get(key)
+    const own = isRecord(stored) ? await readStoreState($, key, stored) as AgentRecord : stored
+    // A receipt may have published a record while this read was in flight.
+    if (records.has(agentId)) return records.get(agentId)
     if (isRecord(own)) {
       records.set(agentId, own)
       $.ui.log(`codex-mod: agent ${agentId} record reloaded from the store (thread=${own.thread ?? 'none'})`, { to: 'debug' })
@@ -1539,48 +3130,69 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
     let best: { key: string; rec: AgentRecord } | undefined
     for (const key of await $.store.keys()) {
       if (!key.startsWith(STORE_PREFIX) || !key.endsWith(`:${agentId}`)) continue
-      const v = await $.store.get(key)
+      const stored = await $.store.get(key)
+      const v = isRecord(stored) ? await readStoreState($, key, stored) as AgentRecord : stored
       if (isRecord(v) && (best === undefined || v.updatedAt > best.rec.updatedAt)) best = { key, rec: v }
     }
     if (best !== undefined) {
+      if (records.has(agentId)) return records.get(agentId)
       records.set(agentId, best.rec)
-      await $.store.set(recordKey(sid, agentId), best.rec)
-      if (best.key !== recordKey(sid, agentId)) await $.store.delete(best.key)
+      if (await writeStoreState($, recordKey(sid, agentId), best.rec) && best.key !== recordKey(sid, agentId)) await $.store.delete(best.key)
       $.ui.log(`codex-mod: agent ${agentId} record moved from ${best.key}`, { to: 'debug' })
       return best.rec
     }
   } catch (err) {
     $.ui.log(`codex-mod: store read failed: ${errText(err)}`, { to: 'debug' })
   }
-  return undefined
+  return records.get(agentId)
 }
 
-async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord): Promise<void> {
+async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord, currentOnly = false): Promise<boolean> {
+  let now: number | undefined
   try {
-    rec.updatedAt = await $.clock.now()
+    now = await $.clock.now()
   } catch {
     // keep the previous stamp
   }
+  // Receipt-only writes must not replace newer launch/thread/handback fields.
+  if (currentOnly) rec = records.get(agentId) ?? rec
+  if (now !== undefined) rec.updatedAt = now
+  // Merge after the await: a first receipt can arrive while a copied launch
+  // record is waiting for its timestamp, before it shares the receipt state.
+  rec.coordinator = records.get(agentId)?.coordinator ?? rec.coordinator
   records.set(agentId, rec)
   try {
-    await $.store.set(recordKey(await sessionId($), agentId), rec)
+    const key = recordKey(await sessionId($), agentId)
+    return await writeStoreState($, key, records.get(agentId) ?? rec)
   } catch (err) {
     $.ui.log(`codex-mod: store write failed: ${errText(err)}`, { to: 'debug' })
+    return false
   }
 }
 
-/** Deletes records not updated for `ttlMs` (and malformed ones). */
+/** Deletes agent records and session handback memos not updated for `ttlMs` (and malformed ones). */
 async function pruneRecords($: EngineInterface, ttlMs: number): Promise<void> {
   try {
     const now = await $.clock.now()
     for (const key of await $.store.keys()) {
-      if (!key.startsWith(STORE_PREFIX)) continue
+      if (!key.startsWith(STORE_PREFIX) && !key.startsWith('mirror:') && !(key.startsWith(SESSION_PREFIX) && key.endsWith(':handback'))) continue
       const v = await $.store.get(key)
-      if (!isRecord(v) || !(now - v.updatedAt < ttlMs)) await $.store.delete(key)
+      const valid = key.startsWith(STORE_PREFIX) ? isRecord(v) : key.startsWith('mirror:') ? isMirror(v) : isHandbackMemo(v)
+      if (!valid || !(now - (v as AgentRecord | HandbackMemo).updatedAt < ttlMs)) {
+        if (key.startsWith(STORE_PREFIX)) {
+          const agent = key.slice(key.lastIndexOf(':') + 1)
+          dropAnswers(agent)
+          if (!runs.has(agent)) records.delete(agent)
+        }
+        await $.store.delete(key).catch(err => $.ui.log(`codex-mod: store prune failed for ${key}: ${errText(err)}`, { to: 'debug' }))
+      } else if (!v.cachedState && JSON.stringify(v) !== JSON.stringify(compactStoreState(v))) {
+        await writeStoreState($, key, v, JSON.stringify(v).length)
+      }
     }
   } catch (err) {
     $.ui.log(`codex-mod: store prune failed: ${errText(err)}`, { to: 'debug' })
   }
+  await flushStoreMigrations($)
 }
 
 // ---- steps -----------------------------------------------------------------
@@ -1611,10 +3223,13 @@ async function* answerWithCodex(
   const conv = await conversation($, agentId)
   const rd = readConversation(conv.items)
   const rec = await loadRecord($, agentId)
+  if (rec?.recoveryUnavailable) {
+    return yield* handBack($, e, 'codex failed: recovery state unavailable', '', handbackFor(agentId, rd.signal, conv.source))
+  }
   if (rec !== undefined) {
     rec.followUps = followUpsOf(rec)
     // a coordinator delivery that came after the run ended runs as a follow-up
-    const arrived = takeDeliveries(agentId, rd.latest?.count ?? rec.userCount ?? 0, rd.latest?.text).filter(d => !rec.followUps!.some(sameFollowUp(d)))
+    const arrived = takeDeliveries(agentId, rd.latest?.count ?? rec.userCount ?? 0).filter(d => !rec.followUps!.some(sameFollowUp(d)))
     if (arrived.length > 0) {
       rec.followUps.push(...arrived)
       await saveRecord($, agentId, rec)
@@ -1627,7 +3242,9 @@ async function* answerWithCodex(
       await saveRecord($, agentId, rec)
     }
   }
-  const handback = handbackFor(agentId, rd.signal)
+  const sessionInactive = cfg.handbackMode === 'auto' && await sessionHandbackInactive($, rd.handbackFailed)
+  const handback = handbackFor(agentId, rd.signal, conv.source, sessionInactive)
+  $.ui.log(`codex-mod: agent ${agentId}: handback route ${handback ? 'tool' : 'text'} (mode ${cfg.handbackMode}, ${conv.source} read, signal ${rd.signal ?? 'none'}, lock ${rec?.handbackLock ?? 'none'}, session not active ${sessionInactive})`, { to: 'debug' })
   const fallback = (): AgentRecord => rec ?? { ...profileOf(name)!, agentName: name, updatedAt: 0 }
 
   // 1. Our SubagentHandback came back "not active": the same answer again as text, no Codex run.
@@ -1670,7 +3287,7 @@ async function* answerWithCodex(
 
   // 3. Only a genuinely new user/coordinator message launches Codex. Engine
   // nudges and reminders are never tasks (cleanText leaves them empty).
-  const isNew = latest !== undefined && (rec?.lastTask === undefined || latest.text !== rec.lastTask || (rec.userCount !== undefined && latest.count > rec.userCount))
+  const isNew = latest !== undefined && !(latest.coordinator && rec?.coordinator?.authoritative) && (!rec || !matchesIdentity(rec, 'lastTask', latest.text) || (rec.userCount !== undefined && latest.count > rec.userCount))
   if (isNew) {
     const base = fallback()
     // a queued follow-up that is this very message runs now, not again later
@@ -1734,41 +3351,78 @@ async function noteFollowUp($: EngineInterface, run: Run): Promise<void> {
   const latest = readConversation(conv.items).latest
   const rec = records.get(run.agentId)
   const fresh: FollowUp[] = []
-  let shown: string | undefined
   if (latest !== undefined && !isCompactionText(latest.text)) {
     const seen = rec?.userCount
     if (seen !== undefined ? latest.count > seen : latest.text !== rec?.lastTask) {
-      fresh.push(latest)
-      shown = latest.text
+      if (!(latest.coordinator && rec?.coordinator?.authoritative)) fresh.push(latest)
     }
   }
-  fresh.push(...takeDeliveries(run.agentId, latest?.count ?? rec?.userCount ?? 0, shown))
+  fresh.push(...takeDeliveries(run.agentId, latest?.count ?? rec?.userCount ?? 0))
   for (const f of fresh) {
     const same = sameFollowUp(f)
+    if (f.uuid && Object.values(rec?.coordinator?.outcomes ?? {}).some(o => o.sourceUuid === f.uuid)) continue
     if (run.followUps.some(same) || run.pendingSteers.some(same) || followUpsOf(rec).some(same)) continue
     await foldIn($, run, f)
   }
 }
 
-/** Steers one follow-up into an app-server run (a steer file), else keeps it for after the run, with its `↪` note. */
+/** Persist an outcome and redraw its owned receipt without touching transcript rows. */
+async function recordOutcome($: EngineInterface, agentId: string, o: MessageOutcome): Promise<boolean> {
+  const rec = records.get(agentId) ?? await loadRecord($, agentId)
+  if (!rec) return false
+  const c = rec.coordinator ??= { received: [], pending: [] }
+  const previous = c.outcomes?.[o.messageId]
+  // A delayed pending reply must not overwrite a stdout acknowledgment.
+  if (previous && !['received', 'pending'].includes(previous.status) && ['received', 'pending'].includes(o.status)) return true
+  const outcome = { ...previous, ...o, sourceUuid: o.sourceUuid ?? previous?.sourceUuid,
+    ...(previous?.status === 'queued' && o.status === 'rejected' ? { status: 'queued' as const, queuedAfterTurnId: previous.queuedAfterTurnId } : {}) }
+  c.outcomes = Object.fromEntries([...Object.entries(c.outcomes ?? {}).filter(([id]) => id !== o.messageId), [o.messageId, outcome]].slice(-128))
+  const saved = await saveRecord($, agentId, rec)
+  await publishOutcome($, outcome)
+  return saved
+}
+
 async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> {
-  // override lines cannot change a running turn's model: the rest is steered
+  const rec = records.get(run.agentId)
+  const messageId = f.messageId ?? f.uuid ?? `cm-${Array.from({ length: 4 }, () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0')).join('')}`
+  f.messageId = messageId
+  const previous = rec?.coordinator?.outcomes?.[messageId]
+  if (previous) return
+  const o: MessageOutcome = { id: steerFileId(f), messageId, sourceUuid: f.uuid, sessionId: run.sessionId, agentId: run.agentId,
+    senderToolUseId: f.senderToolUseId ?? nativeSends.get(run.agentId)?.id, runId: run.control, threadId: run.thread, expectedTurnId: run.turnId,
+    status: 'received', receivedAt: Date.now() }
+  // Journal ownership before any transport call, including the exec FIFO.
+  if (rec && !f.uuid && !o.senderToolUseId) { rec.userCount = f.count; rec.lastTask = f.text }
+  if (!await recordOutcome($, run.agentId, o)) {
+    await recordOutcome($, run.agentId, { ...o, status: 'unknown', reason: 'receipt checkpoint unavailable; no submission' })
+    return
+  }
   const text = parseOverrides(f.text).rest.trim()
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
+    run.pendingSteers.push(f)
     try {
-      await $.fs.write(`${run.control}/steer-${steerFileId(f)}.json`, JSON.stringify({ text }))
-      run.pendingSteers.push(f)
-      $.ui.log(`codex-mod: agent ${run.agentId}: message received mid-run; steered into the running turn`, { to: 'debug' })
-      return
-    } catch (err) {
-      $.ui.log(`codex-mod: agent ${run.agentId}: steer not written (${errText(err)}); it runs after this one`, { to: 'debug' })
+      const outcome = await controlRequest($, run.control, '/messages', { ...o, id: steerFileId(f), text: roleTask(run.name, text, run.policy),
+        ...(run.mirror ? { threadId: run.mirror.thread } : {}) }, `steer-${steerFileId(f)}.json`)
+      if (outcome) await handle($, run, { kind: 'steer', id: String(outcome.id), accepted: ['accepted', 'observed'].includes(outcome.status), reason: outcome.reason, outcome })
+      else await recordOutcome($, run.agentId, { ...o, status: 'pending' })
+    } catch {
+      await recordOutcome($, run.agentId, { ...o, status: 'unknown', reason: 'control outcome unavailable; no retry' })
     }
+    return
   }
   run.followUps.push(f)
-  if (run.transport !== 'app-server') {
-    if (!run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote('queued') })
-    run.queuedNoted = true
-  } else run.queue.push({ kind: 'note', text: steerNote('finished') })
+  if (rec) rec.followUps = [...followUpsOf(rec).filter(f => !run.followUps.some(sameFollowUp(f))), ...run.followUps]
+  const saved = rec && await saveRecord($, run.agentId, rec)
+  await recordOutcome($, run.agentId, { ...o, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId,
+    reason: saved ? undefined : 'follow-up checkpoint unavailable; no retry' })
+  if (!saved) {
+    run.followUps = run.followUps.filter(v => !sameFollowUp(f)(v))
+    if (rec?.followUps) rec.followUps = rec.followUps.filter(v => !sameFollowUp(f)(v))
+    run.queue.push({ kind: 'note', text: '↪ follow-up checkpoint unavailable; outcome unknown, no automatic retry' })
+    return
+  }
+  if (run.transport === 'app-server' || !run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote(run.transport === 'app-server' ? 'finished' : 'queued') })
+  run.queuedNoted = true
   $.ui.log(`codex-mod: agent ${run.agentId}: follow-up received mid-run; it runs after this one`, { to: 'debug' })
 }
 
@@ -1787,19 +3441,18 @@ async function* startRun(
   // the row id of a coordinator delivery: the transcript's newest user message
   // stays the record's task, so that message is not judged new after this run
   delivery?: string,
+  retry?: { profile: Profile; key: string; note: string },
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const agentId = e.agentId!
+  if (base.recoveryUnavailable) return yield* handBack($, e, 'codex failed: recovery state unavailable', '', handback)
   await loadCatalog($)
-  const list = catalog ?? undefined
-  const o = parseOverrides(rawTask)
-  const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
+  const resolved = retry ? { profile: retry.profile, rest: parseOverrides(rawTask).rest, invalid: checkProfile(catalog ?? undefined, retry.profile.model, retry.profile.effort) }
+    : resolveProfile(base, rawTask, catalog ?? undefined)
   const lastTask = delivery !== undefined && base.lastTask !== undefined ? base.lastTask : rawTask
   const rec: AgentRecord = {
     ...base,
     agentName: name,
-    model,
-    effort: o.effort ?? (base.effort || list?.find(m => m.slug === model)?.defaultEffort || FALLBACK_EFFORT),
-    sandbox: base.sandbox,
+    ...resolved.profile,
     thread: base.thread,
     lastTask,
     userCount: count,
@@ -1810,7 +3463,7 @@ async function* startRun(
     updatedAt: base.updatedAt,
   }
   const prof: Profile = { model: rec.model, effort: rec.effort, sandbox: rec.sandbox }
-  const invalid = checkProfile(list, prof.model, prof.effort)
+  const invalid = resolved.invalid
   if (invalid !== undefined) {
     // nothing runs; the record keeps the last profile that could
     await saveRecord($, agentId, { ...base, agentName: name, lastTask, userCount: count, handedBack: false, handback, redeliveries: 0 })
@@ -1826,8 +3479,9 @@ async function* startRun(
   const key = `${count}:${delivery !== undefined ? `${delivery}:` : ''}${rawTask}`
   const recent = (base.launches ?? []).filter(t => now - t < WINDOW_MS)
   const trip =
-    base.guardTrip?.key === key ? base.guardTrip.reason
-    : base.launchKey === key && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
+    base.guardTrip && (base.guardTrip.key === key || matchesIdentity({ guardTripKeyFingerprint: base.guardTripKeyFingerprint }, 'guardTripKey', key)) ? base.guardTrip.reason
+    : retry && (retry.key !== key || matchesIdentity(base, 'capacityRetryKey', key)) ? 'capacity retry already used or message changed'
+    : !retry && matchesIdentity(base, 'launchKey', key) && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
     : recent.length >= config.maxRunsPerWindow ? `${recent.length} launches in the last ${WINDOW_MS / 60000} min (maxRunsPerWindow ${config.maxRunsPerWindow})`
     : undefined
   if (trip !== undefined) {
@@ -1839,23 +3493,42 @@ async function* startRun(
     return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: rec.thread }, config.footer), handback)
   }
   rec.launches = [...recent, now]
-  rec.launchesSinceNew = base.launchKey === key ? (base.launchesSinceNew ?? 0) + 1 : 1
+  rec.launchesSinceNew = matchesIdentity(base, 'launchKey', key) ? (base.launchesSinceNew ?? 0) + 1 : 1
   rec.launchKey = key
   rec.guardTrip = undefined
+  if (retry) rec.capacityRetryKey = key
+  rec.fallbackModels ??= projectRoles.get(name)?.fallbackModels ?? config.capacityFallback
   await saveRecord($, agentId, rec)
-  const task = o.rest
-
+  $.ui.invalidate('ui.render')
+  if (base.lastTask === undefined && base.selection?.note) carry = [carry, `↪ ${base.selection.note}`].filter(Boolean).join('\n\n')
   const cwd = await $.session.cwd()
-  const lean = config.lean ? await leanArgs($) : []
-  let env: Record<string, string> | undefined
-  if (!config.globalRules) {
-    try {
-      env = { CODEX_HOME: await shadowHome($) }
-    } catch (err) {
-      const body = [carry, `codex failed: could not prepare the CODEX_HOME without global rules (${errText(err)})`].filter(Boolean).join('\n\n')
-      return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: rec.thread }, config.footer), handback)
+  let configNote = base.thread && (base.model !== rec.model || base.effort !== rec.effort)
+    ? 'model/effort changed on follow-up; cold start possible' : undefined
+  if (!rec.effectiveConfig) {
+    if (rec.effectiveFingerprint) {
+      return yield* handBack($, e, 'codex failed: saved thread policy unavailable; restore its private state cache before resuming', '', handback)
     }
+    const overrides = await leanArgs($)
+    let home: string
+    try {
+      home = config.globalRules ? await codexHome($) : await shadowHome($)
+    } catch (err) {
+      return yield* handBack($, e, `codex failed: could not prepare the CODEX_HOME without global rules (${errText(err)})`, '', handback)
+    }
+    const policy = resolvePolicy(config, projectRoles.get(name), overrides.filter((_, i) => overrides[i - 1] === '-c'),
+      overrides.flatMap(s => /^mcp_servers\.([A-Za-z0-9_-]+)\.enabled=/.exec(s)?.[1] ?? []),
+      home)
+    rec.effectiveConfig = policy.policy
+    for (const warning of policy.warnings) $.ui.log(`codex-mod: agent ${agentId}: ${warning}`, { to: 'debug' })
+    if (policy.warnings.length) configNote = [configNote, ...policy.warnings].filter(Boolean).join('; ')
+    if (base.thread) configNote = [configNote, 'legacy thread policy baseline unknown; snapshot retained from this turn'].filter(Boolean).join('; ')
   }
+  rec.effectiveFingerprint = configHash({ policy: rec.effectiveConfig.fingerprint, ...prof })
+  await saveRecord($, agentId, rec)
+  const task = roleTask(name, resolved.rest, rec.effectiveConfig)
+  const lean = rec.effectiveConfig.overrides.flatMap(kv => ['-c', kv])
+  const env = { CODEX_HOME: rec.effectiveConfig.home }
+  if (retry) carry = [carry, `↪ ${retry.note}`].filter(Boolean).join('\n\n')
   const via = await transportFor($, config)
   let argv: string[]
   let control: string | undefined
@@ -1863,21 +3536,31 @@ async function* startRun(
     // a fresh control dir per run: no file of an earlier run may steer this one
     rec.runSeq = (rec.runSeq ?? 0) + 1
     await saveRecord($, agentId, rec)
-    const safe = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_')
+    const safe = (s: string) => {
+      let a = 2166136261, b = 5381
+      for (const c of s) { a = Math.imul(a ^ c.charCodeAt(0), 16777619); b = Math.imul(b, 33) ^ c.charCodeAt(0) }
+      return `${(a >>> 0).toString(36)}${(b >>> 0).toString(36)}`
+    }
     const runs = await runsDir($)
     control = `${runs}/${safe(await sessionId($))}-${safe(agentId)}-${rec.runSeq}`
     await $.process.run(['rm', '-rf', control], { timeoutMs: 10000 }).catch(() => undefined)
     // created private (0700) here, before any steer file (prompt text) is written
     // into it: `$.fs.write` would create missing directories with the default mode
     await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
-    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control })
+    const questionTool = displayTools.codex_question
+    const questions = config.nativeActions && !rec.effectiveConfig.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [], control, questions, nestedAgents: config.nestedAgents })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   } else {
-    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
+    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [] })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   }
 
+  await loadCapabilities($)
   const run: Run = {
+    sessionId: await sessionId($),
+    ledger: new SourceLedger(),
+    rows: {},
     agentId,
     name,
     prof,
@@ -1891,6 +3574,8 @@ async function* startRun(
     queue: [],
     snapshots: new Map(),
     actions: 0,
+    patches: 0,
+    patchRows: 0,
     actionSteps: 0,
     // the first action goes out at once
     lastEmit: -Infinity,
@@ -1907,7 +3592,17 @@ async function* startRun(
     steers: 0,
     unknown: 0,
     unknownTypes: [],
+    policy: rec.effectiveConfig,
+    configNote,
+    capacityRetried: !!retry,
+    rawTask,
+    messageCount: count,
+    delivery,
+    execBaseline: rec.thread ? rec.threadUsage?.thread === rec.thread && rec.threadUsage.valid ? rec.threadUsage.total : undefined : zeroUsage(),
   }
+  if (rec.thread) rec.threadUsage = { thread: rec.thread, total: rec.threadUsage?.total ?? zeroUsage(), valid: false }
+  rec.wire = { records: run.ledger.records, rows: run.rows }
+  await saveRecord($, agentId, rec)
   if (config.timeoutMs > 0) {
     try {
       run.timer = $.clock.after(config.timeoutMs, () => {
@@ -1926,6 +3621,15 @@ async function* startRun(
 /** Forgets the answers of an agent's calls that were never made. */
 function dropAnswers(agentId: string): void {
   for (const [id, a] of answers) if (a.agentId === agentId) answers.delete(id)
+  const ids = new Set([...Object.keys(records.get(agentId)?.wire?.rows ?? {}), ...Object.keys(records.get(agentId)?.coordinator?.rows ?? {})])
+  for (const [id, row] of sourceRows) if (row.agentId === agentId) ids.add(id)
+  for (const [id, row] of questionRows) if (row.agent === agentId) ids.add(id)
+  for (const id of ids) {
+    sourceRows.delete(id)
+    planCards.delete(id)
+    questionRows.delete(id)
+    coordinatorRows.delete(id)
+  }
 }
 
 /** Kills a run's child (idempotent) and forgets it. */
@@ -1951,6 +3655,13 @@ async function killRun(run: Run, interrupted = false): Promise<void> {
  * turn interrupted) and read for up to INTERRUPT_GRACE_MS within this call.
  */
 async function stopRun($: EngineInterface, run: Run): Promise<void> {
+  const record = records.get(run.agentId)
+  if (record && run.thread && !run.ended && !run.mirror) {
+    record.threadUsage = { thread: run.thread, total: run.execTotal ?? record.threadUsage?.total ?? zeroUsage(), valid: false }
+    await saveRecord($, run.agentId, record)
+  }
+  await stopMirrorDescendants($, run.agentId)
+  if (run.mirror) { await stopMirror($, run.mirror); return killRun(run) }
   if (run.killed || run.transport !== 'app-server' || run.control === undefined || run.ended) return killRun(run)
   // marked killed first: the step pulling meanwhile ends, and no second stop starts
   run.killed = true
@@ -1993,10 +3704,10 @@ const cancel = (timer: Timer | undefined) => {
   }
 }
 
-/** Writes the run's `interrupt` file, then reads the run until it ends or INTERRUPT_GRACE_MS passes. */
+/** Request interruption once, then drain until terminal evidence or the grace deadline. */
 async function interruptRun($: EngineInterface, run: Run): Promise<void> {
   try {
-    await $.fs.write(`${run.control}/interrupt`, 'interrupt\n')
+    await controlRequest($, run.control!, '/interrupt', { turnId: run.turnId }, 'interrupt')
   } catch (err) {
     $.ui.log(`codex-mod: agent ${run.agentId}: interrupt not written (${errText(err)}); killing the runner`, { to: 'debug' })
     return
@@ -2050,15 +3761,153 @@ async function feed($: EngineInterface, run: Run, piece: ProcessSpawnChunk): Pro
   while ((nl = run.buffered.indexOf('\n')) >= 0) {
     const line = run.buffered.slice(0, nl).trim()
     run.buffered = run.buffered.slice(nl + 1)
-    if (line !== '') await handle($, run, parseCodexLine(line))
+    if (line !== '') await feedLine($, run, line)
   }
 }
 
-const absolute = (cwd: string, p: string) => (p.startsWith('/') ? p : `${cwd.replace(/\/$/, '')}/${p}`)
-const relative = (cwd: string, p: string) => {
-  const root = `${cwd.replace(/\/$/, '')}/`
-  return p.startsWith(root) ? p.slice(root.length) : p
+async function feedLine($: EngineInterface, run: Run, line: string): Promise<void> {
+  let envelope: any
+  try { envelope = JSON.parse(line) } catch {}
+  if (envelope?.type === 'codexmod.childEvent') return
+  if (envelope?.type === 'codexmod.treeUsage') { run.treeUsage = envelope; run.usage = envelope.direct; run.usagePartial = envelope.directPartial; run.usageCanonical = true; return }
+  if (envelope?.type === 'codexmod.directUsage') { run.usage = envelope.usage; run.usageCanonical = true; run.usagePartial = envelope.partial; return }
+  if (envelope?.type === 'codexmod.threadUsage') {
+    const rec = records.get(run.agentId)
+    if (rec && envelope.thread_id === run.thread && validUsage(envelope.total)) {
+      rec.threadUsage = { thread: run.thread!, total: envelope.total, valid: true }
+      await saveRecord($, run.agentId, rec)
+    }
+    return
+  }
+  if (envelope?.type === 'codexmod.child') {
+    detectSpawn($, run, envelope.thread_id, envelope.thread_id)
+    await launchMirror($, run, envelope)
+    return
+  }
+  const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
+  if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
+  const captured = source ? run.ledger.capture(source) : undefined
+  if (captured?.render === false) {
+    if (run.transport === 'exec' && envelope?.type === 'turn.completed') await handle($, run, parseCodexLine(line), source)
+    return
+  }
+  const item = captured?.record.item
+  if (item && (item.type === 'subAgentActivity' && item.kind === 'started' ||
+      item.type === 'collabAgentToolCall' && String(item.tool).replace(/_/g, '').toLowerCase() === 'spawnagent')) {
+    const receivers = item.receiverThreadIds ?? item.receiver_thread_ids
+    const ids = Array.isArray(receivers) ? receivers : typeof item.agentThreadId === 'string' ? [item.agentThreadId] : []
+    if (ids.length) for (const id of ids) detectSpawn($, run, id, id)
+    else detectSpawn($, run, `${source?.threadId}:${item.id}`)
+  }
+  const complete = ['item.completed', 'item/completed'].includes(source?.event ?? '')
+  if (item?.type === 'imageGeneration' && !complete && ['item.started', 'item/started', 'item.updated'].includes(source?.event ?? '')) {
+    run.queue.push({ kind: 'interim', text: `Codex image generation status:\n${JSON.stringify(item)}` })
+    return
+  }
+  if (source?.event === 'thread/compacted' || complete && item?.type === 'contextCompaction') {
+    const key = JSON.stringify([source?.threadId, source?.turnId])
+    const seen = (run.compactions ??= new Map()).get(key) ?? { notification: false, items: [] }
+    let show = false
+    if (item) {
+      if (!seen.items.includes(item.id)) {
+        show = seen.items.length > 0 || !seen.notification
+        seen.items.push(item.id)
+      }
+    } else {
+      show = !seen.notification && seen.items.length === 0
+      seen.notification = true
+    }
+    run.compactions.set(key, seen)
+    if (show) run.queue.push({ kind: 'interim', text: '↪ Codex compacted context' })
+    return
+  }
+  if (complete && item && ['imageView', 'imageGeneration'].includes(item.type)) {
+    if (item.type === 'imageGeneration') await handle($, run, { kind: 'action', display: 'codex_tool', action: generationAction(item) }, captured?.record)
+    else run.actions++
+    const path = item.type === 'imageView' ? item.path : item.savedPath
+    if (typeof path !== 'string' || path === '' || item.type === 'imageGeneration' && (item.status !== 'completed' || item.failure)) {
+      if (item.type === 'imageView' || item.status === 'completed') run.queue.push({ kind: 'interim', text: 'Codex image preview unavailable: no real saved image path reported; remote result strings are not fetched.' })
+      return
+    }
+    const resolved = absolute(source?.cwd ?? run.cwd, path)
+    const ownTools = agentTools.get(run.name) ?? availableTools
+    if (!cfg.nativeActions || !ownTools?.has('Read')) {
+      run.queue.push({ kind: 'interim', text: `Codex ${item.type} ${JSON.stringify(resolved)}: preview unavailable (${cfg.nativeActions ? "Read unavailable in this agent's tools" : 'nativeActions:false'}).` })
+      return
+    }
+    const preview = await captureImage($, resolved)
+    run.queue.push({ kind: 'interim', text: `Codex ${item.type} preview ${JSON.stringify(resolved)}: ${preview.action ? 'later file image captured after the reported operation; original viewed bytes are not established.' : preview.reason}` })
+    if (preview.action) run.queue.push({ kind: 'action', action: { ...preview.action, source: captured?.record } })
+    return
+  }
+  if (complete && item && ['enteredReviewMode', 'exitedReviewMode'].includes(item.type)) {
+    run.queue.push({ kind: 'interim', text: `Codex ${item.type === 'enteredReviewMode' ? 'entered' : 'exited'} review mode${typeof item.review === 'string' ? `\n${item.review}` : ''}` })
+    if (item.findings !== undefined) {
+      const action = findingsAction(item)
+      if (action && cfg.richRows) await handle($, run, { kind: 'action', action }, captured?.record)
+      else run.queue.push({ kind: 'interim', text: `Codex review findings (${action ? 'richRows disabled' : 'required structured fields missing'}):\n${JSON.stringify(item.findings)}` })
+    }
+    return
+  }
+  if (complete && item?.type === 'sleep') {
+    run.queue.push({ kind: 'interim', text: `Codex waited ${item.durationMs ?? item.duration_ms ?? '(duration unreported)'} ms` })
+    return
+  }
+  const child = ['collabAgentToolCall', 'subAgentActivity'].includes(item?.type)
+  const plan = ['todo_list', 'plan_update'].includes(item?.type)
+  if (child || plan) {
+    if (child && cfg.nestedAgents && run.transport === 'app-server' && (item?.kind === 'started' || String(item?.tool).replace(/_/g, '').toLowerCase() === 'spawnagent') && !['failed', 'declined'].includes(item?.status)) {
+      const ids = item?.agentThreadId ? [item.agentThreadId] : item?.receiverThreadIds ?? []
+      if (ids.some(validThreadId)) {
+        for (const id of ids.filter(validThreadId)) (run.childSources ??= new Map()).set(id, captured!.record)
+        return
+      }
+    }
+    if (child && !['item.completed', 'item/completed'].includes(source!.event)) return
+    if (item?.type === 'collabAgentToolCall' && item.status === 'inProgress') return
+    if (child && cfg.nestedAgents && run.transport === 'exec') $.ui.log('codex-mod: nested mirror unavailable on exec; using Batch 5 lifecycle/report rows', { to: 'debug' })
+    const rec = records.get(run.agentId)
+    if (!rec) return
+    const state = rec.display ??= emptyDisplayState()
+    const tools = agentTools.get(run.name) ?? new Set([...NATIVE_TOOLS.filter(t => availableTools?.has(t) && (cfg.richRows || !RICH_TOOLS.has(t))), ...Object.values(displayTools)])
+    const context = { session: run.sessionId, agent: run.agentId, thread: source?.threadId ?? run.thread ?? 'unreported', turn: source?.turnId ?? run.turnId, rich: cfg.richRows, tools }
+    let rows
+    if (child) rows = childRows(item, state, context)
+    else {
+      const parsed = parseCodexLine(line) as Extract<CodexEvent, { kind: 'action' }>
+      if (parsed.kind !== 'action') return
+      rows = planRows(parsed.action.input as PlanInput, state, context)
+    }
+    await saveRecord($, run.agentId, rec)
+    for (const row of rows) await handle($, run, row, captured?.record)
+    return
+  }
+  const ev = parseCodexLine(line, cfg.richRows, todoWriteAvailable)
+  if ((ev.kind === 'files' || ev.kind === 'fileStart') && captured?.record.item) ev.changes = changesOf(captured.record.item)
+  await handle($, run, ev, captured?.record)
 }
+
+function detectSpawn($: EngineInterface, run: Run, key: string, child?: string): void {
+  if (child) (run.observedChildren ??= new Set()).add(child)
+  if (run.policy?.multiAgent !== false || (run.spawnDetected ??= new Set()).has(key)) return
+  run.spawnDetected.add(key)
+  const note = 'multiAgent=false: Codex child spawn observed despite instruction; tool removal is unsupported'
+  $.ui.log(`codex-mod: agent ${run.agentId}, thread ${run.thread ?? 'unknown'}: ${note} (${key})`, { to: 'debug' })
+  if (!run.configNote?.includes(note)) {
+    run.configNote = [run.configNote, note].filter(Boolean).join('; ')
+    run.queue.push({ kind: 'note', text: `↪ ${note}; preserving real child rows and mirrors` })
+  }
+}
+
+export const absolute = (cwd: string, path: string) => {
+  const parts: string[] = []
+  for (const part of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
+    // Let the filesystem resolve parents; collapsing them could cross a symlink.
+    if (part !== '' && part !== '.') parts.push(part)
+  }
+  return '/' + parts.join('/')
+}
+const snapshotKey = (source: SourceRecord | undefined, path: string) => JSON.stringify([source?.threadId, source?.turnId, source?.itemId, path])
 
 /** A file's text (read only), or undefined when it cannot be read. */
 async function readText($: EngineInterface, path: string): Promise<string | undefined> {
@@ -2071,27 +3920,92 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
 }
 
 const remember = (run: Run, path: string, text: string | undefined) => {
-  if (text !== undefined && text.length <= 4 * FILE_MAX) run.snapshots.set(path, text)
+  if (text !== undefined && text.length <= 4 * PATCH_TEXT_MAX) run.snapshots.set(path, text)
   else run.snapshots.delete(path)
 }
 
-async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<void> {
+async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: SourceRecord): Promise<void> {
   if (ev.kind === 'thread') {
     run.thread = ev.id
     const rec = records.get(run.agentId)
     if (rec !== undefined && rec.thread !== ev.id) {
       rec.thread = ev.id
+      rec.threadUsage = { thread: ev.id, total: zeroUsage(), valid: false }
       await saveRecord($, run.agentId, rec)
     }
   } else if (ev.kind === 'message') {
     run.texts.push(ev.text)
     run.queue.push({ kind: 'text', text: ev.text })
+  } else if (ev.kind === 'thinking' || ev.kind === 'interim' || ev.kind === 'note') {
+    run.queue.push(ev)
+    if (ev.kind === 'note' && ev.dim) dimNotes.add(ev.text)
+  } else if (ev.kind === 'action') {
+    run.actions++
+    if (source?.item?.type === 'webSearch') {
+      ev.action = webAction(source.item, source)
+      ev.display = ev.action.tool === 'codex_tool' ? 'codex_tool' : undefined
+    }
+    ev.action.source = source
+    if (source?.item?.status === 'inProgress' && source.item.type !== 'imageGeneration') return
+    if (['failed', 'declined'].includes(source?.item?.status) && !ev.action.error && !(source?.item?.status === 'failed' && ev.action.tool === 'WebFetch' && !Array.isArray(ev.action.result) && Number(ev.action.result.code) >= 400)) ev.action.error = `Codex ${source!.item!.type} ${source!.item!.status}: ${JSON.stringify(source!.item)}`
+    if (ev.action.tool === 'WebSearch' && object(ev.action.result)) ev.action.result.durationSeconds = (sourceDuration(source) ?? 0) / 1000
+    if (ev.display) {
+      await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
+      const tool = displayTools[ev.display]
+      // no registered display tool: the action is shown as its text line, never as a row
+      if (tool === undefined) {
+        run.queue.push({ kind: ev.action.input.name === 'imageGeneration' ? 'interim' : 'note', text: actionLine(ev.action) })
+        return
+      }
+      ev.action.tool = tool
+    }
+    run.queue.push({ kind: 'action', action: ev.action })
   } else if (ev.kind === 'error') run.errors.push(ev.text)
-  else if (ev.kind === 'turn') run.turnId = ev.id
+  else if (ev.kind === 'warning') run.queue.push({ kind: 'interim', text: `Codex warning: ${ev.text}` })
+  else if (ev.kind === 'question') {
+    const q = ev.question
+    if (run.transport !== 'app-server' || !run.control || q.params?.threadId !== run.thread || q.params?.turnId !== run.turnId || !/^[A-Za-z0-9-]+$/.test(q.token)) {
+      run.queue.push({ kind: 'interim', text: `Codex request ignored: unbound RPC ${JSON.stringify(q.requestId)} (${q.method})` })
+      return
+    }
+    for (const row of questionRows.values()) if (row.agent === run.agentId && row.question.token === q.token) row.question = q
+    $.ui.invalidate('ui.render')
+    if (q.status === 'pending' && q.method === QUESTION_METHOD && choiceQuestions(q.params)) {
+      const tool = displayTools.codex_question
+      const ownTools = agentTools.get(run.name)
+      if (!cfg.nativeActions || (run.policy?.lean ?? cfg.lean) || !tool || ownTools && !ownTools.has(tool)) {
+        await $.fs.write(`${run.control}/response-${q.token}.json`, JSON.stringify({ token: q.token, requestId: q.requestId,
+          threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, unsupported: true }))
+        run.queue.push({ kind: 'interim', text: 'Codex question unsupported: owned question UI unavailable; no answer or consent supplied.' })
+        return
+      }
+      // Registration provides the ToolUse site; only its explicit controls write a response.
+      const action: Action = { tool, input: { server: 'codex', name: q.method, arguments: { ...q.params, requestId: q.requestId, token: q.token, status: 'pending' } },
+        result: [{ type: 'text', text: 'Question received; awaiting an explicit user response. Receipt does not answer or approve.' }], source }
+      run.queue.push({ kind: 'action', action })
+    } else {
+      run.queue.push({ kind: 'interim', text: `Codex request ${q.status} (${q.method}, RPC ${JSON.stringify(q.requestId)}):\n${JSON.stringify(q.error ?? q.result ?? q.params)}` })
+      const action = q.status === 'answered' ? answeredQuestion(q.params, q.result) : undefined
+      if (action && cfg.richRows) await handle($, run, { kind: 'action', action }, source)
+    }
+  }
+  else if (ev.kind === 'turn') { run.turnId = ev.id; if (run.mirror) run.mirror.activeTurn = ev.id }
   else if (ev.kind === 'steer') {
-    const i = run.pendingSteers.findIndex(f => (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
-    if (i < 0) return
+    if (run.mirror) {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      run.queue.push({ kind: 'note', text: `↪ child steer ${ev.id}: ${ev.accepted ? 'accepted' : ev.reason ?? 'rejected'}; no automatic retry` }); return }
+    if (ev.outcome.status === 'pending' || ev.outcome.status === 'received') {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      return
+    }
+    const i = run.pendingSteers.findIndex(f => (ev.outcome.messageId && f.messageId === ev.outcome.messageId) || (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
+    if (i < 0) {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      return
+    }
     const [s] = run.pendingSteers.splice(i, 1)
+    const outcome = { ...ev.outcome, messageId: ev.outcome.messageId ?? s!.messageId!, sourceUuid: s!.uuid }
+    await recordOutcome($, run.agentId, outcome)
     if (ev.accepted) {
       run.steers++
       // the steered message had its launch: it never also runs after the handback
@@ -2105,12 +4019,22 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
         rec.launchesSinceNew = 1
         await saveRecord($, run.agentId, rec)
       }
-      run.queue.push({ kind: 'note', text: steerNote('accepted', s!.text) })
+      run.queue.push({ kind: 'note', text: steerNote('accepted') })
       $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} accepted`, { to: 'debug' })
+    } else if (ev.outcome.status === 'unknown') {
+      run.queue.push({ kind: 'note', text: `↪ ${messageStatus(outcome)}; no automatic retry` })
     } else {
       run.followUps.push(s!)
-      run.queue.push({ kind: 'note', text: steerNote('finished') })
-      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} rejected (${ev.reason ?? 'no reason'}); it runs after this one`, { to: 'debug' })
+      const rec = records.get(run.agentId)
+      if (rec) rec.followUps = [...followUpsOf(rec).filter(f => !run.followUps.some(sameFollowUp(f))), ...run.followUps]
+      const saved = rec && await saveRecord($, run.agentId, rec)
+      await recordOutcome($, run.agentId, { ...outcome, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId })
+      if (!saved) {
+        run.followUps = run.followUps.filter(v => !sameFollowUp(s!)(v))
+        if (rec?.followUps) rec.followUps = rec.followUps.filter(v => !sameFollowUp(s!)(v))
+      }
+      run.queue.push({ kind: 'note', text: `↪ ${messageStatus({ ...outcome, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId })}` })
+      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} rejected; ${saved ? 'queued after turn' : 'checkpoint unavailable'}`, { to: 'debug' })
     }
   } else if (ev.kind === 'protocol') {
     run.unknown += ev.types.length
@@ -2120,32 +4044,73 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
     run.unknown++
     if (run.unknownTypes.length < 3 && !run.unknownTypes.includes(ev.type)) run.unknownTypes.push(ev.type)
   } else if (ev.kind === 'usage') {
-    const u = run.usage ?? { input: 0, cached: 0, output: 0 }
-    run.usage = { input: u.input + ev.input, cached: u.cached + ev.cached, output: u.output + ev.output }
+    if (run.usageCanonical) return
+    const total = { input: ev.input, cached: ev.cached, output: ev.output }
+    if (run.transport === 'exec' && !run.mirror) {
+      run.execTotal = total
+      const delta = execDelta(total, run.execBaseline)
+      run.usage = delta.usage
+      run.usagePartial = delta.partial
+      const rec = records.get(run.agentId)
+      if (rec && run.thread && validUsage(total)) {
+        rec.threadUsage = { thread: run.thread, total, valid: true }
+        await saveRecord($, run.agentId, rec)
+      }
+    } else run.usage = total
   } else if (ev.kind === 'command') {
     run.actions++
-    run.queue.push({ kind: 'action', action: commandAction(ev.command, ev.output, ev.exitCode) })
+    if (source?.item?.status === 'inProgress') return
+    run.queue.push({ kind: 'action', action: explorationAction(source) ?? { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
   } else if (ev.kind === 'fileStart') {
-    // the text before the patch, when it is read in time (best effort)
     for (const c of ev.changes) {
-      const path = absolute(run.cwd, c.path)
-      if (c.kind !== 'add' && !run.snapshots.has(path)) remember(run, path, await readText($, path))
+      const path = absolute(source?.cwd ?? run.cwd, c.path)
+      const kind = (typeof c.kind === 'object' ? c.kind?.type : c.kind) ?? 'unknown'
+      const key = snapshotKey(source, path)
+      if (kind !== 'add' && !run.snapshots.has(key)) remember(run, key, await readText($, path))
     }
   } else if (ev.kind === 'files') {
+    if (source?.item?.status === 'inProgress') return
+    // Count source patches independently of files and ordered hunk rows.
+    run.actions++
+    run.patches++
+    if (ev.changes.length > 1) run.queue.push({ kind: 'note', text: `Codex apply_patch ${source?.itemId ?? '(ID unreported)'}: ${ev.changes.length} files in one source patch.` })
+    if (!ev.changes.length) {
+      const status = source?.item?.status
+      const report = `Codex patch ${status ?? 'outcome unconfirmed'}; paths unreported.\n${JSON.stringify(source?.item ?? {})}`
+      run.patchRows++
+      run.queue.push({ kind: 'action', action: { tool: 'Bash', source,
+        input: { command: '# Codex apply_patch: paths unreported', description: `Codex patch ${status ?? 'outcome unconfirmed'}: paths unreported` },
+        result: { stdout: report, stderr: '', interrupted: false }, ...(status === 'completed' ? {} : { error: report }),
+      } })
+    }
     for (const c of ev.changes) {
-      run.actions++
-      const path = absolute(run.cwd, c.path)
-      const before = run.snapshots.get(path)
-      const after = c.kind === 'delete' ? undefined : await readText($, path)
-      run.queue.push({ kind: 'action', action: fileAction({ path, kind: c.kind }, relative(run.cwd, path), before, after) })
-      remember(run, path, after)
+      const cwd = source?.cwd ?? run.cwd
+      const path = absolute(cwd, c.path)
+      const key = snapshotKey(source, path)
+      const before = run.snapshots.get(key)
+      const kind = (typeof c.kind === 'object' ? c.kind?.type : c.kind) ?? 'unknown'
+      const move = typeof c.kind === 'object' ? c.kind?.move_path : c.move_path
+      const destination = typeof move === 'string' ? absolute(cwd, move) : undefined
+      const after = kind === 'delete' ? undefined : await readText($, destination ?? path)
+      const stable = kind === 'delete' || after === await readText($, destination ?? path)
+      const change = { ...c, path, ...(destination ? { kind: { type: kind, move_path: destination } } : {}) }
+      const report = JSON.stringify(Object.fromEntries(Object.entries(source?.item ?? {}).filter(([key]) => key !== 'changes')))
+      const actions = patchActions(change, before, after, c.status ?? source?.item?.status, report, stable)
+      run.patchRows += actions.length
+      if (actions.length > 1) run.queue.push({ kind: 'note', text: `Codex apply_patch ${source?.itemId ?? '(ID unreported)'}: ${path}, ${actions.length} ordered hunk rows for one file.` })
+      for (const action of actions) {
+        action.source = source
+        action.patchPath = path
+        run.queue.push({ kind: 'action', action })
+      }
+      run.snapshots.delete(key)
     }
   }
 }
 
 const interval = (run: Run) => (run.actionSteps >= SLOW_AFTER ? Math.max(SLOW_MS, cfg.intervalMs) : cfg.intervalMs)
 const hasAction = (run: Run) => run.queue.some(q => q.kind === 'action')
-const hasNote = (run: Run) => run.queue.some(q => q.kind === 'note')
+const hasNote = (run: Run) => run.queue.some(q => q.kind === 'note' || q.kind === 'interim' || q.kind === 'thinking')
 const timeoutText = () => `timeout after ${Math.round(cfg.timeoutMs / 60000)} min (timeoutMinutes); Codex was stopped`
 
 /**
@@ -2197,9 +4162,14 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
           if (wait > 0) await $.clock.sleep(wait, { signal })
           if (signal.aborted || run.killed) throw new Error('aborted')
           run.lastEmit = await $.clock.now()
-          return yield* actionStep(e, run)
+          return yield* actionStep($, e, signal, run)
         }
       }
+      // A sender receipt can wake this pull through the steer ack. Returning
+      // here emits its guarded card and lets the host drain its native inbox;
+      // no child pull is left pending and Codex keeps the same running turn.
+      if (!run.ended && cfg.nativeActions && !run.pull && displayTools.coordinator_message &&
+          records.get(run.agentId)?.coordinator?.pending.some(p => p.messageId)) return yield* emit(e, [])
       if (run.ended) break
       let r: IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>
       try {
@@ -2208,18 +4178,20 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
         if (run.timedOut) continue
         if (signal.aborted || run.killed) throw err
         // a spawn that cannot start rejects its first pull
-        failure = { reason: `could not start Codex (${errText(err)})` }
+        failure = { reason: `${run.mirror ? 'child observation lost' : 'could not start Codex'} (${errText(err)})` }
         break
       }
       if (run.timedOut) continue
       if (run.killed) throw new Error('killed')
       if (r.done) {
         run.ended = true
-        if (run.buffered.trim() !== '') await handle($, run, parseCodexLine(run.buffered.trim()))
+        for (const [id] of run.childSources ?? []) await mirrorFallback($, run, { thread_id: id }, 'child attachment unavailable')
+        if (run.buffered.trim() !== '') await feedLine($, run, run.buffered.trim())
         run.buffered = ''
         continue
       }
       await feed($, run, r.value)
+      await checkpointMirror($, run)
     }
   } catch (err) {
     const wasKilled = run.killed
@@ -2235,16 +4207,101 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
   return yield* complete($, e, signal, run, failure, streamed.used ? streamed.answer : undefined)
 }
 
-type Block = { text: string } | { tool: string; id: string; input: Record<string, unknown> }
+type Block = { text: string; dim?: true } | { thinking: string } | { tool: string; id: string; input: Record<string, unknown> }
 
 const mintId = (e: TurnStepInput) => `${ID_PREFIX}${e.turnId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}_${e.index}_${++seq}`
+
+/**
+ * Present receipts only at output boundaries, independently of the run/answer.
+ * Reindex after an inserted block: a streamed text block may resume afterwards.
+ * Never insert between a tool header and its input, or feed display text back
+ * into the inner generator's streamed answer, launch or handback records.
+ */
+async function* withCoordinatorMessages(
+  $: EngineInterface,
+  e: TurnStepInput,
+  inner: AsyncGenerator<TurnStepChunk, TurnStepResult>,
+): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  const indexes = new Map<number, number>()
+  let index = 0
+  let originalTools = 0
+  let answer = ''
+  let textInserted = false
+  const inserted: { at: number; name: string; input: Record<string, unknown> }[] = []
+  for (;;) {
+    const r = await inner.next()
+    if (r.done) {
+      const toolUses = [...r.value.toolUses]
+      inserted.forEach((t, i) => toolUses.splice(t.at + i, 0, { name: t.name, input: t.input }))
+      return { ...r.value, toolUses, ...(textInserted ? { answer } : {}), ...(inserted.length > 0 ? { stopReason: 'tool_use' as const } : {}) }
+    }
+    const chunk = r.value
+    if (chunk.kind !== 'input') {
+      const rec = records.get(e.agentId!) ?? await loadRecord($, e.agentId!)
+      const coordinator = rec?.coordinator
+      if (rec !== undefined && coordinator !== undefined && coordinator.pending.length > 0) {
+        if (cfg.nativeActions) await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
+        for (const message of [...coordinator.pending]) {
+          const parts: string[] = []
+          for (let start = 0; start < message.text.length;) {
+            let end = Math.min(start + COORDINATOR_PART_MAX, message.text.length)
+            // Keep a Unicode surrogate pair together at a row boundary.
+            if (end < message.text.length && /[\uD800-\uDBFF]/.test(message.text[end - 1]!) && /[\uDC00-\uDFFF]/.test(message.text[end]!)) end--
+            parts.push(message.text.slice(start, end))
+            start = end
+          }
+          if (parts.length === 0) parts.push('')
+          for (let part = 0; part < parts.length; part++) {
+            const text = parts.length > 1 ? `(part ${part + 1}/${parts.length})\n${parts[part]}` : parts[part]!
+            const registered = cfg.nativeActions ? displayTools.coordinator_message : undefined
+            const ownTools = agentTools.get(known.get(e.agentId!) ?? '')
+            const tool = registered && (ownTools === undefined || ownTools.has(registered)) ? registered : undefined
+            if (tool === undefined) {
+              const o = message.messageId ? coordinator.outcomes?.[message.messageId] : Object.values(coordinator.outcomes ?? {}).find(o => o.sourceUuid === message.uuid)
+              const echo = literalReceipt(text) + (o ? `\n${messageStatus(o)}\n` : '')
+              answer += echo
+              textInserted = true
+              yield { kind: 'text', index: index++, text: echo }
+            } else {
+              const id = mintId(e)
+              const input = { sourceUuid: message.sourceUuid ?? message.uuid, text }
+              const o = message.messageId ? coordinator.outcomes?.[message.messageId] : Object.values(coordinator.outcomes ?? {}).find(o => o.sourceUuid === message.uuid)
+              coordinatorRows.set(id, { sessionId: await sessionId($), tool, text, messageId: o?.messageId, outcome: o })
+              const rows = coordinator.rows ??= {}
+              rows[id] = { tool, text, sourceUuid: message.sourceUuid ?? message.uuid, messageId: o?.messageId }
+              if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: messageStatus(o) }] })) throw new Error('invalid coordinator display answer')
+              await saveRow($, id, sourceRows.get(id)!)
+              yield { kind: 'tool', index, id, name: tool }
+              yield { kind: 'input', index: index++, json: JSON.stringify(input) }
+              inserted.push({ at: originalTools, name: tool, input })
+            }
+          }
+          // Only mark shown after every part was handed to the host.
+          coordinator.pending = coordinator.pending.filter(p => p.uuid !== message.uuid)
+          await saveRecord($, e.agentId!, rec)
+        }
+        indexes.clear()
+      }
+    }
+    if (chunk.kind === 'tool') originalTools++
+    if (chunk.kind === 'text') answer += chunk.text
+    if (chunk.kind === 'text' || chunk.kind === 'thinking' || chunk.kind === 'tool' || chunk.kind === 'input') {
+      if (!indexes.has(chunk.index)) indexes.set(chunk.index, index++)
+      yield { ...chunk, index: indexes.get(chunk.index)! } as TurnStepChunk
+    } else {
+      yield chunk.kind === 'stop' && inserted.length > 0 ? { ...chunk, stopReason: 'tool_use' } : chunk
+    }
+  }
+}
 
 /**
  * Ends the step with the queued messages and actions up to the last action
  * (at most maxActionsPerStep): each message a text block, each action a
  * call whose answer is stored for the `tool.call` guard.
  */
-async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSignal, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  await loadCapabilities($)
+  const tools = agentTools.get(run.name) ?? new Set([...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (cfg.richRows || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)])
   let cut = -1
   let n = 0
   for (let i = 0; i < run.queue.length && n < cfg.maxActionsPerStep; i++) {
@@ -2260,17 +4317,87 @@ async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepC
     run.carry = undefined
   }
   for (const q of taken) {
-    if (q.kind !== 'action') {
+    if (q.kind === 'thinking') {
+      blocks.push({ thinking: q.text })
+    } else if (q.kind !== 'action') {
       const prev = blocks.at(-1)
-      if (prev !== undefined && 'text' in prev) prev.text += `\n\n${q.text}`
-      else blocks.push({ text: q.text })
+      if (!q.dim && prev !== undefined && 'text' in prev && !prev.dim) prev.text += `\n\n${q.text}`
+      else blocks.push({ text: q.text, ...(q.dim ? { dim: true as const } : {}) })
     } else {
       const id = mintId(e)
-      answers.set(id, { agentId: run.agentId, tool: q.action.tool, result: q.action.result })
+      if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && q.action.source?.item?.type === 'commandExecution') {
+        const source = q.action.source
+        const item = source.item!
+        const durationUnknown = q.action.tool === 'Glob' && item.durationMs == null && (source.startedAtMs === undefined || source.completedAtMs === undefined)
+        blocks.push({ text: `Codex command (cwd ${JSON.stringify(source.cwd)}):\n${item.command}${durationUnknown ? '\nDuration unreported (0 ms display sentinel).' : ''}` })
+      }
+      if (['WebSearch', 'WebFetch'].includes(q.action.tool) && !tools.has(q.action.tool) && q.action.source?.item && displayTools.codex_tool && tools.has(displayTools.codex_tool)) {
+        const original = q.action
+        q.action = { ...webFallback(original.source!.item, `${original.tool} unavailable in this agent's tools.`), tool: displayTools.codex_tool, source: original.source }
+      }
+      if (q.action.tool === 'WebSearch' && sourceDuration(q.action.source) === undefined) blocks.push({ text: 'Web search duration unreported (0-second display sentinel).' })
+      if (q.action.tool === 'WebSearch' && !Array.isArray(q.action.result) && Array.isArray(q.action.result.results)) {
+        for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
+      }
+      if (!tools.has(q.action.tool)) {
+        if (['Write', 'Edit'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item) {
+          const original = q.action
+          const cwd = original.source!.cwd ?? run.cwd
+          const change = changesOf(original.source!.item).find(c => absolute(cwd, c.path) === original.input.file_path)
+          if (change) q.action = { ...patchActions({ ...change, path: String(original.input.file_path) }, undefined, undefined,
+            change.status ?? original.source!.item!.status, '', true, `${original.tool} unavailable in this agent's tools.`)[0]!, source: original.source, patchPath: original.patchPath }
+        }
+        if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item?.type === 'commandExecution') {
+          const original = q.action
+          const item = original.source!.item!
+          blocks.push({ text: `${original.tool} unavailable in this agent's tools; showing the original Bash command.` })
+          q.action = { ...commandAction(item.command, item.aggregatedOutput, item.exitCode, item.status), source: original.source }
+          if (original.tool === 'Grep' && item.exitCode === 1) {
+            delete q.action.error
+            q.action.input.description = `${q.action.input.description} (no matches; exit 1)`
+          }
+        }
+      }
+      if (!tools.has(q.action.tool)) {
+        const original = q.action
+        const reason = `${original.tool} unavailable in this agent's tools`
+        if (displayTools.codex_tool && tools.has(displayTools.codex_tool)) {
+          q.action = { tool: displayTools.codex_tool,
+            input: { server: 'codex', name: original.tool, arguments: original.input },
+            result: [{ type: 'text', text: `${reason}\n${JSON.stringify(original.result)}` }],
+            source: original.source, patchPath: original.patchPath, ...(original.error ? { error: original.error } : {}) }
+        } else {
+          blocks.push({ text: `${reason}; display tool unavailable\n${JSON.stringify(original.input)}\n${original.error ?? JSON.stringify(original.result)}` })
+          continue
+        }
+      }
+      if (!holdAnswer(id, run.sessionId, run.agentId, q.action)) {
+        blocks.push({ text: `codex-mod: output-schema rejection (${q.action.tool}); not executed\n${JSON.stringify(q.action.input)}\n${q.action.error ?? JSON.stringify(q.action.result)}` })
+        continue
+      }
+      if (q.action.tool === displayTools.codex_plan) planCards.set(id, JSON.parse(JSON.stringify(q.action.input)) as PlanInput)
+      await saveRow($, id, sourceRows.get(id)!, planCards.get(id))
+      if (q.action.tool === displayTools.codex_question && run.control) {
+        const data: any = q.action.source?.data
+        if (data?.status === 'pending') questionRows.set(id, { session: run.sessionId, agent: run.agentId, control: run.control, question: data, selected: {} })
+      }
+      if (q.action.mirror) { const m = mirrors.get(q.action.mirror); if (m) { m.displayToolId = id; await saveMirror($, m) } }
+      run.rows[id] = q.action.source ?? null
       blocks.push({ tool: q.action.tool, id, input: q.action.input })
     }
   }
+  if (!blocks.some(b => 'tool' in b)) {
+    // A text fallback must not end a still-running agent before its handback.
+    run.queue.unshift(...blocks.map((b): Queued => 'thinking' in b ? { kind: 'thinking', text: b.thinking } : { kind: 'interim', text: 'text' in b ? b.text : '' }))
+    return yield* pump($, e, signal, run)
+  }
   run.actionSteps++
+  await checkpointMirror($, run)
+  const rec = records.get(run.agentId)
+  if (rec !== undefined) {
+    rec.wire = { records: run.ledger.records, rows: run.rows }
+    await saveRecord($, run.agentId, rec)
+  }
   return yield* emit(e, blocks)
 }
 
@@ -2291,11 +4418,15 @@ async function* complete(
     // already fired
   }
   const tail = run.stderrTail.trim().split('\n').slice(-5).join('\n')
-  // a steer the runner never acked (it ended first) runs after this run, as a follow-up
+  // An unacknowledged submission may already have reached Codex. Never replay it.
+  if (run.mirror && run.pendingSteers.length) {
+    run.queue.push({ kind: 'note', text: '↪ child message outcome unknown; no automatic retry or relaunch' }); run.pendingSteers = []
+  }
   if (run.pendingSteers.length > 0) {
-    run.followUps.push(...run.pendingSteers)
+    for (const f of run.pendingSteers) await recordOutcome($, run.agentId, { messageId: f.messageId ?? f.uuid ?? steerFileId(f), sourceUuid: f.uuid,
+      status: 'unknown', receivedAt: Date.now(), reason: 'runner ended before acknowledgment; no retry' })
     run.pendingSteers = []
-    run.queue.push({ kind: 'note', text: steerNote('finished') })
+    run.queue.push({ kind: 'note', text: '↪ message outcome unknown; no automatic retry or relaunch' })
   }
   let reason = failure?.reason
   let detail = failure?.detail ?? ''
@@ -2322,10 +4453,51 @@ async function* complete(
     }
   }
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
+  const record = records.get(run.agentId)
+  const atCapacity = reason !== undefined && [reason, detail, ...run.errors, run.fatal ?? '', tail].some(s => s.includes('Selected model is at capacity'))
+  const capacityBeforeWork = run.actions === 0 && run.texts.length === 0 && !run.ledger.records.some(r => r.item)
+  if (record && run.thread && atCapacity && run.transport === 'exec' && !run.execTotal && run.execBaseline && capacityBeforeWork) {
+    record.threadUsage = { thread: run.thread, total: run.execBaseline, valid: true }
+    await saveRecord($, run.agentId, record)
+  }
+  if (atCapacity && run.transport === 'exec' && !run.execTotal && !capacityBeforeWork) run.usagePartial = true
+  if (record && run.thread && reason !== undefined && !atCapacity) {
+    // Failed/interrupted exec can incur unreported calls after its last total.
+    // Do not attribute those tokens to a later successful follow-up.
+    if (run.transport === 'exec') record.threadUsage = { thread: run.thread, total: run.execTotal ?? record.threadUsage?.total ?? zeroUsage(), valid: false }
+    run.usagePartial = true
+    await saveRecord($, run.agentId, record)
+  }
+  if (atCapacity && !run.mirror && !run.capacityRetried && !signal.aborted && !run.killed && record && run.thread && run.rawTask !== undefined) {
+    const next = capacityFallback(catalog ?? undefined, record.fallbackModels ?? cfg.capacityFallback, run.prof)
+    if (next) {
+      const note = `${run.prof.model} at capacity; continued on ${next.model}`
+      const previous = cfg.footer === 'off' ? undefined : run.usagePartial ? '↪ capacity attempt usage: partial/unknown'
+        : run.usage ? `↪ capacity attempt usage: ${run.usage.input} input (${run.usage.cached} cached), ${run.usage.output} output tokens` : undefined
+      for (const f of run.followUps) if (!followUpsOf(record).some(sameFollowUp(f))) (record.followUps ??= []).push(f)
+      const carry = [run.carry, previous].filter(Boolean).join('\n\n')
+      const resumed = startRun($, e, signal, cfg, run.name, record, run.rawTask, run.handback, run.messageCount!, carry || undefined, run.delivery,
+        { profile: next, key: record.launchKey!, note })
+      if (streamed !== undefined) return yield* prefixed(streamed, resumed)
+      return yield* resumed
+    }
+    run.configNote = [run.configNote, 'capacity fallback unavailable: no different model validated in models_cache.json'].filter(Boolean).join('; ')
+  }
+  if (run.mirror) for (const message of run.mirror.messages ?? []) if (message.status === 'submitted') {
+    message.status = 'unknown'
+    run.queue.push({ kind: 'note', text: `↪ child message ${message.id}: outcome unknown; no automatic retry or relaunch` })
+  }
+  // Commentary, proposed plans and summaries are emitted before the handback,
+  // never used as a substitute for a missing final message.
   // the answer: the messages not shown yet (those after the last action), else the last
   // one; the notes not shown yet go before it, so a note never stands in for the answer
   const unseen = run.queue.filter(q => q.kind === 'text').map(q => q.text)
-  const notes = run.queue.filter(q => q.kind === 'note').map(q => q.text)
+  const notes = run.queue.filter(q => q.kind === 'note' && !q.dim).map(q => q.text)
+  const leading: Block[] = []
+  for (const q of run.queue) {
+    if (q.kind === 'thinking') leading.push(cfg.nativeActions ? { thinking: q.text } : { text: q.text })
+    else if (q.kind === 'interim' || (q.kind === 'note' && q.dim)) leading.push({ text: q.text })
+  }
   run.queue = []
   const said = unseen.length > 0 ? unseen.join('\n\n') : streamed !== undefined && !run.handback ? '' : (run.texts.at(-1) ?? '')
   const answer = [...notes, said].filter(Boolean).join('\n\n')
@@ -2333,15 +4505,24 @@ async function* complete(
   const rec = records.get(run.agentId)
   if (rec !== undefined) {
     if (run.thread !== undefined) rec.thread = run.thread
-    const queued = [...followUpsOf(rec), ...run.followUps]
+    const queued = [...followUpsOf(rec)]
+    for (const f of run.followUps) if (!queued.some(sameFollowUp(f))) queued.push(f)
     rec.followUps = queued.length > 0 ? queued : undefined
   }
-  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, steers: run.steers }, cfg.footer)
+  if (run.transport === 'exec' && run.observedChildren?.size && !run.treeUsage) {
+    const direct = run.usage ?? zeroUsage()
+    run.treeUsage = { direct, tree: direct, children: run.observedChildren.size, missing: run.observedChildren.size + (run.usagePartial ? 1 : 0), active: 0 }
+  }
+  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, usagePartial: run.usagePartial, treeUsage: run.treeUsage, steers: run.steers, patches: run.patches, patchRows: run.patchRows, configNote: run.configNote }, cfg.footer)
   const shown = [run.carry, body].filter(Boolean).join('\n\n')
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile
   // runs now, in the same step, after this answer.
-  if (!run.handback && rec !== undefined && rec.followUps !== undefined && rec.followUps.length > 0) {
+  if (run.mirror) {
+    if (!['aborted', 'stopping'].includes(run.mirror.state)) run.mirror.state = reason ? 'failed' : 'completed'
+    await saveMirror($, run.mirror)
+  }
+  if (!run.mirror && !run.handback && rec !== undefined && rec.followUps !== undefined && rec.followUps.length > 0) {
     const next = rec.followUps.shift()!
     if (rec.followUps.length === 0) rec.followUps = undefined
     const carry = [shown, foot].filter(Boolean).join('\n\n')
@@ -2352,8 +4533,8 @@ async function* complete(
     }
     return yield* startRun($, e, signal, cfg, run.name, rec, next.text, false, next.count, carry, next.uuid)
   }
-  if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed })
-  return yield* handBack($, e, shown, foot, run.handback)
+  if (streamed !== undefined) return yield* handBack($, e, shown, foot, run.handback, { index: 1, answer: streamed }, leading)
+  return yield* handBack($, e, shown, foot, run.handback, undefined, leading)
 }
 
 /** Why a run with no agent message failed when it printed lines we do not know: the protocol changed. */
@@ -2369,7 +4550,7 @@ async function* prefixed(streamed: string, inner: AsyncGenerator<TurnStepChunk, 
     const r = await inner.next()
     if (r.done) return { ...r.value, answer: streamed + r.value.answer }
     const c = r.value
-    yield c.kind === 'text' || c.kind === 'tool' || c.kind === 'input' ? ({ ...c, index: c.index + 1 } as TurnStepChunk) : c
+    yield c.kind === 'text' || c.kind === 'thinking' || c.kind === 'tool' || c.kind === 'input' ? ({ ...c, index: c.index + 1 } as TurnStepChunk) : c
   }
 }
 
@@ -2390,6 +4571,7 @@ async function* handBack(
   foot: string,
   handback: boolean,
   after?: { index: number; answer: string },
+  leading: Block[] = [],
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const rec = records.get(e.agentId!)
   if (rec !== undefined) {
@@ -2398,7 +4580,7 @@ async function* handBack(
     rec.lastAnswer = [after?.answer, body, foot].filter(Boolean).join('\n\n')
     await saveRecord($, e.agentId!, rec)
   }
-  return yield* finalBlocks(e, body, foot, handback, after)
+  return yield* finalBlocks(e, body, foot, handback, after, leading)
 }
 
 /** A failure before any run: `body`, the agent's name as the footer (no `$` call, so `.catch` can use it). */
@@ -2406,10 +4588,10 @@ const failStep = (e: TurnStepInput, name: string, body: string, handback: boolea
   finalBlocks(e, body, cfg.footer === 'off' ? '' : name, handback)
 
 /** The final blocks of a run: the SubagentHandback call, or the final text. */
-async function* finalBlocks(e: TurnStepInput, body: string, foot: string, handback: boolean, after?: { index: number; answer: string }): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+async function* finalBlocks(e: TurnStepInput, body: string, foot: string, handback: boolean, after?: { index: number; answer: string }, leading: Block[] = []): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const message = [body, foot].filter(Boolean).join('\n\n')
-  const blocks: Block[] = handback ? [{ tool: HANDBACK_TOOL, id: mintId(e), input: { message } }] : message === '' ? [] : [{ text: message }]
-  return yield* emit(e, blocks, after)
+  const blocks: Block[] = handback ? [{ tool: HANDBACK_TOOL, id: `${HANDBACK_ID_PREFIX}${e.turnId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}_${e.index}_${++seq}`, input: { message } }] : message === '' ? [] : [{ text: message }]
+  return yield* emit(e, [...leading, ...blocks], after)
 }
 
 // Ends the step as a model whose response is `blocks`: text chunks, and per
@@ -2424,7 +4606,9 @@ async function* emit(e: TurnStepInput, blocks: Block[], after?: { index: number;
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i]!
     const index = base + i
-    if ('text' in b) {
+    if ('thinking' in b) {
+      yield { kind: 'thinking', index, text: b.thinking }
+    } else if ('text' in b) {
       yield { kind: 'text', index, text: b.text }
       answer += b.text
     } else {
