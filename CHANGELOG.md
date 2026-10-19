@@ -8,6 +8,7 @@
 
 ### Added
 
+- Full coordinator messages in the Codex subagent view through guarded, display-only `coordinator_message` rows and a Coordinator card, with source UUID deduplication across worker restarts, numbered parts above 90,000 characters, and plain text fallback. Steering/queuing status notes remain, without message excerpts; receipt display never substitutes for Codex's answer or confirms steering.
 - Experimental `richRows` (default `false`): draw Codex sub-agent spawns as guarded, completed Agent rows and plan updates as guarded TodoWrite rows when the session offers that tool (otherwise `codex_plan`). Both are answered with native result shapes by the plugin, never executed, counted in the footer and shown as text with `nativeActions: false`.
 - Codex reasoning summaries as best-effort live thinking, completed web searches as guarded WebSearch rows, and MCP/dynamic tool results and plan updates as display-only `codex_tool`/`codex_plan` rows. All new rows are counted in the footer and degrade to text with `nativeActions: false`.
 - App-server commentary between rows, proposed plan text, and notes for Codex agent activity, context compaction, review mode, sleep and image generation. Raw reasoning is never shown; the final answer still uses the handback.

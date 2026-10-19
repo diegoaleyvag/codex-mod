@@ -167,9 +167,12 @@ export const ID_PREFIX = 'toolu_codexmod_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
 export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
 const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite'])
-type DisplayTool = 'codex_tool' | 'codex_plan'
+type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message'
 const displayTools: Partial<Record<DisplayTool, string>> = {}
-const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan'])
+const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'])
+// Kept after the guard consumes its answer, so resolved rows still render.
+const coordinatorRows = new Map<string, { tool: string; text: string }>()
+const COORDINATOR_PART_MAX = 90000
 const dimNotes = new Set<string>()
 export const NOT_EXECUTED = 'codex-mod: not executed'
 // Feature flags a lean launch turns off (`-c features.<name>=false`; an
@@ -409,6 +412,8 @@ export type AgentRecord = Profile & {
   guardTrip?: { key: string; reason: string }
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
+  // Receipt deduplication and unshown bodies survive a hooks-worker restart.
+  coordinator?: { received: string[]; pending: { uuid: string; text: string }[] }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
   updatedAt: number
@@ -640,7 +645,14 @@ export function stripCoordinator(text: string): string {
  * "sent a message while you were working" included. A bare delivery (no
  * wrapper) is `cleanText`'s to unwrap.
  */
-export function coordinatorPayload(text: string): string | undefined {
+export function coordinatorPayload(text: string, verbatim = false): string | undefined {
+  // Match the host's closing tag (including its id), beyond any tags in the body.
+  const raw = /<system-reminder(\s[^>]*)?>\nThe coordinator sent a message while you were working:[ \t]*\n([\s\S]*)<\/system-reminder\1>/.exec(text)?.[2]
+  if (raw !== undefined) {
+    const suffix = '\n\nAddress this before completing your current task.\n'
+    const body = raw.endsWith(suffix) ? raw.slice(0, -suffix.length) : raw.endsWith('\n') ? raw.slice(0, -1) : raw
+    return verbatim ? body : body.trim()
+  }
   for (const block of text.match(REMINDER) ?? []) {
     const inner = REMINDER_WRAP.exec(block.trim())?.[1] ?? ''
     const m = COORDINATOR.exec(inner)
@@ -1205,8 +1217,8 @@ const sessionHandbackKey = (sessionId: string): string => `${SESSION_PREFIX}${se
 type Queued = { kind: 'text' | 'note' | 'interim' | 'thinking'; text: string; dim?: true } | { kind: 'action'; action: Action }
 
 /** The `↪` line shown for a mid-run message: what codex-mod did with it. */
-export function steerNote(what: 'accepted' | 'finished' | 'queued', text = ''): string {
-  if (what === 'accepted') return `↪ steer delivered to Codex mid-turn: "${oneLine(parseOverrides(text).rest, 80)}"`
+export function steerNote(what: 'accepted' | 'finished' | 'queued'): string {
+  if (what === 'accepted') return '↪ steer delivered to Codex mid-turn'
   if (what === 'finished') return '↪ Codex had already finished; this message runs next, on the same thread'
   return '↪ queued: runs after this turn (exec transport has no mid-turn steer)'
 }
@@ -1368,7 +1380,7 @@ export const register: Register = (on, options) => {
     }
     appServer = undefined
     if (config.transport === 'app-server') appServer = await checkAppServer($, config)
-    await registerDisplayTools($)
+    await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
     agentsReady = await registerAgents($, config)
     return next(e)
   })
@@ -1405,15 +1417,38 @@ export const register: Register = (on, options) => {
     return $.ui.resolve(e).Text({ dimColor: true, children: e.props.text })
   }).catch(($, e, next) => next(e))
 
+  on('ui.render', { component: 'ToolUse' }, ($, e, next) => {
+    const row = hasPrefix(e.props.tool_use_id) ? coordinatorRows.get(e.props.tool_use_id) : undefined
+    if (row === undefined || e.props.tool !== displayTools.coordinator_message || e.props.tool !== row.tool) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return Box({ flexDirection: 'column', children: [
+      Text({ weight: 'semibold', children: 'Coordinator' }),
+      Text({ children: row.text }),
+    ] })
+  }).catch(($, e, next) => next(e))
+
   // A coordinator's message delivered into an agent's running turn is an
   // attachment row (`queued_command`), promoted to a system turn in the
   // request, so the conversation read never shows it: it is recorded here, as
   // the row is appended, for the next look for messages. Always relayed as is.
   on('session.append', async ($, e, next) => {
     // only the doors a delivery comes in by: a prompt row the API form carries is read there
-    if (e.agentId !== undefined && (e.door === 'attachment' || e.door === 'delivery')) {
-      const text = coordinatorPayload(rowText(e.message.content))
-      if (text !== undefined && text !== '') {
+    if (e.agentId !== undefined && e.origin.kind === 'coordinator' && (e.door === 'attachment' || e.door === 'delivery')) {
+      const content = rowText(e.message.content)
+      const text = coordinatorPayload(content)
+      const name = text === undefined ? undefined : await agentName($, e.agentId)
+      if (text !== undefined && text !== '' && name !== undefined) {
+        const loaded = await loadRecord($, e.agentId)
+        const rec = records.get(e.agentId) ?? loaded ?? { ...profileOf(name)!, agentName: name, updatedAt: 0 }
+        // Unknown retired roles need an existing valid record, just as their steps do.
+        if (!isRecord(rec)) return next(e)
+        const coordinator = rec.coordinator ??= { received: [], pending: [] }
+        if (coordinator.received.includes(e.uuid)) return next(e)
+        coordinator.received.push(e.uuid)
+        coordinator.pending.push({ uuid: e.uuid, text: coordinatorPayload(content, true) ?? text })
+        // Publish without an await so simultaneous first receipts share state.
+        records.set(e.agentId, rec)
+        await saveRecord($, e.agentId, rec, true)
         const list = deliveries.get(e.agentId) ?? []
         if (!list.some(d => d.uuid === e.uuid)) list.push({ uuid: e.uuid, text })
         deliveries.set(e.agentId, list.slice(-MAX_DELIVERIES))
@@ -1460,7 +1495,7 @@ export const register: Register = (on, options) => {
       return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not declared by this project (.claude/codex-mod.json) or this version of the plugin`, handbackFor(e.agentId, undefined))
     }
     budgets.set(next.signal, () => next.budget.remainingMs)
-    return yield* answerWithCodex($, e, next.signal, config, name)
+    return yield* withCoordinatorMessages($, e, answerWithCodex($, e, next.signal, config, name))
   }).catch(async function* ($, e, next) {
     if (next.called) return yield* next(e)
     const agentId = e.agentId
@@ -1641,19 +1676,21 @@ async function loadProjectRoles($: EngineInterface, config: Config): Promise<voi
  * agentId, requestMeta, consent) or tool-check fields.
  */
 async function registerDisplayTools($: EngineInterface): Promise<void> {
-  for (const name of ['codex_tool', 'codex_plan'] as const) {
+  for (const name of ['codex_tool', 'codex_plan', 'coordinator_message'] as const) {
     if (displayTools[name]) continue
     const tool = name === 'codex_tool'
+    const coordinator = name === 'coordinator_message'
     const registered = await $.tool.register({
       name,
-      description: `Display-only ${tool ? 'tool result' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
+      description: `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
+      ...(coordinator ? { isDeferred: false } : {}),
       inputSchema: {
         type: 'object', additionalProperties: false,
-        properties: tool ? { server: { type: 'string' }, name: { type: 'string' }, arguments: {} } : {
+        properties: coordinator ? { sourceUuid: { type: 'string' }, text: { type: 'string' } } : tool ? { server: { type: 'string' }, name: { type: 'string' }, arguments: {} } : {
           explanation: { type: 'string' },
           steps: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { step: { type: 'string' }, status: { enum: ['pending', 'in_progress', 'completed'] } }, required: ['step', 'status'] } },
         },
-        required: tool ? ['server', 'name', 'arguments'] : ['steps'],
+        required: coordinator ? ['sourceUuid', 'text'] : tool ? ['server', 'name', 'arguments'] : ['steps'],
       },
     })
     displayTools[name] = registered.tool
@@ -1820,6 +1857,8 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
   try {
     const sid = await sessionId($)
     const own = await $.store.get(recordKey(sid, agentId))
+    // A receipt may have published a record while this read was in flight.
+    if (records.has(agentId)) return records.get(agentId)
     if (isRecord(own)) {
       records.set(agentId, own)
       $.ui.log(`codex-mod: agent ${agentId} record reloaded from the store (thread=${own.thread ?? 'none'})`, { to: 'debug' })
@@ -1833,6 +1872,7 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
       if (isRecord(v) && (best === undefined || v.updatedAt > best.rec.updatedAt)) best = { key, rec: v }
     }
     if (best !== undefined) {
+      if (records.has(agentId)) return records.get(agentId)
       records.set(agentId, best.rec)
       await $.store.set(recordKey(sid, agentId), best.rec)
       if (best.key !== recordKey(sid, agentId)) await $.store.delete(best.key)
@@ -1842,18 +1882,26 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
   } catch (err) {
     $.ui.log(`codex-mod: store read failed: ${errText(err)}`, { to: 'debug' })
   }
-  return undefined
+  return records.get(agentId)
 }
 
-async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord): Promise<void> {
+async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord, currentOnly = false): Promise<void> {
+  let now: number | undefined
   try {
-    rec.updatedAt = await $.clock.now()
+    now = await $.clock.now()
   } catch {
     // keep the previous stamp
   }
+  // Receipt-only writes must not replace newer launch/thread/handback fields.
+  if (currentOnly) rec = records.get(agentId) ?? rec
+  if (now !== undefined) rec.updatedAt = now
+  // Merge after the await: a first receipt can arrive while a copied launch
+  // record is waiting for its timestamp, before it shares the receipt state.
+  rec.coordinator = records.get(agentId)?.coordinator ?? rec.coordinator
   records.set(agentId, rec)
   try {
-    await $.store.set(recordKey(await sessionId($), agentId), rec)
+    const key = recordKey(await sessionId($), agentId)
+    await $.store.set(key, records.get(agentId) ?? rec)
   } catch (err) {
     $.ui.log(`codex-mod: store write failed: ${errText(err)}`, { to: 'debug' })
   }
@@ -2414,7 +2462,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
         rec.launchesSinceNew = 1
         await saveRecord($, run.agentId, rec)
       }
-      run.queue.push({ kind: 'note', text: steerNote('accepted', s!.text) })
+      run.queue.push({ kind: 'note', text: steerNote('accepted') })
       $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} accepted`, { to: 'debug' })
     } else {
       run.followUps.push(s!)
@@ -2547,6 +2595,82 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
 type Block = { text: string; dim?: true } | { thinking: string } | { tool: string; id: string; input: Record<string, unknown> }
 
 const mintId = (e: TurnStepInput) => `${ID_PREFIX}${e.turnId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}_${e.index}_${++seq}`
+
+/**
+ * Present receipts only at output boundaries, independently of the run/answer.
+ * Reindex after an inserted block: a streamed text block may resume afterwards.
+ * Never insert between a tool header and its input, or feed display text back
+ * into the inner generator's streamed answer, launch or handback records.
+ */
+async function* withCoordinatorMessages(
+  $: EngineInterface,
+  e: TurnStepInput,
+  inner: AsyncGenerator<TurnStepChunk, TurnStepResult>,
+): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  const indexes = new Map<number, number>()
+  let index = 0
+  let originalTools = 0
+  let answer = ''
+  let textInserted = false
+  const inserted: { at: number; name: string; input: Record<string, unknown> }[] = []
+  for (;;) {
+    const r = await inner.next()
+    if (r.done) {
+      const toolUses = [...r.value.toolUses]
+      inserted.forEach((t, i) => toolUses.splice(t.at + i, 0, { name: t.name, input: t.input }))
+      return { ...r.value, toolUses, ...(textInserted ? { answer } : {}), ...(inserted.length > 0 ? { stopReason: 'tool_use' as const } : {}) }
+    }
+    const chunk = r.value
+    if (chunk.kind !== 'input') {
+      const rec = records.get(e.agentId!) ?? await loadRecord($, e.agentId!)
+      const coordinator = rec?.coordinator
+      if (rec !== undefined && coordinator !== undefined && coordinator.pending.length > 0) {
+        if (cfg.nativeActions) await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
+        for (const message of [...coordinator.pending]) {
+          const parts: string[] = []
+          for (let start = 0; start < message.text.length;) {
+            let end = Math.min(start + COORDINATOR_PART_MAX, message.text.length)
+            // Keep a Unicode surrogate pair together at a row boundary.
+            if (end < message.text.length && /[\uD800-\uDBFF]/.test(message.text[end - 1]!) && /[\uDC00-\uDFFF]/.test(message.text[end]!)) end--
+            parts.push(message.text.slice(start, end))
+            start = end
+          }
+          if (parts.length === 0) parts.push('')
+          for (let part = 0; part < parts.length; part++) {
+            const text = parts.length > 1 ? `(part ${part + 1}/${parts.length})\n${parts[part]}` : parts[part]!
+            const tool = cfg.nativeActions ? displayTools.coordinator_message : undefined
+            if (tool === undefined) {
+              const echo = `Coordinator message:\n\n${text}`
+              answer += echo
+              textInserted = true
+              yield { kind: 'text', index: index++, text: echo }
+            } else {
+              const id = mintId(e)
+              const input = { sourceUuid: message.uuid, text }
+              coordinatorRows.set(id, { tool, text })
+              answers.set(id, { agentId: e.agentId!, tool, result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })
+              yield { kind: 'tool', index, id, name: tool }
+              yield { kind: 'input', index: index++, json: JSON.stringify(input) }
+              inserted.push({ at: originalTools, name: tool, input })
+            }
+          }
+          // Only mark shown after every part was handed to the host.
+          coordinator.pending = coordinator.pending.filter(p => p.uuid !== message.uuid)
+          await saveRecord($, e.agentId!, rec)
+        }
+        indexes.clear()
+      }
+    }
+    if (chunk.kind === 'tool') originalTools++
+    if (chunk.kind === 'text') answer += chunk.text
+    if (chunk.kind === 'text' || chunk.kind === 'thinking' || chunk.kind === 'tool' || chunk.kind === 'input') {
+      if (!indexes.has(chunk.index)) indexes.set(chunk.index, index++)
+      yield { ...chunk, index: indexes.get(chunk.index)! } as TurnStepChunk
+    } else {
+      yield chunk.kind === 'stop' && inserted.length > 0 ? { ...chunk, stopReason: 'tool_use' } : chunk
+    }
+  }
+}
 
 /**
  * Ends the step with the queued messages and actions up to the last action

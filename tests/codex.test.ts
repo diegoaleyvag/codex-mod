@@ -100,6 +100,9 @@ const AGENT_TYPES: Record<string, string> = {
   'agent-exec-deliver': 'codex-mod:codex',
   'agent-api-deliver': 'codex-mod:codex',
   'agent-peer-ignored': 'codex-mod:codex',
+  'agent-coordinator': 'codex-mod:codex',
+  'agent-coordinator-reload': 'codex-mod:codex',
+  'agent-coordinator-stream': 'codex-mod:codex',
 }
 
 type Spawned = { argv: readonly string[]; input?: string; cwd?: string; env?: Record<string, string> }
@@ -109,6 +112,7 @@ type WorldOpts = {
   listThrows?: boolean
   /** Full registered tool names are chosen by the host. */
   toolNamespace?: string
+  toolRegisterThrows?: string
   /** Tools the session exposes to its model, before agent tool filtering. */
   availableTools?: string[]
   toolListThrows?: boolean
@@ -131,6 +135,7 @@ type WorldOpts = {
   /** `$.session.messages({ as: "api" })` is denied (rows only). */
   noApi?: boolean
   sessionId?: string
+  clockNow?: (now: number) => number | Promise<number>
 }
 
 /** The meta row the host puts in an agent's conversation when its report goes through SubagentHandback. */
@@ -169,6 +174,7 @@ function world(on: On, opts: WorldOpts = {}) {
   })
   on('tool.register', (_$, e: any) => {
     toolSpecs.push(e)
+    if (opts.toolRegisterThrows === e.name) throw new Error('registration unavailable')
     return { value: { tool: `mcp__${opts.toolNamespace ?? 'codex-mod'}__${e.name}` } }
   })
   on('fs.write', (_$, e: any) => {
@@ -186,7 +192,7 @@ function world(on: On, opts: WorldOpts = {}) {
   })
   on('session.cwd', () => ({ value: location.cwd }))
   on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
-  on('clock.now', () => ({ value: clock.now }))
+  on('clock.now', async () => ({ value: opts.clockNow ? await opts.clockNow(clock.now) : clock.now }))
   on('clock.sleep', (_$, e: any) => {
     sleeps.push(e.ms)
     clock.now += e.ms
@@ -296,7 +302,7 @@ const validDisplayResult = (result: unknown): boolean =>
   result === undefined || typeof result === 'string' || (Array.isArray(result) && result.every(block =>
     block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string'))
 const assertDisplayAnswer = (tool: string, answer: any) => {
-  if (/^mcp__.*__codex_(tool|plan)$/.test(tool) && !('deny' in answer)) {
+  if (/^mcp__.*__(codex_(tool|plan)|coordinator_message)$/.test(tool) && !('deny' in answer)) {
     expect(validDisplayResult(answer.result)).toBe(true)
   }
 }
@@ -957,15 +963,15 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
-  expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
-  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan'])
+  expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message'])
   expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
   expect(w.toolSpecs[1].inputSchema.properties.steps.items.properties.status.enum).toEqual(['pending', 'in_progress', 'completed'])
-  // The host spreads arguments beside its envelope fields, so both schemas
+  // The host spreads arguments beside its envelope fields, so display schemas
   // must keep these keys out of their top-level inputs.
   const envelopeKeys = ['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent', 'input', 'ceiling']
-  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps']])
+  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text']])
   for (const spec of w.toolSpecs) {
     expect(spec.inputSchema.additionalProperties).toBe(false)
     expect(Object.keys(spec.inputSchema.properties).some(key => envelopeKeys.includes(key))).toBe(false)
@@ -1330,6 +1336,343 @@ test('a delivery to an agent that is not ours is forgotten when its turn ends', 
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'turn-1', agentId: 'agent-gp', reason: 'end_turn' } as any)
   expect(w.modelCalls).toEqual(['agent-gp'])
   expect(w.spawned.length).toBe(0)
+})
+
+// ---- Coordinator receipt display --------------------------------------------
+
+const COORDINATOR_TOOL = 'mcp__codex-mod__coordinator_message'
+const coordinatorCalls = (chunks: any[]) => callsOf(chunks).filter(c => c.name.endsWith('__coordinator_message'))
+const quietCoordinatorRecord = (text: string, uuid = 'saved-row') => ({
+  model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', agentName: 'codex',
+  lastTask: 'first', userCount: 1, handedBack: false, lastAnswer: 'Previous Codex answer', updatedAt: 1_000_000,
+  coordinator: { received: [uuid], pending: [{ uuid, text }] },
+})
+
+test('coordinator receipt: full original message, returned name, UUID dedup across steps, no extra action count or handback text', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const w = world(on, { toolNamespace: 'runtime', messages: () => conv, pieces: [THREAD('echo'), cmdDone('/bin/zsh -lc make'), cmdDone('/bin/zsh -lc lint'), MESSAGE('built')] })
+  const first = await step($, 'agent-coordinator')
+  await runCalls($, first.chunks, 'agent-coordinator')
+  conv.push(...toolResult('Bash'))
+  const text = `codex-model: gpt-6.1-sol\ncodex-effort: high\n  Keep every line.\n\n${'Full message, no excerpt. '.repeat(12)}\n\n`
+  await $.session.append(deliveryRow('agent-coordinator', 'full-row', text))
+  await $.session.append(deliveryRow('agent-coordinator', 'full-row', text))
+  const second = await step($, 'agent-coordinator', 1)
+  expect(coordinatorCalls(second.chunks).map(c => [c.name, c.input])).toEqual([
+    ['mcp__runtime__coordinator_message', { sourceUuid: 'full-row', text }],
+  ])
+  expect(callsOf(second.chunks).map(c => c.name)).toEqual(['mcp__runtime__coordinator_message', 'Bash'])
+  expect(second.result.toolUses.map((c: any) => c.name)).toEqual(['mcp__runtime__coordinator_message', 'Bash'])
+  expect(second.chunks.find(c => c.kind === 'text').text).toBe(steerNote('queued'))
+  const spec = w.toolSpecs.find(s => s.name === 'coordinator_message')
+  expect(spec).toMatchObject({ isDeferred: false, inputSchema: { required: ['sourceUuid', 'text'], additionalProperties: false } })
+  expect(spec.description).toContain('Display-only coordinator message')
+  expect(spec.description).toContain('Never call')
+  const answers = await runCalls($, second.chunks, 'agent-coordinator')
+  expect(answers[0]).toEqual({ result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })
+  conv.push(...toolResult('Bash'))
+  await $.session.append(deliveryRow('agent-coordinator', 'full-row', text))
+  const final = await step($, 'agent-coordinator', 2)
+  expect(coordinatorCalls(final.chunks)).toEqual([])
+  expect(handback(final.result)).toContain('built')
+  expect(handback(final.result)).toContain('2 actions')
+  expect(handback(final.result)).not.toContain('Full message')
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toEqual({ received: ['full-row'], pending: [] })
+})
+
+for (const nativeActions of [true, false]) {
+  test(`coordinator record reload: pending display only, persisted UUID prevents re-show and never launches or replaces the answer (nativeActions ${nativeActions})`, { options: { nativeActions } }, async ($, on) => {
+    const text = 'codex-effort: high\nReloaded coordinator text'
+    const key = 'agent:sess-1:agent-coordinator-reload'
+    let conv: any[] = [user('first')]
+    const w = world(on, { store: new Map([[key, quietCoordinatorRecord(text)]]), messages: () => conv })
+    // A repeated receipt after restart must not requeue it for Codex either.
+    await $.session.append(deliveryRow('agent-coordinator-reload', 'saved-row', text))
+    const displayed = await step($, 'agent-coordinator-reload', 1)
+    if (nativeActions) {
+      expect(coordinatorCalls(displayed.chunks).map(c => c.input)).toEqual([{ sourceUuid: 'saved-row', text }])
+      expect(displayed.result.stopReason).toBe('tool_use')
+      await runCalls($, displayed.chunks, 'agent-coordinator-reload')
+      conv.push(...toolResult(COORDINATOR_TOOL, coordinatorCalls(displayed.chunks)[0].id))
+    } else {
+      expect(displayed.chunks.filter(c => c.kind === 'text')).toEqual([{ kind: 'text', index: 0, text: `Coordinator message:\n\n${text}` }])
+      expect(displayed.result.answer).toBe(`Coordinator message:\n\n${text}`)
+      expect(displayed.result.toolUses).toEqual([])
+    }
+    const stored = w.store.get(key) as any
+    expect(stored.coordinator).toEqual({ received: ['saved-row'], pending: [] })
+    expect(stored.lastAnswer).toBe('Previous Codex answer')
+    expect(stored.followUps).toBe(undefined)
+    await $.session.append(deliveryRow('agent-coordinator-reload', 'saved-row', text))
+    const later = await step($, 'agent-coordinator-reload', 2)
+    expect(later.chunks.filter(c => c.kind === 'text' || c.kind === 'tool')).toEqual([])
+    expect(later.result.stopReason).toBe('end_turn')
+    expect(w.logs.some(l => l.includes('record reloaded from the store'))).toBe(true)
+    expect(w.spawned).toEqual([])
+    expect(w.modelCalls).toEqual([])
+    expect(w.core).toEqual([])
+  })
+}
+
+test('coordinator displayed UUID loaded from the store is not shown or queued again', async ($, on) => {
+  const record = quietCoordinatorRecord('Already shown')
+  record.coordinator.pending = []
+  const w = world(on, { task: 'first', store: new Map([['agent:sess-1:agent-coordinator-reload', record]]) })
+  await $.session.append(deliveryRow('agent-coordinator-reload', 'saved-row', 'Already shown'))
+  const s = await step($, 'agent-coordinator-reload')
+  expect(s.result.toolUses).toEqual([])
+  expect(s.chunks.filter(c => c.kind === 'text')).toEqual([])
+  expect(w.spawned).toEqual([])
+  expect(w.logs.some(l => l.includes('record reloaded from the store'))).toBe(true)
+})
+
+test('coordinator first receipt survives a copied launch record waiting for its save timestamp', async ($, on) => {
+  const key = 'agent:sess-1:agent-coordinator'
+  const { coordinator: _coordinator, ...record } = quietCoordinatorRecord('unused')
+  let clocks = 0
+  let reached!: () => void
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { reached = resolve })
+  const released = new Promise<void>(resolve => { release = resolve })
+  const w = world(on, { task: 'second', store: new Map([[key, record]]), pieces: [cmdDone('/bin/zsh -lc make'), MESSAGE('done')], clockNow: async now => {
+    // startRun reads launch-guard time first, then saveRecord's timestamp.
+    if (++clocks === 2) {
+      reached()
+      await released
+    }
+    return now
+  } })
+  const pending = step($, 'agent-coordinator')
+  await waiting
+  await $.session.append(deliveryRow('agent-coordinator', 'during-save', 'Keep this receipt'))
+  release()
+  const s = await pending
+  expect(coordinatorCalls(s.chunks).map(c => c.input)).toEqual([{ sourceUuid: 'during-save', text: 'Keep this receipt' }])
+  expect((w.store.get(key) as any).coordinator).toEqual({ received: ['during-save'], pending: [] })
+  expect(w.spawned.length).toBe(1)
+})
+
+test('coordinator delayed receipt save preserves newer launch metadata and drained display state', async ($, on) => {
+  const key = 'agent:sess-1:agent-coordinator'
+  const { coordinator: _coordinator, ...record } = quietCoordinatorRecord('unused')
+  let clocks = 0
+  let reached!: () => void
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { reached = resolve })
+  const released = new Promise<void>(resolve => { release = resolve })
+  const w = world(on, { task: 'second', store: new Map([[key, record]]), pieces: [cmdDone('/bin/zsh -lc make'), MESSAGE('done')], clockNow: async now => {
+    if (++clocks === 1) {
+      reached()
+      await released
+    }
+    return now
+  } })
+  const receipt = $.session.append(deliveryRow('agent-coordinator', 'slow-receipt', 'Preserve the newer launch'))
+  await waiting
+  const s = await step($, 'agent-coordinator')
+  expect(coordinatorCalls(s.chunks).length).toBe(1)
+  release()
+  await receipt
+  expect(w.store.get(key)).toMatchObject({
+    lastTask: 'second', launchKey: '1:second', launchesSinceNew: 1,
+    coordinator: { received: ['slow-receipt'], pending: [] },
+  })
+  expect(w.spawned.length).toBe(1)
+})
+
+test('coordinator concurrent first receipts share their UUIDs and bodies before persistence awaits', async ($, on) => {
+  let clocks = 0
+  let reached!: () => void
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { reached = resolve })
+  const released = new Promise<void>(resolve => { release = resolve })
+  const w = world(on, { task: 'first', clockNow: async now => {
+    if (++clocks === 1) {
+      reached()
+      await released
+    }
+    return now
+  } })
+  const first = $.session.append(deliveryRow('agent-coordinator', 'concurrent-1', 'First receipt'))
+  await waiting
+  await $.session.append(deliveryRow('agent-coordinator', 'concurrent-2', 'Second receipt'))
+  release()
+  await first
+  const s = await step($, 'agent-coordinator')
+  expect(coordinatorCalls(s.chunks).map(c => c.input)).toEqual([
+    { sourceUuid: 'concurrent-1', text: 'First receipt' }, { sourceUuid: 'concurrent-2', text: 'Second receipt' },
+  ])
+  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toEqual({ received: ['concurrent-1', 'concurrent-2'], pending: [] })
+})
+
+test('coordinator display guards: own answer only once, foreign IDs, wrong owner, dispatch and main-model calls denied', async ($, on) => {
+  const w = world(on, { task: 'first', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord('Guarded text')]]) })
+  const s = await step($, 'agent-coordinator')
+  const [call] = coordinatorCalls(s.chunks)
+  for (const [tool, id, agentId] of [
+    [call.name, 'foreign', 'agent-coordinator'],
+    [call.name, 'toolu_codexmod_forged', 'agent-coordinator'],
+    [call.name, call.id, undefined],
+    [call.name, call.id, 'agent-gp'],
+    ['mcp__codex-mod__codex_tool', call.id, 'agent-coordinator'],
+  ]) {
+    const answer: any = await $.tool.call({ tool, ...call.input, tool_use_id: id, ...(agentId ? { agentId } : {}) } as any)
+    expect(answer.deny).toContain('not executed')
+  }
+  const check: any = await $.tool.check({ tool: call.name, input: call.input, tool_use_id: call.id, agentId: 'agent-coordinator' } as any)
+  expect(check.decision).toBe('deny')
+  const [answer] = await runCalls($, s.chunks, 'agent-coordinator')
+  expect(answer.result).toEqual([{ type: 'text', text: 'Received; delivery status is reported separately' }])
+  const replay: any = await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-coordinator' } as any)
+  expect(replay.deny).toContain('not executed')
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+})
+
+test('coordinator receipt ignores other agents, main, peer and plugin origins', async ($, on) => {
+  const w = world(on)
+  await $.session.append(deliveryRow('agent-gp', 'foreign-row', 'Other agent'))
+  for (const kind of ['peer', 'plugin']) {
+    await $.session.append({ ...deliveryRow('agent-coordinator', `origin-${kind}`, 'Not the coordinator'), origin: { kind, name: 'other', sessionId: 'other' } } as any)
+  }
+  const main = deliveryRow('agent-coordinator', 'main-row', 'Main session')
+  await $.session.append({ ...main, agentId: undefined } as any)
+  expect(w.store.size).toBe(0)
+})
+
+test('coordinator registration failure falls back to full text and still registers agents', async ($, on) => {
+  const text = 'Complete fallback message'
+  const w = world(on, { task: 'first', toolRegisterThrows: 'coordinator_message', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord(text)]]) })
+  const agents: any[] = []
+  on('agent.register', (_$, e: any) => {
+    agents.push(e)
+    return { value: { agent: `codex-mod:${e.name}` } }
+  })
+  await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  expect(agents.length).toBe(1)
+  expect(agents[0].tools.includes(COORDINATOR_TOOL)).toBe(false)
+  const s = await step($, 'agent-coordinator')
+  expect(s.chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual([`Coordinator message:\n\n${text}`])
+  expect(coordinatorCalls(s.chunks)).toEqual([])
+  expect(w.spawned).toEqual([])
+})
+
+for (const nativeActions of [true, false]) {
+  test(`coordinator long messages split into consecutive source-linked parts above 90,000 characters (nativeActions ${nativeActions})`, { options: { nativeActions } }, async ($, on) => {
+    const text = `${'a'.repeat(90000)}${'b'.repeat(90000)}end`
+    const w = world(on, { task: 'first', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord(text)]]) })
+    const s = await step($, 'agent-coordinator')
+    const parts = nativeActions ? coordinatorCalls(s.chunks).map(c => c.input.text) : s.chunks.filter(c => c.kind === 'text').map(c => c.text.replace('Coordinator message:\n\n', ''))
+    expect(parts).toEqual([`(part 1/3)\n${'a'.repeat(90000)}`, `(part 2/3)\n${'b'.repeat(90000)}`, '(part 3/3)\nend'])
+    expect(parts.map(t => t.replace(/^\(part \d+\/\d+\)\n/, '')).join('')).toBe(text)
+    if (nativeActions) {
+      expect(coordinatorCalls(s.chunks).map(c => c.input.sourceUuid)).toEqual(['saved-row', 'saved-row', 'saved-row'])
+      await runCalls($, s.chunks, 'agent-coordinator')
+    }
+    expect(w.spawned).toEqual([])
+  })
+}
+
+test('coordinator card uses only the exact returned tool and emitted IDs, with literal full text after guard consumption', async ($, on) => {
+  const text = '<tag>**literal coordinator text**</tag>'
+  world(on, { task: 'first', toolNamespace: 'runtime', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord(text)]]) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  const s = await step($, 'agent-coordinator')
+  const [call] = coordinatorCalls(s.chunks)
+  await runCalls($, s.chunks, 'agent-coordinator')
+  const render = (tool: string, id: string) => $.ui.render({ component: 'ToolUse', surface: 'desktop', requestId: id, props: {
+    tool, tool_use_id: id, input: { sourceUuid: 'forged', text: 'forged body' }, isRunning: false, isErrored: false, isInterrupted: false,
+  } } as any)
+  const card: any = await render(call.name, call.id)
+  expect(card.type).toBe('Box')
+  expect(card.children[0]).toMatchObject({ type: 'Text', props: { weight: 'semibold' }, children: ['Coordinator'] })
+  expect(card.children[1]).toMatchObject({ type: 'Text', children: [text] })
+  for (const [tool, id] of [[COORDINATOR_TOOL, call.id], [call.name, 'toolu_codexmod_unemitted'], [call.name, 'foreign'], ['Bash', call.id]]) {
+    const fallback: any = await render(tool, id)
+    expect(fallback.type).toBe('Text')
+    expect(fallback.children).toEqual(['HOST'])
+  }
+})
+
+test('coordinator render errors fall back through next(e)', async () => {
+  let render: any
+  let catcher: any
+  codexRegister(((event: string, ...args: any[]) => {
+    const selected = event === 'ui.render' && args[0]?.component === 'ToolUse'
+    if (selected) render = args.at(-1)
+    return { catch: (handler: any) => { if (selected) catcher = handler } }
+  }) as any, {})
+  const e = { props: { get tool_use_id() { throw new Error('Render failure') } } }
+  let passed: any
+  const next = (value: any) => { passed = value; return { type: 'Text', children: ['HOST'] } }
+  let threw = false
+  try { render({}, e, next) } catch { threw = true }
+  expect(threw).toBe(true)
+  expect(catcher({}, e, next)).toEqual({ type: 'Text', children: ['HOST'] })
+  expect(passed === e).toBe(true)
+})
+
+test('coordinator receipt between a tool header and input waits for the next block boundary', async ($, on) => {
+  const w = world(on, { task: 'first', pieces: [cmdDone('/bin/zsh -lc make'), MESSAGE('built')] })
+  const stream = $.turn.step({ turnId: 'turn-1', index: 0, agentId: 'agent-coordinator', model: 'claude-haiku-4-5', messageCount: 1 })
+  const header = await stream.next()
+  expect(header.value).toMatchObject({ kind: 'tool', index: 0, name: 'Bash' })
+  await $.session.append(deliveryRow('agent-coordinator', 'between-blocks', 'Do not break the tool input'))
+  const input = await stream.next()
+  expect(input.value).toMatchObject({ kind: 'input', index: 0 })
+  const chunks: any[] = [header.value, input.value]
+  let result: any
+  for (;;) {
+    const r = await stream.next()
+    if (r.done) { result = r.value; break }
+    chunks.push(r.value)
+  }
+  expect(callsOf(chunks).map(c => c.name)).toEqual(['Bash', COORDINATOR_TOOL])
+  expect(result.toolUses.map((c: any) => c.name)).toEqual(['Bash', COORDINATOR_TOOL])
+  await runCalls($, chunks, 'agent-coordinator')
+  expect(w.spawned.length).toBe(1)
+  expect(w.core).toEqual([])
+})
+
+test('coordinator plain text received mid-stream uses a separate block and never enters the handback or saved answer', { options: { nativeActions: false } }, async ($, on) => {
+  const text = 'codex-effort: high\n  Full message after the first action.\n\n'
+  const w = world(on, { task: 'first', pieces: [cmdDone('/bin/zsh -lc make'), cmdDone('/bin/zsh -lc lint'), MESSAGE('built')] })
+  const stream = $.turn.step({ turnId: 'turn-1', index: 0, agentId: 'agent-coordinator-stream', model: 'claude-haiku-4-5', messageCount: 1 })
+  const first = await stream.next()
+  expect(first.value).toMatchObject({ kind: 'text', index: 0, text: '$ make' })
+  await $.session.append(deliveryRow('agent-coordinator-stream', 'midstream', text))
+  const chunks: any[] = [first.value]
+  let result: any
+  for (;;) {
+    const r = await stream.next()
+    if (r.done) { result = r.value; break }
+    chunks.push(r.value)
+  }
+  expect(chunks.filter(c => c.kind === 'text').map(c => [c.index, c.text])).toEqual([
+    [0, '$ make'], [1, `Coordinator message:\n\n${text}`], [2, '\n\n$ lint'],
+  ])
+  expect(result.answer).toContain(`Coordinator message:\n\n${text}`)
+  expect(handback(result)).toContain('built')
+  expect(handback(result)).not.toContain('Full message')
+  expect((w.store.get('agent:sess-1:agent-coordinator-stream') as any).lastAnswer).not.toContain('Full message')
+  expect(w.spawned.length).toBe(1)
+})
+
+test('coordinator literal payload preserves whitespace and embedded reminder tags, with or without the host suffix', async () => {
+  const text = '  codex-effort: high\n\n<tag>**message**</tag>\n<system-reminder>literal</system-reminder>\n  \n'
+  for (const address of [true, false]) expect(coordinatorPayload(DELIVERED(text, 'exact', address), true)).toBe(text)
+  expect(coordinatorPayload(DELIVERED(text))).toBe(text.trim())
+})
+
+test('coordinator split keeps a surrogate pair intact at the 90,000 character boundary', async ($, on) => {
+  const text = `${'a'.repeat(89999)}😀tail`
+  world(on, { task: 'first', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord(text)]]) })
+  const s = await step($, 'agent-coordinator')
+  expect(coordinatorCalls(s.chunks).map(c => c.input.text)).toEqual([`(part 1/2)\n${'a'.repeat(89999)}`, '(part 2/2)\n😀tail'])
 })
 
 // ---- options ----------------------------------------------------------------
@@ -1986,9 +2329,7 @@ test('helpers: runner lines, versions, model_provider, runner argv, footer with 
   expect(footer({ ...p, transport: 'app-server', steers: 2 })).toBe('codex · m · low · workspace-write · app-server · 2 steers · 2 actions')
   expect(footer({ ...p, transport: 'app-server', steers: 0 })).toBe('codex · m · low · workspace-write · app-server · 2 actions')
   expect(footer({ ...p, transport: 'app-server', steers: 1 }, 'short')).toBe('codex · m · low')
-  expect(steerNote('accepted', 'codex-effort: high\n  fix the  tests\nplease')).toBe('↪ steer delivered to Codex mid-turn: "fix the tests please"')
-  const long = steerNote('accepted', 'x'.repeat(200))
-  expect(long).toBe(`↪ steer delivered to Codex mid-turn: "${'x'.repeat(77)}..."`)
+  expect(steerNote('accepted')).toBe('↪ steer delivered to Codex mid-turn')
   expect(steerNote('finished')).toBe('↪ Codex had already finished; this message runs next, on the same thread')
   expect(steerNote('queued')).toBe('↪ queued: runs after this turn (exec transport has no mid-turn steer)')
   expect(parseConfig({})).toMatchObject({ transport: 'exec', nodeOverride: undefined })
@@ -2113,8 +2454,8 @@ test('app-server steer: a message arriving mid-run is written as a steer file; a
   expect(w.writes).toEqual([{ path: `${control}/steer-000002.json`, text: JSON.stringify({ text: 'also add tests' }) }])
   // the control dir was created private before any steer file went into it
   expect(w.runs.some(r => r[0] === 'mkdir' && r.slice(1, 4).join(' ') === '-p -m 700' && r.includes('/home/t/.cache/codex-mod/runs') && r.at(-1) === control)).toBe(true)
-  // the note says what was steered (without the override line), before Codex's answer
-  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual(['↪ steer delivered to Codex mid-turn: "also add tests"', 'built, with tests'])
+  // the status note precedes Codex's answer without repeating the message
+  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted'), 'built, with tests'])
   expect(lastLine(handback(s2.result))).toBe('codex · gpt-6.1-sol · medium · workspace-write · app-server · 1 steer · 1 action · 277 new tokens (21K cached, 46 out) · thread t-62')
   expect(w.store.get('agent:sess-1:agent-app-steer')).toMatchObject({ userCount: 2, lastTask: 'codex-effort: high\nalso add tests', launchKey: '2:codex-effort: high\nalso add tests' })
   // the handback's result ends the turn; the steered message never launches again
@@ -2185,7 +2526,7 @@ test('app-server mid-step: while a step waits on the runner, a new message is st
   expect(w.writes.map(x => JSON.parse(x.text))).toEqual([{ text: 'Keep the change bounded.\n\nchange of plan' }])
   // the pull that was pending when the checks ran was read on, nothing lost; the
   // accepted steer is announced before Codex's answer
-  expect(handback(result).startsWith(`${steerNote('accepted', 'change of plan')}\n\ndone, steered`)).toBe(true)
+  expect(handback(result).startsWith(`${steerNote('accepted')}\n\ndone, steered`)).toBe(true)
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
   expect(w.spawned.length).toBe(1)
 })
@@ -2205,7 +2546,7 @@ test('app-server, nativeActions off: the accepted steer\'s note streams as text;
   }
   w = appWorld(on, { messages: () => conv, pieces: [THREAD('t-69'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), steered, ACK(2, 'accepted'), MESSAGE('done'), USAGE] })
   const { chunks, result } = await step($, 'agent-app-plain-steer', 0)
-  expect(chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual(['$ make', `\n\n${steerNote('accepted', 'change of plan, use the other parser')}`])
+  expect(chunks.filter(c => c.kind === 'text').map(c => c.text)).toEqual(['$ make', `\n\n${steerNote('accepted')}`])
   expect(result.toolUses.map((u: any) => u.name)).toEqual(['SubagentHandback'])
   expect(handback(result).startsWith('done\n\n')).toBe(true)
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 1 action')
@@ -2222,7 +2563,7 @@ test('app-server: a coordinator delivery appended as an attachment mid-step is s
   const { result } = await pending
   const control = w.spawned[0]!.argv.at(-1)!
   expect(w.writes).toEqual([{ path: `${control}/steer-000001-row-7.json`, text: JSON.stringify({ text: 'change of plan' }) }])
-  expect(handback(result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted', 'change of plan'), 'steered, done'])
+  expect(handback(result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted'), 'steered, done'])
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
   expect(w.store.get('agent:sess-1:agent-app-deliver')).toMatchObject({ lastTask: 'long task', userCount: 1, launchKey: '1:codex-effort: high\nchange of plan' })
   expect((w.store.get('agent:sess-1:agent-app-deliver') as any).followUps).toBe(undefined)
@@ -2374,7 +2715,7 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(registered.length).toBe(1)
-  expect(registered[0].tools).toEqual(['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan'])
+  expect(registered[0].tools).toEqual(['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message'])
   const first = await step($, 'agent-progress')
   expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
   expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
@@ -2485,7 +2826,7 @@ test('phase 3 safety: every guard exception denies, including main-model registe
     return { catch: (handler: any) => { entry.catcher = handler } }
   }) as any, {})
   const $ = { agent: { list: async () => { throw new Error('Cannot resolve agent') } } }
-  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan']) {
+  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message']) {
     for (const name of ['tool.call', 'tool.check']) {
       const guard = guards.get(name)!
       const e = { tool, agentId: 'unresolved-phase3-agent', tool_use_id: 'foreign' }
