@@ -6,7 +6,7 @@ You need Claude Code with plugin hooks-module support and, to exercise the plugi
 
 ## Checks
 
-Run both before opening a pull request:
+Run these checks before opening a pull request:
 
 ```bash
 claude plugin test .
@@ -14,7 +14,32 @@ claude plugin validate --strict .
 node --test tests/runner.test.mjs
 ```
 
-The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment; the runner tests can. CI (`.github/workflows/ci.yml`) therefore runs only the runner tests, a syntax check and a JSON validity check on Ubuntu and macOS with Node 20 and 22; the hook tests and `claude plugin validate` run locally.
+The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment. CI (`.github/workflows/ci.yml`) runs the runner tests, a syntax check and a JSON validity check on Ubuntu and macOS with Node 20 and 22; the hook tests and `claude plugin validate` run locally.
+
+The cache and checkpoint tests import TypeScript helpers. Run them with Node 22
+or later; CI exercises them on Node 22 on both operating systems:
+
+```bash
+node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs
+```
+
+## Release checklist
+
+1. Match the version in `.claude-plugin/plugin.json`, README and CHANGELOG;
+   update the marketplace description when agent names change.
+2. Run the checks above and verify the GitHub CI matrix. Hook suites remain
+   local evidence, separate from hosted CI.
+3. Record live Desktop checks and remaining limits in `docs/codex-ui-map.md`.
+   Do not describe an unaccepted custom renderer or control as verified.
+4. Document removed options/types and the migration path. Keep manual harnesses
+   and their fixtures; store temporary probes, logs and session checkpoints
+   outside the repository.
+5. Prepare a PR and release notes from the final commit. The owner's release
+   decision must account for remaining acceptance gates. Create the version
+   tag from that commit when publishing; never move an existing release tag.
+6. After installing/updating, inspect `claude plugin list` for scope, version
+   and loaded path, then use a fresh session. A directory marketplace may load
+   the checkout directly rather than the metadata cache.
 
 ## Style
 
