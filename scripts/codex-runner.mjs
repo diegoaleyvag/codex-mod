@@ -30,9 +30,10 @@
 // control dir; never prints credentials.
 
 import { spawn } from 'node:child_process'
-import { chmodSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { TreeUsage } from '../hooks/tree-usage.mjs'
 import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
 
 const PROTOCOL_VERSION = 1
@@ -48,7 +49,7 @@ const OPT_OUT = [
 // Anything else is reported once at the end as protocol drift evidence.
 const KNOWN_METHODS = new Set([
   'error', 'warning', 'configWarning', 'deprecationNotice', 'guardianWarning',
-  'thread/started', 'thread/status/changed', 'thread/tokenUsage/updated', 'thread/settings/updated',
+  'rawResponse/completed', 'thread/started', 'thread/status/changed', 'thread/tokenUsage/updated', 'thread/settings/updated',
   'thread/name/updated', 'thread/goal/updated', 'thread/goal/cleared', 'thread/readState/changed', 'thread/prediction/updated', 'thread/compacted', 'thread/closed', 'thread/queue/changed',
   'turn/started', 'turn/completed', 'turn/diff/updated', 'turn/plan/updated', 'turn/moderationMetadata',
   'hook/started', 'hook/completed', 'item/started', 'item/completed', 'rawResponseItem/completed',
@@ -209,6 +210,17 @@ async function main() {
     process.stdout.write(`${PROTOCOL_VERSION}\n`)
     return
   }
+  if (argv[0] === 'observe') {
+    const a = parseArgs(argv.slice(1))
+    const until = Date.now() + 2000
+    for (;;) {
+      const owner = JSON.parse(readFileSync(join(a.control, 'owner.json'), 'utf8'))
+      let text = ''
+      try { text = readFileSync(join(a.control, `events-${a.thread}.jsonl`), 'utf8') } catch {}
+      if (text.length > Number(a.cursor) || owner.ended || owner.generation !== a.generation || Date.now() >= until) return
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
   if (argv[0] !== 'run') {
     process.stderr.write('usage: codex-runner.mjs run --codex <path> --cwd <dir> --model <m> --effort <e> --sandbox <s> [--thread <id>] [--config k=v]... --control <dir>\n')
     process.exit(2)
@@ -241,14 +253,52 @@ async function main() {
   const unknownMethods = new Set()
   const unknownItems = new Set()
   const itemLifecycles = new Set()
-  let baseline // total usage before this turn
-  let lastTotal
   const turnWaiters = []
   const retries = new Map()
   const inflight = new Set()
   const questions = new Map()
   const requestIds = new Map()
   let ppid = process.ppid
+  const nested = args.nested !== 'false'
+  const generation = randomUUID()
+  const threads = new Map()
+  const early = new Map()
+  const usage = new TreeUsage()
+  let drainTimer
+  let rootCode = 0
+  let parentStopping = false
+  const journal = id => join(args.control, `events-${id}.jsonl`)
+  const ownerState = () => {
+    const path = join(args.control, 'owner.json')
+    writeFileSync(path + '.tmp', JSON.stringify({ generation, updatedAt: Date.now(), ended: finished }))
+    renameSync(path + '.tmp', path)
+  }
+  const childEmit = (state, event) => {
+    const tagged = event.type === 'codexmod.child' ? { ...event, owner_thread_id: state.id, owner_turn_id: state.turnId }
+      : { ...event, thread_id: state.id, turn_id: state.turnId }
+    appendFileSync(journal(state.id), JSON.stringify(tagged) + '\n', { mode: 0o600 })
+    emit({ type: 'codexmod.childEvent', thread_id: state.id, turn_id: state.turnId, event: tagged })
+  }
+  const usageSnapshot = (final = false) => {
+    if (!threadId || !turnId || !threads.size) return
+    writeFileSync(join(args.control, 'usage.json'), JSON.stringify({ version: 1, generation, edges: [...usage.edges], turns: [...usage.turns], responses: [...usage.responses] }), { mode: 0o600 })
+    for (const state of threads.values()) {
+      const snapshot = usage.snapshot(state.id, state.rootTurnId)
+      if (state.id === threadId && !final) emit({ type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
+      else if (state.id !== threadId && !state.attaching && !state.failed) childEmit(state, { type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
+      if (!snapshot.children) continue
+      const event = { type: 'codexmod.treeUsage', ...snapshot,
+        active: snapshot.threadIds.filter(id => id !== state.id && threads.has(id) && !threads.get(id).done && !threads.get(id).failed).length }
+      if (state.id === threadId) emit(event)
+      else childEmit(state, event)
+    }
+  }
+  const maybeFinish = () => {
+    clearTimeout(drainTimer)
+    if (!turnDone || [...threads.values()].some(t => t.id !== threadId && (t.attaching || !t.done && !t.failed))) return
+    // Final usage can follow terminal notifications on the same connection.
+    drainTimer = setTimeout(() => { usageSnapshot(true); void finish(rootCode) }, 200)
+  }
 
   const flushAndExit = code => {
     const t = setTimeout(() => process.exit(code), 500)
@@ -278,6 +328,8 @@ async function main() {
   const finish = async code => {
     if (finished) return
     finished = true
+    ownerState()
+    clearTimeout(drainTimer)
     clearInterval(poller)
     clearInterval(parentWatch)
     clearTimeout(interruptTimer)
@@ -286,6 +338,8 @@ async function main() {
     if (unknownMethods.size > 0 || unknownItems.size > 0) {
       emit({ type: 'codexmod.protocol', unknown_methods: [...unknownMethods], unknown_items: [...unknownItems] })
     }
+    await Promise.all([...threads.values()].filter(t => t.id !== threadId && !t.failed && t.done).map(t =>
+      Promise.race([send('thread/unsubscribe', { threadId: t.id }).catch(() => {}), new Promise(resolve => setTimeout(resolve, 300))])))
     await killChild()
     flushAndExit(code)
   }
@@ -298,7 +352,8 @@ async function main() {
   const send = (method, params) =>
     new Promise((resolve, reject) => {
       const id = ++nextId
-      pending.set(id, { resolve, reject })
+      const timer = setTimeout(() => { pending.delete(id); reject({ code: -32000, message: `${method} outcome unknown (timeout)` }) }, 10000)
+      pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value) }, reject: error => { clearTimeout(timer); reject(error) } })
       try {
         child.stdin.write(JSON.stringify({ id, method, params }) + '\n')
       } catch (e) {
@@ -335,6 +390,7 @@ async function main() {
 
   const shutdown = async () => {
     if (finished) return
+    for (const t of threads.values()) if (t.id !== threadId && t.turnId && !t.done && !t.failed) void interruptThread(t, 'owner shutdown')
     if (turnId && !turnDone) await interrupt(2000)
     await finish(1)
   }
@@ -352,7 +408,24 @@ async function main() {
 
   // --- control directory ----------------------------------------------------
 
-  const ack = (id, status, reason) => emit({ type: 'codexmod.steer', id, status, ...(reason ? { reason } : {}) })
+  const ack = (id, status, reason, target) => {
+    const event = { type: 'codexmod.steer', id, status, ...(reason ? { reason } : {}) }
+    if (target && target.id !== threadId) childEmit(target, event)
+    else emit(event)
+  }
+  const interrupted = new Set()
+  const interruptThread = async (target, operationId) => {
+    const key = JSON.stringify([target.id, target.turnId])
+    if (!target.turnId || target.done || target.failed || interrupted.has(key)) return
+    interrupted.add(key)
+    try {
+      await send('turn/interrupt', { threadId: target.id, turnId: target.turnId })
+      childEmit(target, { type: 'codexmod.interrupt', operationId, status: 'accepted' })
+    } catch (e) {
+      childEmit(target, { type: 'codexmod.interrupt', operationId, status: 'unknown', message: String(e?.message ?? e) })
+    }
+  }
+
   const fileId = name => {
     const id = name.slice('steer-'.length, -'.json'.length)
     return /^\d+$/.test(id) ? Number(id) : id
@@ -363,8 +436,12 @@ async function main() {
     } catch {}
   }
 
-  const requestEvent = (q, status, extra = {}) => emit({ type: 'codexmod.request', token: q.token,
-    requestId: q.id, method: q.method, params: q.params, status, ...extra })
+  const requestEvent = (q, status, extra = {}) => {
+    const event = { type: 'codexmod.request', token: q.token, requestId: q.id, method: q.method, params: q.params, status, ...extra }
+    const target = threads.get(q.params.threadId)
+    if (target && target.id !== threadId && !target.attaching && !target.failed) childEmit(target, event)
+    else if (q.params.threadId === undefined || q.params.threadId === threadId) emit(event)
+  }
   const settleQuestion = (q, response, status) => {
     if (!questions.delete(q.token)) return
     const failed = () => requestEvent(q, 'failed', { error: { code: -32000, message: 'question response could not be delivered to Codex' } })
@@ -389,14 +466,14 @@ async function main() {
     else emit({ type: 'codexmod.responseRejected', token, message: 'invalid question response; no answer delivered' })
   }
 
-  const handleSteer = async (name, path, text) => {
+  const handleSteer = async (name, path, text, target = { id: threadId, turnId }, messageId) => {
     const id = fileId(name)
     remove(path)
     try {
-      await send('turn/steer', { threadId, expectedTurnId: turnId, input: [{ type: 'text', text, text_elements: [] }] })
-      ack(id, 'accepted')
+      await send('turn/steer', { threadId: target.id, expectedTurnId: target.turnId, input: [{ type: 'text', text, text_elements: [] }], ...(messageId ? { clientUserMessageId: messageId } : {}) })
+      ack(id, 'accepted', undefined, target)
     } catch (e) {
-      ack(id, 'rejected', String(e?.message ?? 'turn/steer failed'))
+      ack(id, e?.code === -32000 || e?.code === -2 ? 'unknown' : 'rejected', String(e?.message ?? 'turn/steer failed'), target)
     }
   }
 
@@ -414,7 +491,17 @@ async function main() {
         responseFile(name, path, final)
         continue
       }
+      if (/^interrupt-.+\.json$/.test(name)) {
+        let body
+        try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { continue }
+        remove(path)
+        const target = threads.get(body.threadId)
+        if (!final && target && target.id !== threadId && target.turnId === body.turnId) void interruptThread(target, body.operationId)
+        continue
+      }
       if (name === 'interrupt') {
+        parentStopping = true
+        for (const t of threads.values()) if (t.id !== threadId) void interruptThread(t, 'parent stop')
         if (final || turnDone) {
           remove(path)
           continue
@@ -429,16 +516,28 @@ async function main() {
         continue
       }
       if (!/^steer-.+\.json$/.test(name) || inflight.has(name)) continue
-      if (final || turnDone) {
+      if (final) {
         remove(path)
-        ack(fileId(name), 'rejected', 'turn finished')
+        ack(fileId(name), 'rejected', 'owner finished')
         continue
       }
       if (!turnId) continue // hold until the turn id is known
       let text
+      let target
+      let messageId
       try {
         const body = JSON.parse(readFileSync(path, 'utf8'))
+        if (typeof body.messageId === 'string') messageId = body.messageId
+        if (body.threadId) {
+          target = threads.get(body.threadId)
+          if (!target || target.id === threadId || target.done || target.failed || !target.turnId || target.turnId !== body.turnId) {
+            remove(path)
+            ack(fileId(name), 'rejected', 'child turn stale or idle; no turn started', target)
+            continue
+          }
+        }
         if (typeof body?.text !== 'string') throw new Error('no text')
+        if (!target && turnDone) { remove(path); ack(fileId(name), 'rejected', 'turn finished'); continue }
         text = body.text
       } catch {
         const n = (retries.get(name) ?? 0) + 1
@@ -450,10 +549,11 @@ async function main() {
         continue
       }
       inflight.add(name)
-      handleSteer(name, path, text).finally(() => inflight.delete(name))
+      handleSteer(name, path, text, target, messageId).finally(() => inflight.delete(name))
     }
   }
-  const poller = setInterval(() => sweepControl(), 200)
+  const poller = setInterval(() => { ownerState(); sweepControl() }, 200)
+  ownerState()
 
   // --- translation ----------------------------------------------------------
 
@@ -462,10 +562,20 @@ async function main() {
       .filter(c => typeof c?.path === 'string' && c.path !== '')
       .map(c => ({ ...c }))
 
-  const handleNotification = m => {
+  const handleNotification = (m, state) => {
+    const threadId = state?.id ?? rootThread()
+    const turnId = state?.turnId ?? rootTurn()
+    const emit = event => state && state.id !== rootThread()
+      ? childEmit(state, event) : rootEmit(event)
     const p = m.params ?? {}
+    if (m.method === 'turn/completed') {
+      const turns = state.terminalTurns ??= new Set()
+      if (turns.has(turnId)) return
+      turns.add(turnId)
+    }
     if (!KNOWN_METHODS.has(m.method)) unknownMethods.add(m.method)
     const item = p.item
+    discover(item, threadId, turnId)
     if (item?.id && ['item/started', 'item/completed'].includes(m.method)) {
       const key = JSON.stringify([threadId, turnId, item.id, m.method])
       if (itemLifecycles.has(key) || (m.method === 'item/started' && itemLifecycles.has(JSON.stringify([threadId, turnId, item.id, 'item/completed'])))) return
@@ -487,20 +597,26 @@ async function main() {
     switch (m.method) {
       case 'thread/tokenUsage/updated': {
         const u = p.tokenUsage
+        usage.cumulative(threadId, turnId, state?.rootTurnId ?? rootTurn(), u)
+        usageSnapshot()
         if (u?.total) {
-          if (baseline === undefined) {
+          if (state.baseline === undefined) {
             // total before this turn's first model call = first total - first last
             const l = u.last ?? {}
-            baseline = {
+            state.baseline = {
               inputTokens: (u.total.inputTokens ?? 0) - (l.inputTokens ?? 0),
               cachedInputTokens: (u.total.cachedInputTokens ?? 0) - (l.cachedInputTokens ?? 0),
               outputTokens: (u.total.outputTokens ?? 0) - (l.outputTokens ?? 0),
             }
           }
-          lastTotal = u.total
+          state.lastTotal = u.total
         }
         break
       }
+      case 'rawResponse/completed':
+        usage.response(threadId, turnId, p.rootTurnId ?? state.rootTurnId ?? rootTurn(), p.responseId, p.usage)
+        usageSnapshot()
+        break
       case 'item/started':
         emit({ type: 'item.started', item: item?.type === 'fileChange' ? completedItem(item, changesOf) : { type: 'source_only' }, source })
         break
@@ -532,10 +648,11 @@ async function main() {
       }
       case 'turn/completed': {
         const t = p.turn ?? {}
-        turnDone = true
+        state.done = true
+        if (threadId === rootThread()) { turnDone = true; rootCode = t.status === 'completed' ? 0 : 1 }
         if (t.status === 'completed') {
-          const tot = lastTotal ?? {}
-          const b = baseline ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }
+          const tot = state.lastTotal ?? {}
+          const b = state.baseline ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }
           emit({
             type: 'turn.completed',
             usage: {
@@ -549,33 +666,132 @@ async function main() {
         } else {
           emit({ type: 'turn.failed', error: { message: t.error?.message ?? 'turn failed' } })
         }
-        for (const w of turnWaiters.splice(0)) w()
-        finish(t.status === 'completed' ? 0 : 1)
+        if (threadId === rootThread()) for (const w of turnWaiters.splice(0)) w()
+        maybeFinish()
         break
       }
     }
   }
 
-  // Ours when it belongs to our thread and (once known) our turn.
+  const rootThread = () => threadId
+  const rootTurn = () => turnId
+  const rootEmit = emit
+  const uuid = id => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+
+  const parentEmit = (state, event) => state.parent === threadId ? emit(event) : childEmit(threads.get(state.parent), event)
+
+  const attach = async state => {
+    try {
+      const result = await send('thread/resume', { threadId: state.id, excludeTurns: true })
+      const th = result?.thread
+      if (th?.id !== state.id || th.parentThreadId !== state.parent) throw new Error('child ancestry mismatch or missing parent')
+      if (th.historyMode && !['legacy', 'paginated'].includes(th.historyMode)) throw new Error(`unsupported child history mode ${th.historyMode}`)
+      state.model = th.model ?? state.model
+      // Buffer live notifications until history has been merged. Only this
+      // source generation is replayed; fork history is not a child action.
+      let cursor
+      const cursors = new Set()
+      do {
+        const page = await send('thread/turns/list', { threadId: state.id, limit: 100, sortDirection: 'asc', itemsView: 'summary', ...(cursor ? { cursor } : {}) })
+        if (!Array.isArray(page?.data)) throw new Error('invalid child turn history')
+        for (const turn of page.data) {
+          if (turn.rootTurnId !== state.rootTurnId) continue
+          state.turnId = turn.id
+          let itemCursor
+          const itemCursors = new Set()
+          do {
+            const items = await send('thread/items/list', { threadId: state.id, turnId: turn.id, limit: 100, sortDirection: 'asc', ...(itemCursor ? { cursor: itemCursor } : {}) })
+            if (!Array.isArray(items?.data)) throw new Error('invalid child item history')
+            for (const entry of items.data) {
+              if (entry.turnId !== turn.id || entry.completedAtMs == null) continue
+              handleNotification({ method: 'item/completed', params: { ...entry, threadId: state.id, turnId: turn.id } }, state)
+            }
+            itemCursor = items.nextCursor
+            if (itemCursor && itemCursors.has(itemCursor)) throw new Error('repeated child item cursor')
+            itemCursors.add(itemCursor)
+          } while (itemCursor)
+          if (['completed', 'failed', 'interrupted'].includes(turn.status)) handleNotification({ method: 'turn/completed', params: { threadId: state.id, turn } }, state)
+        }
+        cursor = page.nextCursor
+        if (cursor && cursors.has(cursor)) throw new Error('repeated child turn cursor')
+        cursors.add(cursor)
+      } while (cursor)
+      state.attaching = false
+      parentEmit(state, { type: 'codexmod.child', thread_id: state.id, parent_thread_id: state.parent,
+        source_turn_id: state.spawnTurn, source_item_id: state.spawnItem, root_turn_id: state.rootTurnId, turn_id: state.turnId ?? state.buffer.find(m => m.method === 'turn/started')?.params?.turn?.id,
+        path: state.path, model: state.model, effort: state.effort, status: 'attached', generation })
+      for (const m of state.buffer.splice(0)) route(m)
+      maybeFinish()
+    } catch (e) {
+      state.failed = true
+      state.attaching = false
+      state.buffer = []
+      parentEmit(state, { type: 'codexmod.child', thread_id: state.id, parent_thread_id: state.parent,
+        source_turn_id: state.spawnTurn, source_item_id: state.spawnItem, status: 'unavailable',
+        reason: String(e?.message ?? e), generation })
+      maybeFinish()
+    }
+  }
+
+  function discover(item, parent, spawnTurn) {
+    if (!nested || !item || ['failed', 'declined'].includes(item.status)) return
+    const ids = item.type === 'subAgentActivity' && item.kind === 'started' ? [item.agentThreadId]
+      : item.type === 'collabAgentToolCall' && item.tool === 'spawnAgent' ? item.receiverThreadIds ?? [] : []
+    for (const id of ids) {
+      if (!uuid(id) || id === threadId || threads.has(id)) continue
+      if (!usage.edge(parent, id)) continue
+      const state = { id, parent, spawnTurn, spawnItem: item.id, rootTurnId: threads.get(parent)?.rootTurnId ?? turnId,
+        path: item.agentPath, model: item.model, effort: item.reasoningEffort, attaching: true, done: false,
+        buffer: early.get(id) ?? [] }
+      early.delete(id)
+      threads.set(id, state)
+      void attach(state)
+    }
+  }
+
   const route = m => {
     const p = m.params ?? {}
-    if (p.threadId !== undefined && p.threadId !== threadId) return
-    if (m.method === 'turn/started' && !turnId && p.turn?.id) {
-      setTurn(p.turn.id)
+    if (!threadId) { buffered.push(m); return }
+    const id = p.threadId ?? p.thread?.id ?? threadId
+    if (id !== threadId) {
+      if (!nested) return
+      const state = threads.get(id)
+      if (!state) {
+        // Unsolicited data is held, never exposed without a verified edge.
+        if (uuid(id) && early.size < 32) { const q = early.get(id) ?? []; if (q.length < 256) q.push(m); early.set(id, q) }
+        return
+      }
+      if (state.failed) return
+      if (state.attaching) {
+        if (state.buffer.length >= 2048) { state.failed = true; state.buffer = []; emit({ type: 'codexmod.child', thread_id: id, parent_thread_id: state.parent, status: 'unavailable', reason: 'child replay buffer overflow' }) }
+        else state.buffer.push(m)
+        return
+      }
+      const tid = p.turnId ?? p.turn?.id
+      if (m.method === 'turn/started') {
+        if (p.turn.rootTurnId && p.turn.rootTurnId !== state.rootTurnId) return
+        if (state.turnId !== tid) { state.baseline = undefined; state.lastTotal = undefined }
+        state.turnId = tid
+        state.done = false
+        childEmit(state, { type: 'codexmod.turn', turn_id: tid })
+        if (parentStopping) void interruptThread(state, 'parent stop')
+      }
+      if (tid && !state.turnId) state.turnId = tid
+      if (tid && state.turnId !== tid) return
+      handleNotification(m, state)
       return
     }
+    if (m.method === 'turn/started' && !turnId && p.turn?.id) { setTurn(p.turn.id); return }
     const tid = p.turnId ?? p.turn?.id
-    if (!turnId) {
-      buffered.push(m)
-      return
-    }
+    if (!turnId) { buffered.push(m); return }
     if (tid !== undefined && tid !== turnId) return
-    handleNotification(m)
+    handleNotification(m, threads.get(threadId))
   }
 
   function setTurn(id) {
     if (turnId) return
     turnId = id
+    threads.set(threadId, { id: threadId, turnId: id, rootTurnId: id, done: false })
     emit({ type: 'codexmod.turn', turn_id: id })
     for (const m of buffered.splice(0)) route(m)
     for (const m of bufferedRequests.splice(0)) onLine(JSON.stringify(m))
@@ -689,7 +905,7 @@ async function main() {
       out = ''
       onLine(rest)
     }
-    if (!childExpectedExit && !finished && !turnDone) {
+    if (!childExpectedExit && !finished) {
       fatal(`app-server exited early (${signal ?? code}): ${stderrTail.trim()}`)
     }
   })
@@ -728,10 +944,6 @@ async function main() {
   emit({ type: 'thread.started', thread_id: threadId })
 
   sweepControl() // an interrupt written during startup
-  if (pendingInterrupt) {
-    emit({ type: 'turn.failed', error: { message: 'interrupted' } })
-    return finish(1)
-  }
   let ts
   try {
     ts = await send('turn/start', {

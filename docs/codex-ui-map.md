@@ -178,3 +178,60 @@ noninteractive admission, so that native path remains conditional. Actual
 Desktop preview/history, live thinking versus reopen, owned question controls
 and coordinator rendering need a NEW Desktop session. See
 [Batch 6 harness](../tests/fixtures/batch6-harness.md).
+
+## Nested observation loops
+
+`nestedAgents:true` on app-server discovers verified source UUID edges from
+SubAgentActivity and legacy spawn items. The owning connection rejoins with
+`thread/resume {threadId,excludeTurns:true}` without execution overrides or
+`turn/start`, pages current-root-turn history, merges buffered live events,
+and journals each child's public compatibility envelopes separately. Root
+completion cannot terminate a live child observer. Attachment gaps and
+unverified ancestry are lifecycle/report fallbacks; no file-only tailing or
+new source execution repairs a missing stream.
+
+The actual parent's step reserves and persists a launch capability before
+calling `$.agent.spawn`. A separate spawn observer records the core tool ID;
+turn.start can bind the host ID before the API resolves. Distinct depth 2/3
+mirror step registrations avoid the calling handler's inherited exclusion.
+CLI 2.1.302 can omit parentAgentId and report cwd as undefined in agent.spawn.
+Admission therefore uses the active spawning step's recorded parent/session,
+exact one-time prompt token, expected type/name/description and one core tool
+ID shared across call/check/spawn. Cwd is excluded from that input digest;
+the source cwd remains in the mirror record for replay. An explicit conflicting
+parent or host identity is refused. Missing list metadata is reconciled only
+against the admitted launch, without creating another task.
+Their catches answer without engine APIs or provider fallthrough. A mirror
+consumes the existing journal through the normal guarded action renderer and
+never enters startRun/answerWithCodex. Infrastructure Agent admission checks
+exact held input and plugin origin; all source/display actions remain
+nonexecuting. The hidden type is not offered to model dispatch.
+
+The extra parent Agent row is a completed **observation-link operation**,
+with the returned real host agentId and a separately recorded host launch ID.
+It is not the core virtual launch row, and makes no native token/task-state
+projection. Native Desktop linkage between these rows is an acceptance gate.
+The host task owns its own transcript and completion. Child source terminal
+events end the mirror without interrupt echo. Host child stop writes only a
+child-addressed interrupt, while parent stop snapshots all observed live
+descendants. Steering preserves message UUIDs and intent before submission;
+ambiguous delivery is never retried or converted to new inference. Idle child
+continuation is rejected in this slice.
+
+Private mirror records (`mirror:<session>:<child UUID>`) retain parent/source
+IDs, launch token/digest, broker generation, actual host ID, core launch ID,
+display-link ID and launch outcome. Agent records retain replay cursor,
+prefix check, public ledger, pending rows, final text and direct usage.
+Recovery consumes these records and the current owner journal, or reports a
+partial/lost observer. Reserved, uncertain and evicted identities are never
+automatically spawned again. Journal truncation/replacement is a gap. Cursor
+and host transcript writes are not atomic; ambiguous text delivery is not
+claimed exactly once.
+
+The source usage ledger counts each reachable thread once, scoped by root
+turn, and deduplicates response IDs and cumulative turn snapshots. Full
+footers label direct and tree counts; missing sources remain partial. Host
+stop usage stays null, preventing parent-tree/child-direct double counting.
+No native GPT badge or zero auxiliary host inference claim follows from this
+accounting. See the [nested harness](../tests/fixtures/nested-harness.md) for
+core task, provider-boundary and NEW Desktop checks.

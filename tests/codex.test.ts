@@ -1,4 +1,4 @@
-import { test, expect } from 'claude-code/testing'
+import { test as hostTest, expect } from 'claude-code/testing'
 import type { BuiltinToolResults, On } from 'claude-code'
 import { explorationAction, literalWords } from '../hooks/exploration.ts'
 import { batch2Cases } from './fixtures/batch2-cases.ts'
@@ -12,8 +12,26 @@ import batch5Items, { CHILD as B5_CHILD, THREAD as B5_THREAD } from './fixtures/
 import batch6Items, { PNG, questionParams, ANSWER } from './fixtures/batch6-items.mjs'
 import batch6Images from './fixtures/batch6-images.mjs'
 import { imageFile, captureImage, generationAction, findingsAction, literalReceipt, IMAGE_MAX } from '../hooks/images-modes.ts'
+import { RECORD_BUDGET } from '../hooks/store-state.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
+import { PARENT as N_PARENT, CHILD as N_CHILD, PARENT_TURN as N_PT, CHILD_TURN as N_CT, nestedCommand, nestedFile, nestedActivity } from './fixtures/nested-items.mjs'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
+
+// Cache-directory setup is infrastructure, independent of each test's process fixture.
+const cacheDirectories = {
+  name: 'cache-directories',
+  tier: 'prepend' as const,
+  register: ((on: On) => {
+    on('process.run', ($, e, next) => {
+      if (e.argv[0] === 'mkdir' && String(e.argv.at(-1)).includes('/codex-mod/runs/state-')) return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return next(e)
+    })
+  }) as any,
+}
+const test: typeof hostTest = ((name: string, options: any, fn?: any) => {
+  if (typeof options === 'function') return hostTest(name, { plugins: [cacheDirectories] }, options)
+  return hostTest(name, { ...options, plugins: [cacheDirectories, ...(options.plugins ?? [])] }, fn)
+}) as typeof hostTest
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -123,6 +141,8 @@ type Piece = { stream: 'stdout' | 'stderr'; text: string }
 type WorldOpts = {
   /** `$.agent.list` rejects. */
   listThrows?: boolean
+  agentList?: () => any[]
+  registeredAgents?: any[]
   /** Full registered tool names are chosen by the host. */
   toolNamespace?: string
   toolRegisterThrows?: string
@@ -141,6 +161,7 @@ type WorldOpts = {
    */
   pieces?: readonly (Piece | 'block' | (() => boolean))[]
   store?: Map<string, unknown>
+  storeReject?: (key: string, value: unknown) => boolean
   /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
   binary?: Map<string, string>
@@ -179,6 +200,7 @@ function world(on: On, opts: WorldOpts = {}) {
   const checks: { tool: string; agentId?: string }[] = []
   // every `$.fs.write`, in order (steer and interrupt files of app-server runs)
   const writes: { path: string; text: string }[] = []
+  const stateWrites: { path: string; text: string }[] = []
   const toolSpecs: any[] = []
   const toolLists: string[][] = []
   on('tool.list', () => {
@@ -193,7 +215,10 @@ function world(on: On, opts: WorldOpts = {}) {
     return { value: { tool: `mcp__${opts.toolNamespace ?? 'codex-mod'}__${e.name}` } }
   })
   on('fs.write', (_$, e: any) => {
-    writes.push({ path: e.path, text: e.text })
+    if (/\/runs\/state-[^/]+\/record\.json$/.test(e.path)) {
+      stateWrites.push({ path: e.path, text: e.text })
+      files.set(e.path, e.text)
+    } else writes.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
   on('ui.log', (_$, e: any) => {
@@ -203,6 +228,7 @@ function world(on: On, opts: WorldOpts = {}) {
   on('session.start', () => ({ cwd: '/tmp/project' }))
   on('agent.list', () => {
     if (opts.listThrows) throw new Error('agent list unavailable')
+    if (opts.agentList) return { value: opts.agentList() }
     return { value: Object.entries(AGENT_TYPES).map(([id, type]) => ({ id, type, description: id, status: status.get(id) ?? ('running' as const) })) }
   })
   on('session.cwd', () => ({ value: location.cwd }))
@@ -225,6 +251,7 @@ function world(on: On, opts: WorldOpts = {}) {
   })
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
+    if (opts.storeReject?.(e.key, e.value)) throw new Error('store limit exceeded')
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined }
   })
@@ -287,8 +314,55 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, reads, location, toolSpecs, toolLists }
+  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, stateWrites, reads, location, toolSpecs, toolLists }
 }
+
+// Source evidence and display payloads now recover from private cache files.
+function savedState(w: ReturnType<typeof world>, key: string): any {
+  const metadata: any = w.store.get(key)
+  return metadata?.cachedState ? JSON.parse(w.files.get(`/home/t/.cache/codex-mod/runs/state-${encodeURIComponent(key)}/record.json`)!) : metadata
+}
+
+test('store load migrates a 900 KB wire and unknown oversized fields without losing resume identity', async ($, on) => {
+  const key = 'agent:sess-1:agent-coordinator-reload'
+  const record = { ...quietCoordinatorRecord('pending literal body'), thread: 'resume-thread',
+    wire: { records: [{ event: 'public', data: 'x'.repeat(900_000) }], rows: {} }, legacyPayload: 'y'.repeat(900_000) }
+  const w = world(on, { store: new Map([[key, record]]) })
+  // Exercise loadRecord without relying on session.start pruning.
+  await $.session.append(deliveryRow('agent-coordinator-reload', 'saved-row', 'pending literal body'))
+  const compact: any = w.store.get(key)
+  expect(compact.wire).toBe(undefined)
+  expect(compact.legacyPayload).toBe(undefined)
+  expect(compact.thread).toBe('resume-thread')
+  expect(JSON.stringify(compact).length <= RECORD_BUDGET).toBe(true)
+  expect(savedState(w, key).wire.records[0].data.length).toBe(900_000)
+})
+
+test('store prune recovers when an already oversized store rejects shrinking replacements', async ($, on) => {
+  const store = new Map<string, unknown>(['a', 'b', 'c'].map(id => [`agent:sess-1:${id}`, {
+    ...quietCoordinatorRecord('body'), wire: { records: ['x'.repeat(900_000)], rows: {} },
+  }]))
+  const w = world(on, { store, storeReject: (key, value) => JSON.stringify(Object.fromEntries(new Map([...store, [key, value]]))).length > 1_000_000 })
+  await startSession($)
+  expect(store.size).toBe(3)
+  for (const value of store.values()) {
+    expect((value as any).wire).toBe(undefined)
+    expect(JSON.stringify(value).length <= RECORD_BUDGET).toBe(true)
+  }
+  expect(w.stateWrites.length).toBe(3)
+})
+
+test('store rejection cannot fail an action step, its guard, or the handback', async ($, on) => {
+  const w = world(on, { storeReject: () => true, pieces: [THREAD('resilient'), cmdDone('printf ok'), MESSAGE('Completed despite full store')] })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['Bash'])
+  const results: any[] = await runCalls($, first.chunks, 'agent-progress')
+  expect(results[0].result).toBeDefined()
+  const last = await step($, 'agent-progress', 1)
+  expect(handback(last.result)).toContain('Completed despite full store')
+  expect(w.logs.some(l => l.includes('store write failed'))).toBe(true)
+  expect(w.core).toEqual([])
+})
 
 /** A SessionMessage-shaped test row in the Messages API form. */
 function apiOf(r: any): any {
@@ -342,6 +416,249 @@ const fileEv = (type: 'item.started' | 'item.completed', path: string, kind: str
 const THREAD = (id: string) => out(JSON.stringify({ type: 'thread.started', thread_id: id }))
 const MESSAGE = (text: string) => out(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }))
 const USAGE = out('{"type":"turn.completed","usage":{"input_tokens":21269,"cached_input_tokens":20992,"output_tokens":46}}')
+
+const nestedReady = { type: 'codexmod.child', thread_id: N_CHILD, parent_thread_id: N_PARENT,
+  source_turn_id: N_PT, source_item_id: 'spawn-1', root_turn_id: N_PT, turn_id: N_CT,
+  path: '/root/check', model: 'gpt-6.1-sol', effort: 'medium', status: 'attached', generation: 'fake-generation' }
+const nestedSource = (item: any, parent = false) => ({ type: 'item.completed', item: item.type === 'agentMessage' ? { type: 'agent_message', text: item.text } : item.type === 'commandExecution'
+  ? { type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput, exit_code: item.exitCode } : item.type === 'fileChange' ? { type: 'file_change', changes: item.changes } : { type: 'source_only' },
+  thread_id: parent ? N_PARENT : N_CHILD, turn_id: parent ? N_PT : N_CT,
+  source: { transport: 'app-server', event: 'item/completed', threadId: parent ? N_PARENT : N_CHILD, turnId: parent ? N_PT : N_CT, item } })
+const nestedJournal = [
+  { type: 'codexmod.turn', thread_id: N_CHILD, turn_id: N_CT }, nestedSource(nestedCommand), nestedSource(nestedCommand), nestedSource(nestedFile),
+  nestedSource({ type: 'agentMessage', id: 'child-final', text: 'child checked the fixture' }),
+  { type: 'turn.completed', thread_id: N_CHILD, turn_id: N_CT, usage: { input_tokens: 2000, cached_input_tokens: 1500, output_tokens: 100 } },
+].map(e => JSON.stringify(e) + '\n').join('')
+const nestedRootPieces = [THREAD(N_PARENT), out(JSON.stringify({ type: 'codexmod.turn', turn_id: N_PT })),
+  out(JSON.stringify(nestedSource(nestedActivity, true))), out(JSON.stringify(nestedReady)), MESSAGE('parent done')]
+
+test('nested mirrors: hidden type; early core-event identity reconciles with list; child rows execute zero native tools', { options: { transport: 'app-server', progressIntervalMs: 0 } }, async ($, on) => {
+  let prompt = 'root task'
+  const host = 'host-child-1'
+  const actual: any[] = []
+  const registered: any[] = []
+  const w = appWorld(on, { pieces: nestedRootPieces, messages: () => [{ role: 'user', text: prompt, toolUses: [] }],
+    readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? nestedJournal : path.endsWith('/owner.json') ? JSON.stringify({ generation: 'fake-generation', updatedAt: Date.now(), ended: true }) : text,
+    registeredAgents: registered, agentList: () => [
+    { id: 'agent-progress', type: 'codex-mod:codex', description: 'parent', status: 'running' as const },
+    { id: host, type: 'codex-mod:codex-child', description: 'observer', parentId: 'agent-progress', status: 'running' as const, spawnedBy: 'codex-mod' },
+  ] })
+  let childFinal = ''
+  on('turn.start', (_$, e: any) => ({ turnId: e.turnId }))
+  on('agent.spawn', async (_$, e: any) => {
+    actual.push(e)
+    // Re-enter before the API resolves, as core can do. This is an API-chain
+    // test, not evidence that the testing kit created a native task record.
+    prompt = e.prompt
+    await $.turn.start({ text: e.prompt, turnId: 'mirror-host-turn', agentId: host })
+    for (let i = 0; i < 8; i++) {
+      const s = await step($, host, i, 'mirror-host-turn')
+      if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { childFinal = handback(s.result); break }
+      if (s.result.stopReason === 'end_turn') { childFinal = s.result.answer; break }
+      await runCalls($, s.chunks, host)
+    }
+    prompt = 'root task'
+    return { model: 'claude-haiku-4-5', agentId: host }
+  })
+  await startSession($)
+  const hidden = registered.find(a => a.name === 'codex-child')
+  expect(hidden.prompt).toContain('hook not active')
+  expect(hidden.background).toBe(true)
+  expect(await $.agent.offer({ agent: 'codex-mod:codex-child', description: '', source: 'plugin', provider: { plugin: 'codex-mod', tier: 'project' } } as any)).toEqual({ isOffered: false })
+  const parent = await step($, 'agent-progress')
+  const link = callsOf(parent.chunks).find(c => c.name === 'Agent')!
+  expect(link).toBeDefined()
+  const answer: any = await $.tool.call({ tool: 'Agent', ...link.input, tool_use_id: link.id, agentId: 'agent-progress' } as any)
+  expect(answer.result.agentId).toBe(host)
+  expect(answer.result.content[0].text).toContain('Observation link')
+  expect(childFinal).toContain('child checked the fixture')
+  expect(childFinal).toContain('500 new tokens (1.5K cached, 100 out)')
+  expect(actual.length).toBe(1)
+  // The testing kit supplies API args rather than core-filled spawn events.
+  // Actual parent/tool linkage requires the native harness below.
+  expect(actual[0].subagentType ?? actual[0].subagent_type).toBe('codex-mod:codex-child')
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+  const identity: any = w.store.get(`mirror:sess-1:${N_CHILD}`)
+  expect(identity.host).toBe(host)
+  expect(identity.parentHost).toBe('agent-progress')
+  expect(identity.parentThread).toBe(N_PARENT)
+  expect(identity.displayToolId).toBe(link.id)
+  expect(identity.launch).toBe('bound')
+})
+
+for (const refusal of ['deny', 'depth', 'attachment', 'uncertain']) test(`nested ${refusal}: Batch 5 fallback; no second execution or automatic host retry`, { options: { transport: 'app-server', richRows: true, progressIntervalMs: 0 } }, async ($, on) => {
+  const ready = refusal === 'attachment' ? { ...nestedReady, status: 'unavailable', reason: 'rejoin unsupported' } : nestedReady
+  const calls: any[] = []
+  const w = appWorld(on, { pieces: [THREAD(N_PARENT), out(JSON.stringify(nestedSource(nestedActivity, true))), out(JSON.stringify(ready)), out(JSON.stringify(ready)), MESSAGE('parent done')], agentList: () => [
+    { id: 'agent-progress', type: 'codex-mod:codex', status: 'running' as const, description: '', ...(refusal === 'depth' ? { parentId: 'host-up-2' } : {}) },
+    { id: 'host-up-2', type: 'general-purpose', status: 'running' as const, description: '', parentId: 'host-up-1' },
+    { id: 'host-up-1', type: 'general-purpose', status: 'running' as const, description: '' },
+  ] })
+  on('agent.spawn', (_$, e: any) => { calls.push(e); if (refusal === 'uncertain') throw new Error('lost host result'); return { deny: 'concurrency limit' } })
+  const s = await step($, 'agent-progress')
+  const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n') + (s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer)
+  expect(text).toContain('mirror unavailable')
+  expect(w.spawned.length).toBe(1)
+  expect(calls.length).toBe(refusal === 'deny' || refusal === 'uncertain' ? 1 : 0)
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('nested off: app-server launch disables rejoin and keeps the Batch 5 rows', { options: { transport: 'app-server', nestedAgents: false, richRows: true } }, async ($, on) => {
+  const w = appWorld(on, { pieces: nestedRootPieces })
+  let spawns = 0
+  on('agent.spawn', () => { spawns++; return { deny: 'must not be called' } })
+  await step($, 'agent-progress')
+  expect(w.spawned[0].argv).toContain('--nested')
+  expect(argOf(w.spawned[0].argv, '--nested')).toBe('false')
+  expect(spawns).toBe(0)
+  expect(parseConfig({}).nestedAgents).toBe(true)
+  expect(parseConfig({ nestedAgents: 'true' }).warnings).toContain('nestedAgents: not a boolean; default used')
+})
+
+const savedMirror = (host = 'host-recovered-child', extra: any = {}) => ({ version: 1, session: 'sess-1', thread: N_CHILD,
+  parentThread: N_PARENT, parentHost: 'agent-progress', host, hostToolId: 'real-host-tool-id', sourceTurn: N_PT, sourceItem: 'spawn-1', rootTurn: N_PT,
+  control: '/tmp/private-nested-run', node: 'node', reader: '/plugin/scripts/codex-runner.mjs', generation: 'fake-generation', token: 'opaque-launch-token',
+  inputDigest: 'saved', depth: 2, model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', launch: 'bound', state: 'running', activeTurn: N_CT, updatedAt: 1000000, ...extra })
+const mirrorStore = (m: any, extra: any = {}) => new Map<string, unknown>([
+  [`mirror:sess-1:${N_CHILD}`, m],
+  [`agent:sess-1:${m.host}`, { agentName: 'codex-child', model: m.model, effort: m.effort, sandbox: m.sandbox,
+    thread: N_CHILD, lastTask: m.token, userCount: 1, updatedAt: m.updatedAt, mirror: m, ...extra }],
+])
+
+test('nested recovery: persisted mirror cursor resumes public events with no startRun or source replay', { options: { progressIntervalMs: 0 } }, async ($, on) => {
+  const m = savedMirror()
+  const consumed = nestedJournal.indexOf('\n') + 1
+  const w = world(on, { task: m.token, store: mirrorStore(m, { playback: { cursor: consumed, prefix: nestedJournal.slice(0, consumed), texts: [], queue: [], actions: 0, turnId: N_CT } }),
+    readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? nestedJournal : path.endsWith('/owner.json') ? JSON.stringify({ generation: m.generation, ended: true }) : text })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const s = await step($, m.host, i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+    await runCalls($, s.chunks, m.host)
+  }
+  expect(final).toContain('child checked the fixture')
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+  const rec: any = w.store.get(`agent:sess-1:${m.host}`)
+  expect(rec.playback.cursor).toBe(nestedJournal.length)
+  expect(rec.mirror.host).toBe(m.host)
+})
+
+for (const gap of ['owner-lost', 'truncated', 'invalid-depth', 'malformed']) test(`nested recovery ${gap}: fail closed with no execution, inference or relaunch`, async ($, on) => {
+  const m = savedMirror('host-broken-child', gap === 'invalid-depth' ? { depth: 9 } : {})
+  const store = mirrorStore(m, gap === 'truncated' ? { playback: { cursor: 99, prefix: 'old-file', texts: [], queue: [], actions: 0 } } : {})
+  const w = world(on, { task: m.token, store, readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? gap === 'malformed' ? 'bad json\n' : '' : path.endsWith('/owner.json') ? '{}' : text })
+  const s = await step($, m.host)
+  const body = s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer
+  expect(body).toContain('codex failed:')
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('nested host stop writes one child interrupt and never returns/kills a parent process', { options: { progressIntervalMs: 0 } }, async ($, on) => {
+  const m = savedMirror('host-stopped-child')
+  const journal = nestedJournal.split('\n').slice(0, 2).join('\n') + '\n'
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? journal : text })
+  on('turn.complete', () => ({ text: '' }))
+  const s = await step($, m.host)
+  await runCalls($, s.chunks, m.host)
+  for (let i = 0; i < 2; i++) await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'turn-1', agentId: m.host, reason: 'aborted' } as any)
+  const interrupts = w.writes.filter(w => w.path.includes('/interrupt-'))
+  expect(interrupts.length).toBe(1)
+  expect(JSON.parse(interrupts[0].text)).toMatchObject({ threadId: N_CHILD, turnId: N_CT })
+  expect(w.spawned).toEqual([])
+  expect(w.kills.count).toBe(0)
+  expect(w.writes.some(w => w.path.endsWith('/interrupt'))).toBe(false)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('nested SendMessage receipts steer the exact child once per UUID; identical bodies with distinct UUIDs remain distinct', async ($, on) => {
+  const m = savedMirror('host-message-child')
+  const w = world(on, { task: m.token, store: mirrorStore(m) })
+  for (const uuid of ['delivery-one', 'delivery-one', 'delivery-two']) await $.session.append({
+    agentId: m.host, uuid, origin: { kind: 'coordinator' }, door: 'attachment',
+    message: { role: 'system', content: `<system-reminder>The coordinator sent a message while you were working:\nSame body\nAddress this before completing your current task.</system-reminder>` },
+  } as any)
+  const steers = w.writes.filter(w => w.path.includes('/steer-'))
+  expect(steers.length).toBe(2)
+  expect(steers.every(w => JSON.parse(w.text).threadId === N_CHILD)).toBe(true)
+  expect(steers.every(w => JSON.parse(w.text).text.includes('Same body'))).toBe(true)
+  expect(new Set(steers.map(w => w.path)).size).toBe(2)
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
+
+test('nested launch guards refuse unowned type/token and malformed display references without reaching native core', async ($, on) => {
+  const w = world(on)
+  for (const prompt of ['opaque-launch-token', 'codex-mirror:forged']) {
+    const result: any = await $.agent.spawn({ subagentType: 'codex-mod:codex-child', prompt })
+    expect(result.deny).toContain('unowned')
+  }
+  const result: any = await $.tool.call({ tool: 'Agent', subagent_type: 'codex-mod:codex-child', prompt: 'forged', description: 'forged', agentId: 'agent-codex' } as any)
+  expect(result.deny).toContain('not executed')
+  expect(w.core).toEqual([])
+  expect(w.spawned).toEqual([])
+})
+
+test('nested footer reports direct and deduplicated tree counts without claiming native model usage', () => {
+  const line = footer({ model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'read-only', agent: 'codex', actions: 0,
+    usage: { input: 1000, cached: 600, output: 50 }, treeUsage: { direct: { input: 1000, cached: 600, output: 50 }, tree: { input: 3000, cached: 2100, output: 150 }, children: 1, missing: 0, active: 0 } })
+  expect(line).toContain('tree 3,150 tokens (direct 1,050; children 2,100)')
+  expect(line).toContain('new 900 / cached 2.1K / out 150')
+})
+
+for (const launch of ['reserved', 'launching', 'uncertain', 'bound']) test(`nested restart ${launch}: reconcile or report missing identity without a replacement host spawn`, { options: { transport: 'app-server' } }, async ($, on) => {
+  const m = savedMirror('evicted-host', { launch, displayToolId: undefined })
+  const w = appWorld(on, { store: mirrorStore(m), pieces: nestedRootPieces })
+  let spawns = 0
+  on('agent.spawn', () => { spawns++; return { deny: 'no replacement allowed' } })
+  const s = await step($, 'agent-progress')
+  expect(handback(s.result)).toContain('mirror unavailable')
+  expect(spawns).toBe(0)
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('nested terminal usage replay has one direct count after source-ledger hydration', () => {
+  const event = normalizeSource(JSON.stringify({ type: 'turn.completed', thread_id: N_CHILD, turn_id: N_CT, usage: { input_tokens: 2000, output_tokens: 100 } }))!
+  const ledger = new SourceLedger()
+  expect(ledger.capture(event).render).toBe(true)
+  expect(ledger.capture(event).render).toBe(false)
+  const hydrated = new SourceLedger()
+  for (const record of ledger.records) hydrated.capture(record)
+  expect(hydrated.capture(event).render).toBe(false)
+})
+
+test('nested idle message is explicitly rejected without creating a turn or a stranded control file', async ($, on) => {
+  const m = savedMirror('host-idle-child', { state: 'completed' })
+  const w = world(on, { messages: () => [user(m.token), user('new idle message')], store: mirrorStore(m, { handedBack: true, lastAnswer: 'previous child report' }) })
+  const s = await step($, m.host)
+  expect(handback(s.result)).toContain('child message rejected')
+  expect(w.writes).toEqual([])
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
+
+test('nested canonical direct counters replace response/terminal copies instead of adding them', { options: { progressIntervalMs: 0 } }, async ($, on) => {
+  const m = savedMirror('host-numeric-child')
+  const direct = JSON.stringify({ type: 'codexmod.directUsage', thread_id: N_CHILD, turn_id: N_CT, usage: { input: 2000, cached: 1500, output: 100 } }) + '\n'
+  const journal = direct + direct + nestedJournal
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? journal : path.endsWith('/owner.json') ? JSON.stringify({ generation: m.generation, ended: true }) : text })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const s = await step($, m.host, i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+    await runCalls($, s.chunks, m.host)
+  }
+  expect(final).toContain('500 new tokens (1.5K cached, 100 out)')
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
 
 const user = (text: string) => ({ role: 'user', text, toolUses: [] })
 const toolResult = (tool: string, id = 'x') => [
@@ -750,7 +1067,7 @@ test('exec: a message queued mid-run is announced once, as text before the next 
   // a second queued message gets no second note; the answer is Codex's own
   expect(handback(s3.result).startsWith('built\n\n')).toBe(true)
   expect(handback(s3.result)).not.toContain('↪')
-  expect(w.store.get('agent:sess-1:agent-exec-note')).toMatchObject({ followUps: [{ text: 'also run the linter', count: 2 }, { text: 'and the docs', count: 3 }] })
+  expect(savedState(w, 'agent:sess-1:agent-exec-note')).toMatchObject({ followUps: [{ text: 'also run the linter', count: 2 }, { text: 'and the docs', count: 3 }] })
   expect(w.spawned.length).toBe(1)
 })
 
@@ -965,10 +1282,11 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   const runs: string[][] = []
   const registered: any[] = []
   on('agent.register', (_$, e: any) => {
-    registered.push(e)
+    if (e.name !== 'codex-child') registered.push(e)
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   on('process.run', (_$, e: any) => {
+    if (e.argv[0] === 'mkdir' && String(e.argv.at(-1)).includes('/codex-mod/runs/state-')) return runOk()
     runs.push([...e.argv])
     return runOk(e.argv[0] === 'which' ? '/usr/local/bin/codex\n' : 'ok')
   })
@@ -977,7 +1295,7 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
-  expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'])
   expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
@@ -1019,7 +1337,7 @@ test('session.start: projectRoles false never reads the file; codexPath wins', {
   const runs: string[][] = []
   const registered: string[] = []
   on('agent.register', (_$, e: any) => {
-    registered.push(e.name)
+    if (e.name !== 'codex-child') registered.push(e.name)
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   on('process.run', (_$, e: any) => {
@@ -1319,7 +1637,7 @@ test('exec: a coordinator delivery appended as an attachment (not in the API for
   conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e2')]
   const s3 = await step($, 'agent-exec-deliver', 2)
   expect(handback(s3.result).startsWith('built\n\n')).toBe(true)
-  expect(w.store.get('agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, followUps: [{ text: 'also lint', count: 1, uuid: 'row-1' }] })
+  expect(savedState(w, 'agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, followUps: [{ text: 'also lint', count: 1, uuid: 'row-1' }] })
   conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
   const s4 = await step($, 'agent-exec-deliver', 3)
   expect(w.spawned.length).toBe(2)
@@ -1327,7 +1645,7 @@ test('exec: a coordinator delivery appended as an attachment (not in the API for
   expect(w.spawned[1]!.input).toBe('also lint')
   expect(s4.result.toolUses[0]!.name).toBe('Bash')
   // the transcript's task stays the record's: after this run the first message is not new again
-  expect(w.store.get('agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, launchKey: '1:row-1:also lint' })
+  expect(savedState(w, 'agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, launchKey: '1:row-1:also lint' })
   conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_e3')]
   const s5 = await step($, 'agent-exec-deliver', 4)
   expect(s5.result.toolUses[0]!.name).toBe('Bash')
@@ -1563,7 +1881,7 @@ test('coordinator registration failure falls back to full text and still registe
   const w = world(on, { task: 'first', toolRegisterThrows: 'coordinator_message', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord(text)]]) })
   const agents: any[] = []
   on('agent.register', (_$, e: any) => {
-    agents.push(e)
+    if (e.name !== 'codex-child') agents.push(e)
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
@@ -1847,7 +2165,7 @@ test('project roles: missing file silently registers only codex', async ($, on) 
   const w = world(on)
   on('process.run', () => runOk())
   on('agent.register', (_$, e: any) => {
-    registered.push(e.name)
+    if (e.name !== 'codex-child') registered.push(e.name)
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   await startSession($)
@@ -1864,8 +2182,8 @@ for (const [label, text, notifyThrows] of [['malformed JSON', '{', false], ['wro
     let registrations = 0
     on('process.run', () => runOk())
     on('agent.register', (_$, e: any) => {
-      registrations++
-      if (registrations === 1) throw new Error('retry registration')
+      if (e.name !== 'codex-child') registrations++
+      if (e.name !== 'codex-child' && registrations === 1) throw new Error('retry registration')
       return { value: { agent: `codex-mod:${e.name}` } }
     })
     on('ui.notify', (_$, e: any) => {
@@ -2028,8 +2346,8 @@ test('agent registration refused at session start is retried once on the next ma
   const w = world(on)
   let calls = 0
   on('agent.register', (_$, e: any) => {
-    calls++
-    if (calls === 1) throw new Error('session not bound')
+    if (e.name !== 'codex-child') calls++
+    if (e.name !== 'codex-child' && calls === 1) throw new Error('session not bound')
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
@@ -2381,7 +2699,7 @@ function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol
   const w = world(on, opts)
   const runs: string[][] = []
   const timers: number[] = []
-  on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
+  on('agent.register', (_$, e: any) => { opts.registeredAgents?.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   on('process.run', (_$, e: any) => {
     runs.push([...e.argv])
     const a = e.argv as string[]
@@ -2630,6 +2948,7 @@ test('app-server: runner drift evidence with no agent message fails as "protocol
 
 test('session start prunes app-server control dirs older than pruneDays', async ($, on) => {
   const removed: string[] = []
+  const inspected: string[] = []
   world(on)
   on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
   on('process.run', (_$, e: any) => {
@@ -2641,11 +2960,18 @@ test('session start prunes app-server control dirs older than pruneDays', async 
   on('fs.list', () => ({ value: [
     { name: 'old', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
     { name: 'new', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+    { name: 'state-stale', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+    { name: 'state-active', kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
     { name: 'stray.txt', kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false },
   ] }))
-  on('fs.stat', (_$, e: any) => ({ value: { kind: 'dir' as const, size: 0, isLink: false, mtimeMs: e.path.endsWith('/old') ? 1_000_000 - 3 * 86_400_000 : 1_000_000 - 1000 } }))
+  on('fs.stat', (_$, e: any) => {
+    inspected.push(e.path)
+    const stale = e.path.endsWith('/old') || e.path.endsWith('/state-stale/record.json') || e.path.endsWith('/state-active')
+    return { value: { kind: 'dir' as const, size: 0, isLink: false, mtimeMs: stale ? 1_000_000 - 3 * 86_400_000 : 1_000_000 - 1000 } }
+  })
   await startSession($)
-  expect(removed).toEqual([`${runs}/old`])
+  expect(removed).toEqual([`${runs}/old`, `${runs}/state-stale`])
+  expect(inspected).toContain(`${runs}/state-active/record.json`)
 })
 
 // ---- Phase 3 item rendering and display-only guards ------------------------
@@ -2736,12 +3062,12 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   const w = world(on, { toolNamespace: 'runtime', pieces: [THREAD('phase3'), out(events.map(i => itemLine(i)).join('\n'))] })
   const registered: any[] = []
   on('agent.register', (_$, e: any) => {
-    registered.push(e)
+    if (e.name !== 'codex-child') registered.push(e)
     return { value: { agent: `codex-mod:${e.name}` } }
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(registered.length).toBe(1)
-  expect(registered[0].tools).toEqual(['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message', 'mcp__runtime__codex_question'])
+  expect(registered[0].tools).toEqual(['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message', 'mcp__runtime__codex_question'])
   const first = await step($, 'agent-progress')
   expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
   expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
@@ -2955,13 +3281,13 @@ for (const [richRows, available] of [[false, false], [false, true], [true, false
     const w = world(on, { files: new Map([['.claude/codex-mod.json', PROJECT_ROLES]]), availableTools: available ? ['Agent', 'TodoWrite'] : ['Agent'] })
     const specs: any[] = []
     on('agent.register', (_$, e: any) => {
-      specs.push(e)
+      if (e.name !== 'codex-child') specs.push(e)
       return { value: { agent: `codex-mod:${e.name}` } }
     })
     await startSession($)
     expect(specs.map(s => s.name)).toEqual(['codex', 'implementer', 'implementer-high', 'auditor'])
     for (const s of specs) {
-      expect(s.tools.includes('Agent')).toBe(richRows)
+      expect(s.tools.includes('Agent')).toBe(true)
       expect(s.tools.includes('TodoWrite')).toBe(richRows && available)
     }
     expect(w.toolLists.length).toBe(1)
@@ -2974,7 +3300,7 @@ for (const toolListThrows of [false, true]) {
     const w = world(on, { availableTools: ['Agent'], toolListThrows, pieces: [out([spawnItem, todo, planItem, { type: 'agent_message', text: 'Done.' }].map(i => itemLine(i)).join('\n'))] })
     const specs: any[] = []
     on('agent.register', (_$, e: any) => {
-      specs.push(e)
+      if (e.name !== 'codex-child') specs.push(e)
       return { value: { agent: `codex-mod:${e.name}` } }
     })
     await startSession($)
@@ -3482,7 +3808,7 @@ test('foundation errors: failed/declined/null/nonzero commands and failed spawns
   expect(answers[3].deny).toContain('spawn failed')
   expect(w.core).toEqual([])
   await step($, 'agent-progress', 1)
-  const rec: any = w.store.get('agent:sess-1:agent-progress')
+  const rec: any = savedState(w, 'agent:sess-1:agent-progress')
   expect(rec.wire.records.filter((r: any) => r.item?.type === 'commandExecution').length).toBe(3)
   expect(Object.keys(rec.wire.rows).length).toBe(4)
 })
@@ -3505,7 +3831,7 @@ test('foundation replay: one command row, one file row, no aggregate-diff row an
 test('foundation capability failure: only registered tools are admitted; absent native rows fall back without execution', async ($, on) => {
   const w = world(on, { availableTools: [], pieces: [cmdDone('printf actual', 'actual\n'), MESSAGE('Done')] })
   const specs: any[] = []
-  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  on('agent.register', (_$, e: any) => { if (e.name !== 'codex-child') specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   await startSession($)
   expect(specs[0].tools).toEqual(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
   const s = await step($, 'agent-progress')
@@ -3575,7 +3901,7 @@ test('foundation source-only notifications, unsupported variants, warnings and p
   expect(handback(s.result)).toContain('codex failed:')
   expect(handback(s.result)).not.toContain('Incomplete')
   expect(s.chunks.some(c => c.kind === 'text' && c.text === 'Incomplete')).toBe(true)
-  const wire: any = (w.store.get('agent:sess-1:agent-progress') as any).wire
+  const wire: any = savedState(w, 'agent:sess-1:agent-progress').wire
   expect(wire.records.length).toBe(6)
   expect(wire.records[0].item.changes[0].kind.move_path).toBe('b.txt')
   expect(wire.records[1].data.stdin).toBe('q')
@@ -3643,7 +3969,7 @@ test('foundation coordinator registration retry respects the existing agent tool
   const opts: WorldOpts = { task: 'first', toolRegisterThrows: 'coordinator_message', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord('Full receipt')]]) }
   const w = world(on, opts)
   const specs: any[] = []
-  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  on('agent.register', (_$, e: any) => { if (e.name !== 'codex-child') specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   await startSession($)
   expect(specs[0].tools.includes('mcp__codex-mod__coordinator_message')).toBe(false)
   opts.toolRegisterThrows = undefined
@@ -3739,7 +4065,7 @@ test('batch 2 all fixture rows answer from held output, with command/cwd visible
         expect(s.chunks.some(b => b.kind === 'text' && b.text.includes(fixture.item.command) && b.text.includes('/workspace'))).toBe(true)
         expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
       }
-      const wire: any = (w.store.get('agent:sess-1:agent-progress') as any).wire
+      const wire: any = savedState(w, 'agent:sess-1:agent-progress').wire
       expect(wire.rows[c.id].item.aggregatedOutput).toBe(fixture.item.aggregatedOutput)
     }
   }
@@ -3830,7 +4156,7 @@ test('batch 2 nativeActions off displays exploration commands as text, preservin
 test('batch 2 exploration tools are admitted in each registered Codex agent independently of richRows', async ($, on) => {
   world(on, { availableTools: [...NATIVE_TOOLS] })
   const specs: any[] = []
-  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  on('agent.register', (_$, e: any) => { if (e.name !== 'codex-child') specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   await startSession($)
   for (const spec of specs) for (const tool of ['Read', 'Glob', 'Grep']) expect(spec.tools.includes(tool)).toBe(true)
 })
@@ -3924,7 +4250,7 @@ for (const c of batch3Cases) {
     expect(w.core).toEqual([])
     const final = await step($, 'agent-progress', 1)
     expect(handback(final.result)).toContain(`1 patch / ${calls.length} file row`)
-    const record: any = w.store.get('agent:sess-1:agent-progress')
+    const record: any = savedState(w, 'agent:sess-1:agent-progress')
     expect(record.wire.records.filter((r: any) => r.event === 'item.completed' && r.item?.type === 'fileChange').length).toBe(1)
     expect(Object.keys(record.wire.rows).length).toBe(calls.length)
   })
@@ -4086,7 +4412,7 @@ for (const item of batch4Items) for (const transport of ['exec', 'app-server'] a
     expect(w.writes).toEqual([])
     const final = await step($, 'agent-progress', 1)
     expect(callsOf(final.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
-    const record: any = w.store.get('agent:sess-1:agent-progress')
+    const record: any = savedState(w, 'agent:sess-1:agent-progress')
     const sources = record.wire.records.filter((s: any) => s.event.endsWith('completed') && s.item?.id === item.id)
     expect(sources.length).toBe(1)
     expect(sources[0].item.results ?? sources[0].item.result ?? sources[0].item.contentItems).toEqual(
@@ -4136,7 +4462,7 @@ test('batch 4 WebFetch requires every reported response fact; rejects fabricated
 for (const available of [true, false]) test(`batch 4 WebFetch own allowlist and availability (${available})`, async ($, on) => {
   const w = world(on, { availableTools: available ? ['WebFetch'] : [], stdout: batch4Line(batch4Items.find(i => i.id === 'open-full')) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
   const specs: any[] = []
-  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  on('agent.register', (_$, e: any) => { if (e.name !== 'codex-child') specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   await startSession($)
   expect(specs[0].tools.includes('WebFetch')).toBe(available)
   const first = await step($, 'agent-progress')
@@ -4356,7 +4682,7 @@ const b5Stream = (transport: 'exec' | 'app-server') => [JSON.stringify({ type: '
 })].join('\n') + '\n'
 
 for (const transport of ['exec', 'app-server'] as const) for (const surface of ['tasks', 'todo', 'display', 'absent', 'registration-fails', 'text'] as const) {
-  test(`batch 5 ${transport} ${surface}: own admission, source binding, schema, replay and no host execution`, { options: { richRows: surface !== 'display', nativeActions: surface !== 'text', transport, progressIntervalMs: 0 } }, async ($, on) => {
+  test(`batch 5 ${transport} ${surface}: own admission, source binding, schema, replay and no host execution`, { options: { richRows: surface !== 'display', nativeActions: surface !== 'text', transport, nestedAgents: false, progressIntervalMs: 0 } }, async ($, on) => {
     const tools = surface === 'absent' || surface === 'registration-fails' ? [] : ['Agent', 'SendMessage', 'TaskStop', ...(surface === 'todo' ? ['TodoWrite'] : ['TaskCreate', 'TaskUpdate'])]
     const w = world(on, { availableTools: tools, stdout: b5Stream(transport), toolRegisterThrows: surface === 'registration-fails' ? 'codex_tool' : undefined })
     if (transport === 'app-server') {
@@ -4364,7 +4690,7 @@ for (const transport of ['exec', 'app-server'] as const) for (const surface of [
       on('fs.exists', (_$, e: any) => ({ value: RUNNER_PATH.test(e.path) }))
     }
     const specs: any[] = []
-    on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: 'codex-mod:' + e.name } } })
+    on('agent.register', (_$, e: any) => { if (e.name !== 'codex-child') specs.push(e); return { value: { agent: 'codex-mod:' + e.name } } })
     await startSession($)
     const emitted: any[] = [], results: any[] = []
     let final = '', text = ''
@@ -4389,7 +4715,7 @@ for (const transport of ['exec', 'app-server'] as const) for (const surface of [
     expect(w.modelCalls).toEqual([])
     expect(w.spawned.length).toBe(1)
     expect(w.writes).toEqual([])
-    const record: any = w.store.get('agent:sess-1:agent-progress')
+    const record: any = savedState(w, 'agent:sess-1:agent-progress')
     expect(record.display.plans[B5_THREAD].steps).toEqual([])
     expect(record.display.children[JSON.stringify([B5_THREAD, B5_CHILD])].displayId).toBe(displayChildId('sess-1', B5_CHILD))
     if (surface === 'text' || surface === 'registration-fails') {

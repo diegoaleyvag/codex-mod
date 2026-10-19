@@ -109,12 +109,15 @@
 // so the user-level AGENTS.md is not loaded. Nothing in the real home is
 // written or deleted by this module.
 
+import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics } from './mirror-launch.ts'
+import type { MirrorAuthority } from './mirror-launch.ts'
 import { explorationAction, validExploration } from './exploration.ts'
 import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
 import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult } from './web-tools.ts'
 import { childRows, planRows, planText, emptyDisplayState } from './plans-children.ts'
 import { captureImage, validImage, generationAction, findingsAction, literalReceipt } from './images-modes.ts'
 import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuestion } from './questions.mjs'
+import { compactStoreState, flushStoreMigrations, readStoreState, writeStoreState } from './store-state.ts'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
@@ -252,7 +255,7 @@ export function parseProjectRoles(text: string, { allowFullAccess = false } = {}
   if (entries.length > 16) warnings.push('at most 16 roles allowed; extra roles skipped')
   for (const [name, value] of entries.slice(0, 16)) {
     const bad = (why: string) => warnings.push(`role ${JSON.stringify(name)} skipped: ${why}`)
-    if (!/^[a-z][a-z0-9-]{0,31}$/.test(name) || name === 'codex') {
+    if (!/^[a-z][a-z0-9-]{0,31}$/.test(name) || ['codex', 'codex-child'].includes(name)) {
       bad('invalid or reserved name')
       continue
     }
@@ -313,6 +316,7 @@ export type Config = {
   maxRunsPerWindow: number
   nativeActions: boolean
   richRows: boolean
+  nestedAgents: boolean
   ttlMs: number
   /** What a run is launched with; `app-server` falls back to exec when its checks fail. */
   transport: Transport
@@ -392,6 +396,7 @@ export function parseConfig(raw: unknown): Config {
     maxRunsPerWindow: int('maxRunsPerWindow', 3, 1, 100),
     nativeActions: bool('nativeActions', true),
     richRows: bool('richRows', false),
+    nestedAgents: bool('nestedAgents', true),
     ttlMs: int('pruneDays', 2, 1, 365) * DAY_MS,
     transport: oneOf<Transport>('transport', 'exec', ['exec', 'app-server']),
     nodeOverride: nodePath === '' ? undefined : nodePath,
@@ -423,13 +428,15 @@ export type AgentRecord = Profile & {
   guardTrip?: { key: string; reason: string }
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
-  // Receipt deduplication and unshown bodies survive a hooks-worker restart.
+  // Receipt IDs are bounded in the store; bodies recover from private cache files.
   coordinator?: { received: string[]; pending: { uuid: string; text: string }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string }> }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
-  // Latest run's public wire evidence, including unsupported source variants.
+  // Runtime/cache only: never put lossless source evidence in the host store.
   wire?: { records: SourceRecord[]; rows: Record<string, SourceRecord | null> }
   display?: DisplayState
+  mirror?: ChildMirror
+  playback?: { cursor: number; prefix: string; texts: string[]; queue: Queued[]; actions: number; usage?: Usage; usageCanonical?: boolean; usagePartial?: boolean; turnId?: string }
   updatedAt: number
 }
 
@@ -522,9 +529,15 @@ export class SourceLedger {
   private completed = new Set<string>()
   private started = new Set<string>()
   private plans = new Map<string, string>()
+  private usageTurns = new Set<string>()
 
   capture(record: SourceRecord): { record: SourceRecord; render: boolean } {
     const key = JSON.stringify([record.threadId, record.turnId, record.itemId])
+    if (record.event === 'turn.completed') {
+      const turn = JSON.stringify([record.threadId, record.turnId])
+      if (this.usageTurns.has(turn)) return { record, render: false }
+      this.usageTurns.add(turn)
+    }
     const end = ['item.completed', 'item/completed'].includes(record.event)
     const start = ['item.started', 'item/started'].includes(record.event)
     if (record.itemId && ((end && this.completed.has(key)) || (start && (this.started.has(key) || this.completed.has(key))))) return { record: this.items.get(key) ?? record, render: false }
@@ -578,7 +591,7 @@ export type CodexEvent =
 type ActionResult = Record<string, unknown> | { type: 'text'; text: string }[]
 
 /** One of Codex's actions as a tool call, and the result it is answered with. */
-export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord; patchPath?: string }
+export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord; patchPath?: string; mirror?: string }
 
 type NativeName = typeof NATIVE_TOOLS[number]
 type NativeResult = BuiltinToolResults[Exclude<NativeName, 'Glob' | 'Grep'>] | GlobResult | GrepResult
@@ -617,7 +630,7 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
   else if (a.tool === 'Write') inputOK = keysOnly(i, ['file_path', 'content']) && typeof i.file_path === 'string' && typeof i.content === 'string'
   else if (a.tool === 'WebSearch') inputOK = keysOnly(i, ['query', 'mode']) && typeof i.query === 'string' && i.query !== '' && ['standard', 'extended'].includes(i.mode)
   else if (a.tool === 'WebFetch') inputOK = keysOnly(i, ['url', 'prompt']) && typeof i.url === 'string' && i.url !== '' && typeof i.prompt === 'string'
-  else if (a.tool === 'Agent') inputOK = keysOnly(i, ['description', 'prompt', 'subagent_type']) && typeof i.description === 'string' && typeof i.prompt === 'string' && i.subagent_type === 'codex-mod:codex'
+  else if (a.tool === 'Agent') inputOK = keysOnly(i, ['description', 'prompt', 'subagent_type']) && typeof i.description === 'string' && typeof i.prompt === 'string' && (i.subagent_type === 'codex-mod:codex' || i.subagent_type === 'codex-mod:codex-child' && validMirrorLink(a))
   else if (a.tool === 'TodoWrite') inputOK = keysOnly(i, ['todos']) && todos(i.todos)
   else if (a.tool === 'TaskCreate') inputOK = keysOnly(i, ['subject', 'description', 'activeForm', 'metadata']) && typeof i.subject === 'string' && i.subject.startsWith('Codex plan: ') && typeof i.description === 'string' && typeof i.activeForm === 'string' && object(i.metadata) && keysOnly(i.metadata, ['codexPlan', 'sourceThread', 'sourceRevision']) && i.metadata.codexPlan === true && typeof i.metadata.sourceThread === 'string' && Number.isInteger(i.metadata.sourceRevision) && i.metadata.sourceRevision > 0
   else if (a.tool === 'TaskUpdate') inputOK = keysOnly(i, ['taskId', 'status', 'description']) && typeof i.taskId === 'string' && i.taskId.startsWith('codex-plan-') && (i.status === undefined || ['pending', 'in_progress', 'completed', 'deleted'].includes(i.status)) && (i.description === undefined || typeof i.description === 'string') && Object.keys(i).length > 1
@@ -956,7 +969,7 @@ export function compact(n: number): string {
  * The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`;
  * an app-server run adds `app-server` (and `N steers`) after the sandbox, a fallback run why it is exec.
  */
-export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number }, mode: FooterMode = 'full'): string {
+export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number; usagePartial?: boolean; treeUsage?: TreeSnapshot }, mode: FooterMode = 'full'): string {
   if (mode === 'off') return ''
   if (mode === 'short') return [p.agent, p.model, p.effort].join(' · ')
   const parts = [p.agent, p.model, p.effort, p.sandbox]
@@ -964,9 +977,15 @@ export function footer(p: Profile & { agent: string; actions: number; usage?: Us
   if (p.steers !== undefined && p.steers > 0) parts.push(`${p.steers} steer${p.steers === 1 ? '' : 's'}`)
   parts.push(`${p.actions} action${p.actions === 1 ? '' : 's'}`)
   if (p.patches) parts.push(`${p.patches} patch${p.patches === 1 ? '' : 'es'} / ${p.patchRows} file row${p.patchRows === 1 ? '' : 's'}`)
-  if (p.usage !== undefined) {
+  if (p.usagePartial) parts.push('direct usage partial/unknown')
+  else if (p.usage !== undefined) {
     const fresh = Math.max(0, p.usage.input - p.usage.cached)
     parts.push(`${compact(fresh)} new tokens (${compact(p.usage.cached)} cached, ${compact(p.usage.output)} out)`)
+  }
+  if (p.treeUsage) {
+    const t = p.treeUsage
+    const exact = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+    parts.push(`tree ${exact(t.tree.input + t.tree.output)} tokens (direct ${exact(t.direct.input + t.direct.output)}; children ${exact(t.tree.input + t.tree.output - t.direct.input - t.direct.output)}) · new ${compact(t.tree.input - t.tree.cached)} / cached ${compact(t.tree.cached)} / out ${compact(t.tree.output)}${t.active || t.missing ? ` (partial: ${t.active} active, ${t.missing} missing)` : ''}`)
   }
   if (p.thread !== undefined) parts.push(`thread ${p.thread.slice(0, 8)}`)
   return parts.join(' · ')
@@ -1216,6 +1235,7 @@ export function runnerArgv(p: {
   extra: readonly string[]
   control: string
   questions?: boolean
+  nestedAgents?: boolean
 }): string[] {
   const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra]
   return [
@@ -1225,6 +1245,7 @@ export function runnerArgv(p: {
     ...overrides.flatMap(kv => ['--config', kv]),
     '--control', p.control,
     ...(p.questions ? ['--questions', 'choices'] : []),
+    ...(p.nestedAgents === false ? ['--nested', 'false'] : []),
   ]
 }
 
@@ -1330,6 +1351,11 @@ type Run = {
   unknown: number
   unknownTypes: string[]
   fatal?: string
+  mirror?: ChildMirror
+  treeUsage?: TreeSnapshot
+  usageCanonical?: boolean
+  usagePartial?: boolean
+  childSources?: Map<string, SourceRecord>
   compactions?: Map<string, { notification: boolean; items: string[] }>
 }
 
@@ -1449,6 +1475,332 @@ const roleTask = (name: string, text: string): string => {
   return instructions ? `${instructions}\n\n${text}` : text
 }
 
+type TreeSnapshot = { direct: Usage; tree: Usage; children: number; missing: number; active: number }
+type ChildMirror = {
+  version: 1; session: string; thread: string; parentThread: string; parentHost: string
+  host?: string; hostToolId?: string; displayToolId?: string
+  sourceTurn?: string; sourceItem?: string; rootTurn?: string
+  control: string; generation: string; token: string; inputDigest: string; node: string; reader: string; activeTurn?: string; cwd?: string
+  depth: number; model: string; effort: string; sandbox: string; path?: string
+  launch: 'reserved' | 'launching' | 'bound' | 'refused' | 'uncertain'
+  state: 'waiting' | 'running' | 'completed' | 'failed' | 'aborted'
+  reason?: string; stopSent?: boolean; updatedAt: number
+}
+const mirrors = new Map<string, ChildMirror>()
+// Only a live source step can authorize infrastructure; disk records alone cannot.
+const mirrorAuthorities = new Map<string, MirrorAuthority>()
+const mirrorDiagnostics = new MirrorDiagnostics()
+const flushMirrorDiagnostics = ($: EngineInterface) => mirrorDiagnostics.flush(line => $.ui.log(line, { to: 'debug' }))
+const mirrorKey = (sid: string, thread: string) => `mirror:${sid}:${thread}`
+const validThreadId = (id: unknown): id is string => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+const isMirror = (m: any): m is ChildMirror => m?.version === 1 && validThreadId(m.thread) && typeof m.parentHost === 'string' &&
+  typeof m.session === 'string' && typeof m.control === 'string' && typeof m.token === 'string' && typeof m.generation === 'string' && [2, 3, 4].includes(m.depth)
+
+async function hydrateMirrors($: EngineInterface): Promise<void> {
+  const sid = await sessionId($)
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(`mirror:${sid}:`) || mirrors.has(key)) continue
+    const stored = await $.store.get(key)
+    const value = stored && await readStoreState($, key, stored)
+    if (isMirror(value)) mirrors.set(key, value)
+  }
+}
+
+async function saveMirror($: EngineInterface, m: ChildMirror): Promise<boolean> {
+  m.updatedAt = await $.clock.now()
+  mirrors.set(mirrorKey(m.session, m.thread), m)
+  // Launch reservations must be durable before core can create a host loop.
+  const saved = await writeStoreState($, mirrorKey(m.session, m.thread), m)
+  if (m.host) {
+    const rec = records.get(m.host)
+    if (rec) { rec.mirror = m; await saveRecord($, m.host, rec) }
+  }
+  return saved
+}
+
+async function bindMirror($: EngineInterface, m: ChildMirror, host: string): Promise<void> {
+  const info = (await $.agent.list()).find(a => a.id === host)
+  const verdict = mirrorHostMatches(m, host, info, mirrorAuthorities.get(m.token)?.spawned === true)
+  if (verdict !== 'admit') {
+    mirrorDiagnostics.add(mirrorLaunchDiagnostic('bind', verdict, info ?? {}, 'codex-mod', m))
+    flushMirrorDiagnostics($)
+    throw new Error(`mirror host identity mismatch: ${verdict}`)
+  }
+  m.host = host
+  m.launch = 'bound'
+  if (m.state === 'waiting') m.state = 'running'
+  known.set(host, 'codex-child')
+  const loaded = await loadRecord($, host)
+  const rec: AgentRecord = loaded ?? { model: m.model, effort: m.effort, sandbox: m.sandbox, agentName: 'codex-child', thread: m.thread, updatedAt: 0 }
+  rec.mirror = m
+  records.set(host, rec)
+  await saveMirror($, m)
+}
+
+/** An API launch may traverse tool guards. Only its exact held capability
+ * and plugin origin allow infrastructure through; source actions never do. */
+function heldMirrorCall(e: any, origin: string, phase: 'call' | 'check' = 'call'): boolean {
+  const prompt = phase === 'check' && object(e.input) ? e.input.prompt : e.prompt
+  const m = [...mirrors.values()].find(m => m.token === prompt)
+  // The nested dispatch carries the exact capability in prompt. No event
+  // loop ID or async-local context participates in the authority lookup.
+  const verdict = admitMirrorLaunch(m, mirrorAuthorities.get(prompt), e, origin, phase)
+  const input = phase === 'check' && object(e.input) ? e.input : e
+  if (m || input.subagent_type === 'codex-mod:codex-child') mirrorDiagnostics.add(mirrorLaunchDiagnostic(phase, verdict, e, origin, m))
+  return verdict === 'admit'
+}
+
+function heldMirrorSpawn(e: any, origin: string): ChildMirror | undefined {
+  const m = [...mirrors.values()].find(m => m.token === e.prompt)
+  const verdict = admitMirrorLaunch(m, mirrorAuthorities.get(e.prompt), e, origin, 'spawn')
+  mirrorDiagnostics.add(mirrorLaunchDiagnostic('spawn', verdict, e, origin, m))
+  return verdict === 'admit' ? m : undefined
+}
+
+function validMirrorLink(a: Action): boolean {
+  if (!a.mirror || !object(a.result)) return false
+  const m = mirrors.get(a.mirror)
+  return !!m && m.launch === 'bound' && m.host === a.result.agentId && a.input.prompt === `Observe existing Codex child ${m.thread}` &&
+    a.source?.threadId === m.parentThread && a.source?.data?.thread_id === m.thread
+}
+
+async function mirrorFallback($: EngineInterface, run: Run, data: any, reason: string): Promise<void> {
+  const text = `↪ Codex child ${data.thread_id}: mirror unavailable (${reason}); using Batch 5 lifecycle/report view. Child transcript unavailable.`
+  run.queue.push({ kind: 'note', text })
+  $.ui.log(`codex-mod: ${text}`, { to: 'debug' })
+  const source = run.childSources?.get(data.thread_id)
+  run.childSources?.delete(data.thread_id)
+  if (source?.item) {
+    const rec = records.get(run.agentId)
+    if (rec) {
+      const state = rec.display ??= emptyDisplayState()
+      const tools = agentTools.get(run.name) ?? new Set<string>()
+      for (const row of childRows(source.item, state, { session: run.sessionId, agent: run.agentId, thread: run.thread!, turn: source.turnId, rich: cfg.richRows, tools })) await handle($, run, row, source)
+    }
+  }
+}
+
+async function launchMirror($: EngineInterface, run: Run, data: any): Promise<void> {
+  if (!cfg.nestedAgents || run.transport !== 'app-server' || !run.control || data.parent_thread_id !== run.thread || !validThreadId(data.thread_id)) return
+  if (data.status !== 'attached') return mirrorFallback($, run, data, data.reason ?? 'child attachment failed')
+  await hydrateMirrors($)
+  const key = mirrorKey(run.sessionId, data.thread_id)
+  let m = mirrors.get(key)
+  if (m) {
+    if (m.launch !== 'bound') return mirrorFallback($, run, data, m.reason ?? `previous launch ${m.launch}; creation outcome not retried`)
+    const info = (await $.agent.list()).find(a => a.id === m!.host)
+    const verdict = mirrorHostMatches(m, m.host!, info)
+    if (verdict !== 'admit') {
+      mirrorDiagnostics.add(mirrorLaunchDiagnostic('recover', verdict, info ?? {}, 'codex-mod', m))
+      flushMirrorDiagnostics($)
+    }
+    if (m.parentHost !== run.agentId || verdict !== 'admit' || m.generation !== data.generation) return mirrorFallback($, run, data, 'previous host or broker unavailable; no relaunch')
+    if (!m.displayToolId && !run.queue.some(q => q.kind === 'action' && q.action.mirror === key)) return mirrorFallback($, run, data, `existing host ${m.host}; launch row recovery incomplete; no relaunch`)
+    return
+  }
+  const list = await $.agent.list()
+  let depth = run.mirror?.depth ?? 1
+  let parent = list.find(a => a.id === run.agentId)
+  const seen = new Set<string>()
+  while (!run.mirror && parent?.parentId) {
+    if (seen.has(parent.id)) return mirrorFallback($, run, data, 'host ancestry cycle')
+    seen.add(parent.id)
+    depth++
+    parent = list.find(a => a.id === parent!.parentId)
+    if (!parent) return mirrorFallback($, run, data, 'host ancestry unavailable')
+  }
+  const description = oneLine(`Codex ${data.model ?? run.prof.model} · ${data.path ?? data.thread_id}`, 120)
+  const token = `codex-mirror:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}:${Math.random().toString(36).slice(2)}`
+  const input = { subagentType: `${$.plugin.name}:codex-child`, prompt: token, description, name: `codex-${data.thread_id}`, cwd: run.cwd }
+  m = { version: 1, session: run.sessionId, thread: data.thread_id, parentThread: run.thread!, parentHost: run.agentId,
+    sourceTurn: data.source_turn_id, sourceItem: data.source_item_id, rootTurn: data.root_turn_id,
+    control: run.control, node: appServer && 'node' in appServer ? appServer.node : 'node', reader: appServer && 'runner' in appServer ? appServer.runner : `${$.plugin.root}/${RUNNER}`, activeTurn: data.turn_id, generation: data.generation, token, inputDigest: mirrorLaunchDigest(input), cwd: run.cwd, depth: depth + 1,
+    model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort, sandbox: run.prof.sandbox,
+    path: data.path, launch: 'reserved', state: 'waiting', updatedAt: 0 }
+  if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror identity checkpoint unavailable; no host launched')
+  if (m.depth > 3) {
+    m.launch = 'refused'; m.reason = 'host depth cap 3'
+    await saveMirror($, m)
+    return mirrorFallback($, run, data, m.reason)
+  }
+  m.launch = 'launching'
+  if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror launch checkpoint unavailable; no host launched')
+  mirrorAuthorities.set(token, { parentHost: run.agentId, session: run.sessionId })
+  try {
+    // This call is in the source parent's turn.step context. It creates only
+    // a host observer; the Codex child has already been spawned by Codex.
+    const result = await $.agent.spawn(input)
+    // turn.start may bind a core identity before the launch call resolves.
+    // Reconcile that verified identity when a host omits it from the ack.
+    const early = mirrors.get(key)
+    const host = result.agentId ?? (early?.launch === 'bound' ? early.host : undefined)
+    if (result.deny || !host) {
+      m.launch = m.host ? 'uncertain' : 'refused'; m.reason = result.deny ?? 'host returned no agentId'
+      await saveMirror($, m)
+      return mirrorFallback($, run, data, m.reason)
+    }
+    await bindMirror($, m, host)
+  } catch (err) {
+    // Core may already have created a task. An unknown outcome is never
+    // retried automatically, even after a worker restart.
+    m.launch = 'uncertain'; m.reason = errText(err)
+    await saveMirror($, m)
+    return mirrorFallback($, run, data, `host creation outcome unknown: ${m.reason}`)
+  } finally {
+    mirrorAuthorities.delete(token)
+    flushMirrorDiagnostics($)
+  }
+  run.childSources?.delete(data.thread_id)
+  const source = normalizeSource(JSON.stringify(data), { transport: 'app-server', threadId: run.thread, turnId: run.turnId, cwd: run.cwd })!
+  source.threadId = run.thread
+  source.data = data
+  const prompt = `Observe existing Codex child ${m.thread}`
+  const action: Action = { tool: 'Agent', mirror: key, input: { description, prompt, subagent_type: 'codex-mod:codex-child' }, source,
+    result: { agentId: m.host, agentType: 'codex-mod:codex-child', status: 'completed', prompt, canContinueAgent: false,
+      content: [{ type: 'text', text: `Observation link to real host agent ${m.host} for Codex child ${m.thread}. Host launch ${m.hostToolId ?? 'ID unavailable'}; child lifecycle and transcript belong to that host task. This completed link operation reports no host usage; Codex source usage is in the direct/tree footer.` }],
+      resolvedModel: m.model, totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, server_tool_use: null, service_tier: null, cache_creation: null } } }
+  run.queue.push({ kind: 'action', action })
+}
+
+async function stopMirror($: EngineInterface, m: ChildMirror): Promise<void> {
+  if (m.stopSent || m.state !== 'running') return
+  const run = m.host ? runs.get(m.host) : undefined
+  const turnId = run?.turnId ?? (m.host ? records.get(m.host)?.playback?.turnId : undefined) ?? m.activeTurn
+  m.stopSent = true
+  m.state = 'aborted'
+  await saveMirror($, m)
+  if (turnId) await $.fs.write(`${m.control}/interrupt-${m.thread}.json`, JSON.stringify({ threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }))
+}
+
+/** A journal consumer owns no process. Every pull settles inside one step;
+ * a worker reload resumes its cursor or reports a source gap, never executes. */
+function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessSpawnChunk, ProcessSpawnResult> {
+  const m = rec.mirror!
+  let cursor = rec.playback?.cursor ?? 0
+  let prefix = rec.playback?.prefix ?? ''
+  let ended = false
+  let code = 0
+  let quiet = 0
+  let settle: (r: ProcessSpawnResult) => void
+  const result = new Promise<ProcessSpawnResult>(resolve => { settle = resolve })
+  const done = () => { ended = true; const value = { code, signal: null } as ProcessSpawnResult; settle(value); return { done: true as const, value } }
+  return {
+    result,
+    [Symbol.asyncIterator]() { return this },
+    async next() {
+      if (ended) return done()
+      for (;;) {
+        const text = await $.fs.read(`${m.control}/events-${m.thread}.jsonl`).catch(() => '')
+        if (typeof text !== 'string' || text.length < cursor || cursor && text.slice(Math.max(0, cursor - 160), cursor) !== prefix) throw new Error('child journal truncated or replaced; no relaunch')
+        const nl = text.indexOf('\n', cursor)
+        if (nl >= 0) {
+          quiet = 0
+          const line = text.slice(cursor, nl)
+          cursor = nl + 1
+          prefix = text.slice(Math.max(0, cursor - 160), cursor)
+          const ev = JSON.parse(line)
+          if (ev.thread_id !== m.thread && ev.type !== 'codexmod.child') throw new Error('foreign child journal identity')
+          if (ev.type === 'turn.failed') code = 1
+          if (ev.type === 'codexmod.turn' && m.state !== 'aborted') m.state = 'running'
+          const run = m.host ? runs.get(m.host) : undefined
+          if (run && ['turn.completed', 'turn.failed'].includes(ev.type)) {
+            // Source terminal evidence settles the observer; do not echo a stop.
+            m.state = code ? 'failed' : 'completed'
+          }
+          rec.playback = { cursor, prefix, texts: run?.texts ?? [], queue: run?.queue ?? [], actions: run?.actions ?? 0, usage: run?.usage, usageCanonical: run?.usageCanonical, usagePartial: run?.usagePartial, turnId: ev.turn_id ?? run?.turnId }
+          return { done: false as const, value: { stream: 'stdout' as const, text: line + '\n' } }
+        }
+        const owner = JSON.parse(String(await $.fs.read(`${m.control}/owner.json`).catch(() => '{}')))
+        if (owner.generation !== m.generation || owner.ended || !Number.isFinite(owner.updatedAt) || Date.now() - owner.updatedAt > 15000) {
+          if (!['completed', 'failed', 'aborted'].includes(m.state)) throw new Error('child source owner unavailable; partial transcript, no relaunch')
+          return done()
+        }
+        const run = m.host ? runs.get(m.host) : undefined
+        if (['completed', 'failed'].includes(m.state) && ++quiet >= 2) return done()
+        if (run?.killed || m.state === 'aborted') return done()
+        await mirrorMessages($, rec, run)
+        // A bounded read-only wait in the host keeps polling out of the
+        // dispatch's CPU/sleep budget. It starts no Codex or provider work.
+        await $.process.run([m.node, m.reader, 'observe', '--control', m.control, '--thread', m.thread, '--cursor', String(cursor), '--generation', m.generation], { timeoutMs: 3000 })
+      }
+    },
+    async return() { return done() },
+  } as HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+}
+
+async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): Promise<void> {
+  const m = rec.mirror!
+  const c = await conversation($, m.host!)
+  const read = readConversation(c.items)
+  const count = read.latest?.count ?? rec.userCount ?? 0
+  const received = [...(rec.coordinator?.pending ?? []).map(p => ({ ...p, count })), ...takeDeliveries(m.host!, count)]
+  const latest = read.latest
+  if (latest && latest.text !== m.token && latest.text !== rec.lastTask && latest.count > (rec.userCount ?? 0)) received.push({ text: latest.text, count: latest.count })
+  for (const message of received) {
+    const id = steerFileId(message)
+    const control = (rec.coordinator ??= { received: [], pending: [] })
+    const key = `mirror:${id}`
+    if (control.received.includes(key)) continue
+    control.received.push(key)
+    // Journal intent first. A crash after this write has an unknown outcome,
+    // so recovery does not send it twice or convert it to a new run.
+    rec.lastTask = message.text; rec.userCount = message.count
+    if (rec.handedBack || m.state !== 'running' || !(run?.turnId ?? rec.playback?.turnId ?? m.activeTurn)) {
+      const note = '↪ child message rejected: source turn idle, terminal or unknown; no new turn started'
+      if (run) run.queue.push({ kind: 'note', text: note })
+      else rec.lastAnswer = [rec.lastAnswer, note].filter(Boolean).join('\n\n')
+      await saveRecord($, m.host!, rec)
+      continue
+    }
+    await saveRecord($, m.host!, rec)
+    await $.fs.write(`${m.control}/steer-${m.thread}-${id}.json`, JSON.stringify({ text: message.text, messageId: message.uuid ?? id, threadId: m.thread, turnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn }))
+    if (run) run.queue.push({ kind: 'note', text: `↪ child message submitted (${message.uuid ?? id}); awaiting Codex acknowledgement` })
+  }
+}
+
+async function checkpointMirror($: EngineInterface, run: Run): Promise<void> {
+  if (!run.mirror) return
+  const rec = records.get(run.agentId)
+  if (!rec?.playback) return
+  Object.assign(rec.playback, { texts: run.texts, queue: run.queue, actions: run.actions, usage: run.usage, usageCanonical: run.usageCanonical, usagePartial: run.usagePartial, turnId: run.turnId })
+  rec.wire = { records: run.ledger.records, rows: run.rows }
+  await saveMirror($, run.mirror)
+}
+
+async function* answerMirror($: EngineInterface, e: TurnStepInput, signal: AbortSignal, rec: AgentRecord): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  const m = rec.mirror!
+  if (!isMirror(m) || m.host !== e.agentId) return yield* failStep(e, 'codex-child', 'codex failed: unowned mirror; no run launched', false)
+  mirrors.set(mirrorKey(m.session, m.thread), m)
+  const c = await conversation($, e.agentId!)
+  const read = readConversation(c.items)
+  const handback = handbackFor(e.agentId!, read.signal, c.source)
+  if (rec.handedBack) {
+    await mirrorMessages($, rec)
+    return yield* redeliver($, e, e.agentId!, rec, handback)
+  }
+  let run = runs.get(e.agentId!)
+  if (!run) {
+    const ledger = new SourceLedger()
+    for (const source of rec.wire?.records ?? []) ledger.capture(source)
+    const p = rec.playback
+    run = { sessionId: m.session, ledger, rows: rec.wire?.rows ?? {}, agentId: e.agentId!, name: 'codex-child', prof: rec,
+      cwd: m.cwd ?? await $.session.cwd(), child: mirrorStream($, rec), thread: m.thread, turnId: p?.turnId, buffered: '', stderrTail: '',
+      texts: p?.texts ?? [], queue: p?.queue ?? [], errors: [], snapshots: new Map(), actions: p?.actions ?? 0, usage: p?.usage, usageCanonical: p?.usageCanonical, usagePartial: p?.usagePartial,
+      patches: 0, patchRows: 0, actionSteps: 0, lastEmit: -Infinity, ended: false, killed: false, timedOut: false,
+      handback, followUps: [], transport: 'app-server', control: m.control, transportNote: 'app-server mirror', pendingSteers: [], steers: 0,
+      unknown: 0, unknownTypes: [], mirror: m }
+    runs.set(e.agentId!, run)
+  } else {
+    // Engine interfaces belong to a dispatch. Replace only the inert reader
+    // between steps so all filesystem/control calls use this step's interface.
+    await run.child.return(undefined as unknown as ProcessSpawnResult)
+    run.child = mirrorStream($, rec)
+  }
+  await mirrorMessages($, rec, run)
+  return yield* pump($, e, signal, run)
+}
+
 export const register: Register = (on, options) => {
   cfg = parseConfig(options)
   const config = cfg
@@ -1495,18 +1847,32 @@ export const register: Register = (on, options) => {
   // else is refused. A subagent not seen yet (after a worker restart, say) has
   // its type resolved first; if that fails, `.catch` refuses the call.
   on('tool.call', async ($, e, next) => {
+    const held = heldMirrorCall(e, next.origin.plugin)
+    flushMirrorDiagnostics($)
+    if (held) return next(e)
     if (guarded(e)) return answerGuarded(e, await sessionId($))
     if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
     return next(e)
-  }).catch(($, e, next) => (guarded(e) || unresolved(e) ? { deny: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => {
+    if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
+    if (!guarded(e) && !unresolved(e)) return next(e)
+    const held = typeof e.tool_use_id === 'string' ? answers.get(e.tool_use_id) : undefined
+    return held ? answerGuarded(e, held.sessionId) : { deny: NOT_EXECUTED }
+  })
 
   // GUARD 2. `tool.check` runs inside `tool.call`'s `next`, which guard 1
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
   on('tool.check', async ($, e, next) => {
+    const held = heldMirrorCall(e, next.origin.plugin, 'check')
+    flushMirrorDiagnostics($)
+    if (held) return next(e)
     if (!hasPrefix(e.tool_use_id) && !isDisplay(e.tool) && unresolved(e)) await agentName($, e.agentId!)
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
-  }).catch(($, e, next) => (guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => {
+    if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin, 'check')) return next(e)
+    return guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
+  })
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
     if (!dimNotes.has(e.props.text)) return next(e)
@@ -1522,7 +1888,8 @@ export const register: Register = (on, options) => {
       const sid = await sessionId($)
       for (const key of await $.store.keys()) {
         if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
-        const rec = await $.store.get(key)
+        const stored = await $.store.get(key)
+        const rec = stored && await readStoreState($, key, stored)
         if (!isRecord(rec)) continue
         const saved = rec.coordinator?.rows?.[id]
         if (saved && saved.tool === e.props.tool && rec.coordinator!.received.includes(saved.sourceUuid)) {
@@ -1615,6 +1982,7 @@ export const register: Register = (on, options) => {
         // Publish without an await so simultaneous first receipts share state.
         records.set(e.agentId, rec)
         await saveRecord($, e.agentId, rec, true)
+        if (rec.mirror) { await mirrorMessages($, rec, runs.get(e.agentId)); return next(e) }
         const list = deliveries.get(e.agentId) ?? []
         if (!list.some(d => d.uuid === e.uuid)) list.push({ uuid: e.uuid, text })
         deliveries.set(e.agentId, list.slice(-MAX_DELIVERIES))
@@ -1624,10 +1992,45 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : next(e)))
 
+  on('agent.offer', ($, e, next) => e.agent === `${$.plugin.name}:codex-child` ? { isOffered: false } : next(e))
+    .catch(($, e, next) => e.agent.endsWith(':codex-child') ? { isOffered: false } : next(e))
+
+  on('agent.spawn', async ($, e, next) => {
+    if (e.subagentType !== `${$.plugin.name}:codex-child`) return next(e)
+    const held = heldMirrorSpawn(e, next.origin.plugin)
+    flushMirrorDiagnostics($)
+    if (!held) return { deny: 'codex-mod: unowned or unsupported mirror launch' }
+    if (!await saveMirror($, held)) return { deny: 'codex-mod: mirror launch checkpoint unavailable' }
+    return next(e)
+  }).catch(($, e, next) => {
+    if (!e.subagentType.endsWith(':codex-child')) return next(e)
+    const held = next.error.kind === 're-entry' ? heldMirrorSpawn(e, next.origin.plugin) : undefined
+    if (!held) return { deny: 'codex-mod: mirror launch failed closed' }
+    // The ancestor's spawn observer is inherited by grandchildren. Its
+    // pure guard can admit only another held observer, without engine APIs.
+    held.hostToolId = e.tool_use_id
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    flushMirrorDiagnostics($)
+    if (!e.agentId) return next(e)
+    await hydrateMirrors($)
+    const held = [...mirrors.values()].find(m => m.token === e.text && m.launch === 'launching')
+    if (held) await bindMirror($, held, e.agentId)
+    return next(e)
+  })
+
   // A turn that ends while its Codex run is still active (interrupted, an
   // error, maxTurns reached) kills the child.
   on('turn.complete', async ($, e, next) => {
     const run = e.agentId === undefined ? undefined : runs.get(e.agentId)
+    const mirror = e.agentId ? (await loadRecord($, e.agentId))?.mirror : undefined
+    if (mirror && !run && e.isAborted && !['completed', 'failed', 'aborted'].includes(mirror.state)) await stopMirror($, mirror)
+    if (run?.mirror && e.reason === 'end_turn' && !e.isAborted) {
+      await killRun(run)
+      return next(e)
+    }
     if (run !== undefined) {
       $.ui.log(`codex-mod: agent ${run.agentId} turn ended (${e.reason}) while Codex ran; killing it`, { to: 'debug' })
       await stopRun($, run)
@@ -1656,7 +2059,7 @@ export const register: Register = (on, options) => {
       if (name === undefined) throw err
       known.set(e.agentId, name)
     }
-    if (name === undefined) return yield* next(e)
+    if (name === undefined || name === 'codex-child') return yield* next(e)
     if (profileOf(name) === undefined && await loadRecord($, e.agentId) === undefined) {
       return yield* failStep(e, name, `codex failed: agent type ${$.plugin.name}:${name} is not declared by this project (.claude/codex-mod.json) or this version of the plugin`, handbackFor(e.agentId, undefined))
     }
@@ -1666,12 +2069,42 @@ export const register: Register = (on, options) => {
     if (next.called) return yield* next(e)
     const agentId = e.agentId
     const name = agentId === undefined ? undefined : (known.get(agentId) ?? records.get(agentId)?.agentName)
+    if (name === 'codex-child') {
+      if (next.error.kind === 're-entry') return yield* next(e)
+      return yield* failStep(e, name, 'codex failed: mirror dispatch failed closed', false)
+    }
     if (agentId === undefined || name === undefined) return yield* next(e)
     const run = runs.get(agentId)
     if (run !== undefined) void killRun(run)
     const rec = records.get(agentId)
     if (rec !== undefined) rec.handedBack = true
     return yield* failStep(e, name, `codex failed: ${failureText(next.error)}`, handbackFor(agentId, undefined))
+  })
+
+  // A spawning hook is skipped by the loop it creates. Separate consumers
+  // for the two admitted host depths keep grandchildren intercepted too.
+  for (const depth of [2, 3]) on('turn.step', { agentId: depth === 2 ? /.+/ : /[\s\S]+/ }, async function* ($, e, next) {
+    if (!e.agentId) return yield* next(e)
+    const saved = await loadRecord($, e.agentId)
+    if (saved?.mirror) known.set(e.agentId, 'codex-child')
+    if (await agentName($, e.agentId) !== 'codex-child') return yield* next(e)
+    const rec = await loadRecord($, e.agentId)
+    if (!rec?.mirror || !isMirror(rec.mirror) || ![2, 3].includes(rec.mirror.depth)) return yield* failStep(e, 'codex-child', 'codex failed: mirror identity unavailable; no run launched', false)
+    if (rec.mirror.depth !== depth) return yield* next(e)
+    budgets.set(next.signal, () => next.budget.remainingMs)
+    return yield* withCoordinatorMessages($, e, answerMirror($, e, next.signal, rec))
+  }).catch(async function* ($, e, next) {
+    // No engine APIs here: a failure must never fall through to a provider.
+    const mirror = e.agentId ? records.get(e.agentId)?.mirror : undefined
+    if (mirror && mirror.depth !== depth && [2, 3].includes(mirror.depth) && next.error.kind === 're-entry') return yield* next(e)
+    if (e.agentId && (known.get(e.agentId) === 'codex-child' || mirror)) {
+      if (mirror) mirror.state = 'failed'
+      const run = runs.get(e.agentId)
+      if (run) void killRun(run)
+      return yield* failStep(e, 'codex-child', 'codex failed: mirror consumer failed closed; no run launched', false)
+    }
+    if (e.agentId && !known.has(e.agentId)) return yield* failStep(e, 'codex-child', 'codex failed: mirror ownership unavailable', false)
+    return yield* next(e)
   })
 }
 
@@ -1793,7 +2226,8 @@ async function pruneRuns($: EngineInterface, ttlMs: number): Promise<void> {
     const now = await $.clock.now()
     for (const ent of await $.fs.list(dir)) {
       if (ent.kind !== 'dir') continue
-      const st = await $.fs.stat(`${dir}/${ent.name}`)
+      // Recovery files are updated in place; their directory mtime may be old.
+      const st = await $.fs.stat(`${dir}/${ent.name}${ent.name.startsWith('state-') ? '/record.json' : ''}`)
       if (!(now - st.mtimeMs < ttlMs)) await $.process.run(['rm', '-rf', `${dir}/${ent.name}`], { timeoutMs: 10000 })
     }
   } catch (err) {
@@ -1883,9 +2317,10 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
   for (const [name, r] of projectRoles) {
     specs.push({ name, description: `${r.description} Runs OpenAI Codex ${r.model} at ${r.effort} reasoning in a ${r.sandbox} sandbox (declared by this project).${override}${models}` })
   }
+  specs.push({ name: 'codex-child', description: 'Internal observation loop for an existing Codex child. Never dispatch directly.' })
   for (const s of specs) {
     try {
-      const tools = [...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (config.richRows || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)]
+      const tools = [...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (config.richRows || tool === 'Agent' && config.nestedAgents || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)]
       await $.agent.register({
         name: s.name,
         description: s.description,
@@ -2022,7 +2457,7 @@ async function sessionHandbackInactive($: EngineInterface, failed: boolean): Pro
   try {
     const key = sessionHandbackKey(await sessionId($))
     if (failed) {
-      await $.store.set(key, { handbackLock: 'text', updatedAt: await $.clock.now() })
+      await writeStoreState($, key, { handbackLock: 'text', updatedAt: await $.clock.now() })
       return true
     }
     return isHandbackMemo(await $.store.get(key))
@@ -2038,7 +2473,9 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
   if (held !== undefined) return held
   try {
     const sid = await sessionId($)
-    const own = await $.store.get(recordKey(sid, agentId))
+    const key = recordKey(sid, agentId)
+    const stored = await $.store.get(key)
+    const own = isRecord(stored) ? await readStoreState($, key, stored) as AgentRecord : stored
     // A receipt may have published a record while this read was in flight.
     if (records.has(agentId)) return records.get(agentId)
     if (isRecord(own)) {
@@ -2050,14 +2487,14 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
     let best: { key: string; rec: AgentRecord } | undefined
     for (const key of await $.store.keys()) {
       if (!key.startsWith(STORE_PREFIX) || !key.endsWith(`:${agentId}`)) continue
-      const v = await $.store.get(key)
+      const stored = await $.store.get(key)
+      const v = isRecord(stored) ? await readStoreState($, key, stored) as AgentRecord : stored
       if (isRecord(v) && (best === undefined || v.updatedAt > best.rec.updatedAt)) best = { key, rec: v }
     }
     if (best !== undefined) {
       if (records.has(agentId)) return records.get(agentId)
       records.set(agentId, best.rec)
-      await $.store.set(recordKey(sid, agentId), best.rec)
-      if (best.key !== recordKey(sid, agentId)) await $.store.delete(best.key)
+      if (await writeStoreState($, recordKey(sid, agentId), best.rec) && best.key !== recordKey(sid, agentId)) await $.store.delete(best.key)
       $.ui.log(`codex-mod: agent ${agentId} record moved from ${best.key}`, { to: 'debug' })
       return best.rec
     }
@@ -2083,7 +2520,7 @@ async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord,
   records.set(agentId, rec)
   try {
     const key = recordKey(await sessionId($), agentId)
-    await $.store.set(key, records.get(agentId) ?? rec)
+    await writeStoreState($, key, records.get(agentId) ?? rec)
   } catch (err) {
     $.ui.log(`codex-mod: store write failed: ${errText(err)}`, { to: 'debug' })
   }
@@ -2094,14 +2531,19 @@ async function pruneRecords($: EngineInterface, ttlMs: number): Promise<void> {
   try {
     const now = await $.clock.now()
     for (const key of await $.store.keys()) {
-      if (!key.startsWith(STORE_PREFIX) && !(key.startsWith(SESSION_PREFIX) && key.endsWith(':handback'))) continue
+      if (!key.startsWith(STORE_PREFIX) && !key.startsWith('mirror:') && !(key.startsWith(SESSION_PREFIX) && key.endsWith(':handback'))) continue
       const v = await $.store.get(key)
-      const valid = key.startsWith(STORE_PREFIX) ? isRecord(v) : isHandbackMemo(v)
-      if (!valid || !(now - (v as AgentRecord | HandbackMemo).updatedAt < ttlMs)) await $.store.delete(key)
+      const valid = key.startsWith(STORE_PREFIX) ? isRecord(v) : key.startsWith('mirror:') ? isMirror(v) : isHandbackMemo(v)
+      if (!valid || !(now - (v as AgentRecord | HandbackMemo).updatedAt < ttlMs)) {
+        await $.store.delete(key).catch(err => $.ui.log(`codex-mod: store prune failed for ${key}: ${errText(err)}`, { to: 'debug' }))
+      } else if (!v.cachedState && JSON.stringify(v) !== JSON.stringify(compactStoreState(v))) {
+        await writeStoreState($, key, v, JSON.stringify(v).length)
+      }
     }
   } catch (err) {
     $.ui.log(`codex-mod: store prune failed: ${errText(err)}`, { to: 'debug' })
   }
+  await flushStoreMigrations($)
 }
 
 // ---- steps -----------------------------------------------------------------
@@ -2395,7 +2837,7 @@ async function* startRun(
     await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
     const questionTool = displayTools.codex_question
     const questions = config.nativeActions && !config.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
-    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control, questions })
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control, questions, nestedAgents: config.nestedAgents })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   } else {
     argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
@@ -2483,6 +2925,7 @@ async function killRun(run: Run, interrupted = false): Promise<void> {
  * turn interrupted) and read for up to INTERRUPT_GRACE_MS within this call.
  */
 async function stopRun($: EngineInterface, run: Run): Promise<void> {
+  if (run.mirror) { await stopMirror($, run.mirror); return killRun(run) }
   if (run.killed || run.transport !== 'app-server' || run.control === undefined || run.ended) return killRun(run)
   // marked killed first: the step pulling meanwhile ends, and no second stop starts
   run.killed = true
@@ -2587,6 +3030,12 @@ async function feed($: EngineInterface, run: Run, piece: ProcessSpawnChunk): Pro
 }
 
 async function feedLine($: EngineInterface, run: Run, line: string): Promise<void> {
+  let envelope: any
+  try { envelope = JSON.parse(line) } catch {}
+  if (envelope?.type === 'codexmod.childEvent') return
+  if (envelope?.type === 'codexmod.treeUsage') { run.treeUsage = envelope; run.usage = envelope.direct; run.usageCanonical = true; return }
+  if (envelope?.type === 'codexmod.directUsage') { run.usage = envelope.usage; run.usageCanonical = true; run.usagePartial = envelope.partial; return }
+  if (envelope?.type === 'codexmod.child') { await launchMirror($, run, envelope); return }
   const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
   if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
   const captured = source ? run.ledger.capture(source) : undefined
@@ -2649,8 +3098,16 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
   const child = ['collabAgentToolCall', 'subAgentActivity'].includes(item?.type)
   const plan = ['todo_list', 'plan_update'].includes(item?.type)
   if (child || plan) {
+    if (child && cfg.nestedAgents && run.transport === 'app-server' && (item?.kind === 'started' || String(item?.tool).replace(/_/g, '').toLowerCase() === 'spawnagent') && !['failed', 'declined'].includes(item?.status)) {
+      const ids = item?.agentThreadId ? [item.agentThreadId] : item?.receiverThreadIds ?? []
+      if (ids.some(validThreadId)) {
+        for (const id of ids.filter(validThreadId)) (run.childSources ??= new Map()).set(id, captured!.record)
+        return
+      }
+    }
     if (child && !['item.completed', 'item/completed'].includes(source!.event)) return
     if (item?.type === 'collabAgentToolCall' && item.status === 'inProgress') return
+    if (child && cfg.nestedAgents && run.transport === 'exec') $.ui.log('codex-mod: nested mirror unavailable on exec; using Batch 5 lifecycle/report rows', { to: 'debug' })
     const rec = records.get(run.agentId)
     if (!rec) return
     const state = rec.display ??= emptyDisplayState()
@@ -2761,8 +3218,9 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
       if (action && cfg.richRows) await handle($, run, { kind: 'action', action }, source)
     }
   }
-  else if (ev.kind === 'turn') run.turnId = ev.id
+  else if (ev.kind === 'turn') { run.turnId = ev.id; if (run.mirror) run.mirror.activeTurn = ev.id }
   else if (ev.kind === 'steer') {
+    if (run.mirror) { run.queue.push({ kind: 'note', text: `↪ child steer ${ev.id}: ${ev.accepted ? 'accepted' : ev.reason ?? 'rejected'}; no automatic retry` }); return }
     const i = run.pendingSteers.findIndex(f => (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
     if (i < 0) return
     const [s] = run.pendingSteers.splice(i, 1)
@@ -2794,6 +3252,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     run.unknown++
     if (run.unknownTypes.length < 3 && !run.unknownTypes.includes(ev.type)) run.unknownTypes.push(ev.type)
   } else if (ev.kind === 'usage') {
+    if (run.usageCanonical) return
     const u = run.usage ?? { input: 0, cached: 0, output: 0 }
     run.usage = { input: u.input + ev.input, cached: u.cached + ev.cached, output: u.output + ev.output }
   } else if (ev.kind === 'command') {
@@ -2912,18 +3371,20 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
         if (run.timedOut) continue
         if (signal.aborted || run.killed) throw err
         // a spawn that cannot start rejects its first pull
-        failure = { reason: `could not start Codex (${errText(err)})` }
+        failure = { reason: `${run.mirror ? 'child observation lost' : 'could not start Codex'} (${errText(err)})` }
         break
       }
       if (run.timedOut) continue
       if (run.killed) throw new Error('killed')
       if (r.done) {
         run.ended = true
+        for (const [id] of run.childSources ?? []) await mirrorFallback($, run, { thread_id: id }, 'child attachment unavailable')
         if (run.buffered.trim() !== '') await feedLine($, run, run.buffered.trim())
         run.buffered = ''
         continue
       }
       await feed($, run, r.value)
+      await checkpointMirror($, run)
     }
   } catch (err) {
     const wasKilled = run.killed
@@ -3109,6 +3570,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         const data: any = q.action.source?.data
         if (data?.status === 'pending') questionRows.set(id, { session: run.sessionId, agent: run.agentId, control: run.control, question: data, selected: {} })
       }
+      if (q.action.mirror) { const m = mirrors.get(q.action.mirror); if (m) { m.displayToolId = id; await saveMirror($, m) } }
       run.rows[id] = q.action.source ?? null
       blocks.push({ tool: q.action.tool, id, input: q.action.input })
     }
@@ -3119,6 +3581,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
     return yield* pump($, e, signal, run)
   }
   run.actionSteps++
+  await checkpointMirror($, run)
   const rec = records.get(run.agentId)
   if (rec !== undefined) {
     rec.wire = { records: run.ledger.records, rows: run.rows }
@@ -3145,6 +3608,9 @@ async function* complete(
   }
   const tail = run.stderrTail.trim().split('\n').slice(-5).join('\n')
   // a steer the runner never acked (it ended first) runs after this run, as a follow-up
+  if (run.mirror && run.pendingSteers.length) {
+    run.queue.push({ kind: 'note', text: '↪ child message outcome unknown; no automatic retry or relaunch' }); run.pendingSteers = []
+  }
   if (run.pendingSteers.length > 0) {
     run.followUps.push(...run.pendingSteers)
     run.pendingSteers = []
@@ -3196,12 +3662,13 @@ async function* complete(
     const queued = [...followUpsOf(rec), ...run.followUps]
     rec.followUps = queued.length > 0 ? queued : undefined
   }
-  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, steers: run.steers, patches: run.patches, patchRows: run.patchRows }, cfg.footer)
+  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, usagePartial: run.usagePartial, treeUsage: run.treeUsage, steers: run.steers, patches: run.patches, patchRows: run.patchRows }, cfg.footer)
   const shown = [run.carry, body].filter(Boolean).join('\n\n')
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile
   // runs now, in the same step, after this answer.
-  if (!run.handback && rec !== undefined && rec.followUps !== undefined && rec.followUps.length > 0) {
+  if (run.mirror) { run.mirror.state = reason ? 'failed' : 'completed'; await saveMirror($, run.mirror) }
+  if (!run.mirror && !run.handback && rec !== undefined && rec.followUps !== undefined && rec.followUps.length > 0) {
     const next = rec.followUps.shift()!
     if (rec.followUps.length === 0) rec.followUps = undefined
     const carry = [shown, foot].filter(Boolean).join('\n\n')

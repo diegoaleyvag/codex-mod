@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline'
 import batch4Items from './batch4-items.mjs'
 import batch5Items from './batch5-items.mjs'
 import batch6Items, { PNG, questionParams } from './batch6-items.mjs'
+import { PARENT, CHILD, PARENT_TURN, CHILD_TURN, nestedCommand, nestedFile, nestedActivity, nestedUsage } from './nested-items.mjs'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
 // and the whole turn in ONE stdout write), steer / steer-reject / hang / deaf
@@ -15,6 +16,9 @@ import batch6Items, { PNG, questionParams } from './batch6-items.mjs'
 // slow-start[-deaf] (turn/start answered after 500 ms, then as hang / deaf),
 // approval, malformed, unknown, die, legacy.
 const scenario = process.env.FAKE_SCENARIO ?? 'normal'
+if (process.argv.includes('--version')) { process.stdout.write('codex-cli 0.163.0 (fake)\n'); process.exit(0) }
+if (process.argv.includes('--help')) { process.stdout.write('fake codex app-server\n'); process.exit(0) }
+if (process.argv.includes('login')) { process.stdout.write('fixture: no authentication required\n'); process.exit(0) }
 const log = m => process.env.FAKE_LOG && appendFileSync(process.env.FAKE_LOG, JSON.stringify(m) + '\n')
 let batch // when set, `out` collects lines for one write
 const out = o => {
@@ -23,9 +27,36 @@ const out = o => {
   else process.stdout.write(line)
 }
 const note = (method, params) => out({ method, params })
-let THREAD = 'thr-1'
-const TURN = 'turn-1'
+let THREAD = scenario.startsWith('nested-') ? PARENT : 'thr-1'
+const TURN = scenario.startsWith('nested-') ? PARENT_TURN : 'turn-1'
 let turnActive = false
+let childActive = false
+let childAttached = false
+const childNote = (method, params) => note(method, { threadId: CHILD, turnId: CHILD_TURN, ...params })
+const childComplete = (status = 'completed') => {
+  if (!childActive) return
+  childActive = false
+  childNote('item/completed', { item: { type: 'agentMessage', id: 'child-final', text: 'child checked the fixture' } })
+  for (let i = 0; i < 2; i++) childNote('turn/completed', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status, error: status === 'failed' ? { message: 'child failed' } : null } })
+  if (scenario !== 'nested-response-only') setTimeout(() => childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) }), 20)
+}
+const childWork = () => {
+  if (scenario === 'nested-early') note('thread/started', { thread: { id: CHILD, parentThreadId: PARENT, model: 'gpt-6.1-sol' } })
+  childNote('turn/started', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status: 'inProgress' } })
+  childNote('item/completed', { item: nestedCommand })
+  childNote('item/completed', { item: nestedCommand })
+  childNote('item/commandExecution/outputDelta', { itemId: nestedCommand.id, delta: 'child' })
+  childNote('item/started', { item: { ...nestedFile, status: 'inProgress' } })
+  childNote('item/completed', { item: nestedFile })
+  const numeric = { threadId: CHILD, turnId: CHILD_TURN, responseId: 'child-response-1', rootTurnId: PARENT_TURN, usage: nestedUsage(2000, 1500, 100).total }
+  note('rawResponse/completed', numeric)
+  note('rawResponse/completed', numeric)
+  if (scenario !== 'nested-response-only') {
+    childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) })
+    childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) })
+  }
+  if (scenario !== 'nested-controls') setTimeout(() => childComplete(scenario === 'nested-failure' ? 'failed' : 'completed'), Number(process.env.FAKE_CHILD_DELAY_MS ?? 350))
+}
 let reqId = 100
 const usage = (i, c, o) => ({ total: { totalTokens: i + o, inputTokens: i, cachedInputTokens: c, cacheWriteInputTokens: 0, outputTokens: o, reasoningOutputTokens: 0 }, last: { totalTokens: 10, inputTokens: 8, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0 }, modelContextWindow: null })
 
@@ -102,9 +133,41 @@ createInterface({ input: process.stdin }).on('line', line => {
       return reply({ userAgent: 'codex-cli/9.9.9 (fake)' })
     case 'thread/start':
     case 'thread/resume':
+      if (scenario.startsWith('nested-') && m.params.threadId === CHILD) {
+        if (m.method !== 'thread/resume' || Object.keys(m.params).some(k => !['threadId', 'excludeTurns'].includes(k))) throw new Error('duplicate child execution or override')
+        if (scenario === 'nested-rejoin-failure') return out({ id: m.id, error: { code: -32601, message: 'child rejoin unavailable' } })
+        if (childAttached) throw new Error('child attached twice')
+        childAttached = true
+        reply({ thread: { id: CHILD, parentThreadId: scenario === 'nested-ancestry' ? CHILD : PARENT, historyMode: scenario === 'nested-history-mode' ? 'unknown' : 'paginated', model: 'gpt-6.1-sol' } })
+        if (scenario !== 'nested-early') setTimeout(childWork, 30)
+        return
+      }
       THREAD = m.params.threadId ?? THREAD
       return reply({ thread: { id: THREAD } })
+    case 'thread/turns/list':
+      return reply({ data: [{ id: CHILD_TURN, rootTurnId: PARENT_TURN, status: 'inProgress', items: [] }], nextCursor: null })
+    case 'thread/items/list':
+      return reply({ data: m.params.cursor ? [] : [{ turnId: CHILD_TURN, item: nestedCommand, startedAtMs: 1, completedAtMs: 2 }], nextCursor: m.params.cursor ? null : 'page-2' })
+    case 'thread/unsubscribe':
+      return reply({ status: 'unsubscribed' })
     case 'turn/start':
+      if (scenario.startsWith('nested-')) {
+        if (m.params.threadId !== PARENT) throw new Error('duplicate source child turn/start')
+        reply({ turn: { id: TURN, status: 'inProgress' } })
+        turnActive = true
+        childActive = true
+        note('turn/started', { threadId: PARENT, turn: { id: TURN, status: 'inProgress' } })
+        note('thread/tokenUsage/updated', { threadId: PARENT, turnId: TURN, tokenUsage: nestedUsage(1000, 600, 50) })
+        if (scenario === 'nested-early') childWork()
+        if (scenario !== 'nested-collab-only') note('item/completed', { threadId: PARENT, turnId: TURN, item: nestedActivity })
+        if (['nested-both', 'nested-collab-only'].includes(scenario)) note('item/completed', { threadId: PARENT, turnId: TURN,
+          item: { type: 'collabAgentToolCall', id: 'collab-spawn', tool: 'spawnAgent', status: 'completed', senderThreadId: PARENT, receiverThreadIds: [CHILD], prompt: 'check fixture', agentsStates: { [CHILD]: { status: 'running' } } } })
+        setTimeout(() => {
+          note('item/completed', { threadId: PARENT, turnId: TURN, item: { type: 'agentMessage', id: 'parent-final', text: 'parent done' } })
+          complete('completed')
+        }, 80)
+        return
+      }
       if (scenario === 'die') {
         process.stderr.write('fake fatal: no auth\n')
         process.exit(3)
@@ -242,11 +305,19 @@ createInterface({ input: process.stdin }).on('line', line => {
       if (scenario === 'slow') return setTimeout(finishNormally, 1500)
       return setTimeout(finishNormally, 50)
     case 'turn/steer':
+      if (scenario.startsWith('nested-') && m.params.threadId === CHILD) {
+        if (!childActive || m.params.expectedTurnId !== CHILD_TURN) return out({ id: m.id, error: { code: -32000, message: 'stale child turn' } })
+        return reply({ turnId: CHILD_TURN })
+      }
       if (!turnActive) return out({ id: m.id, error: { code: -32600, message: 'no active turn' } })
       if (scenario === 'steer-reject') return out({ id: m.id, error: { code: -32600, message: 'expected turn mismatch' } })
       reply({ turnId: TURN })
       return setTimeout(finishNormally, 50)
     case 'turn/interrupt':
+      if (scenario.startsWith('nested-') && m.params.threadId === CHILD) {
+        reply({})
+        return setTimeout(() => childComplete('interrupted'), 10)
+      }
       reply({})
       if (!scenario.endsWith('deaf')) setTimeout(() => complete('interrupted'), 50)
       return

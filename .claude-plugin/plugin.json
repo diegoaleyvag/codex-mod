@@ -110,6 +110,12 @@
       "description": "Draw Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows when available (otherwise codex_plan), answered by the plugin and never run.",
       "default": false
     },
+    "nestedAgents": {
+      "type": "boolean",
+      "title": "Nested Codex agents",
+      "description": "With app-server, observe existing Codex children in real nested host agents without executing them again. Off: retain Batch 5 lifecycle/report rows. Unsupported attachment or host admission falls back with a note.",
+      "default": true
+    },
     "progressIntervalMs": {
       "type": "number",
       "title": "Progress interval (ms)",

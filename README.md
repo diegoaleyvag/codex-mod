@@ -176,6 +176,7 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `footer` | `full` | `full`, `short` (agent, model, effort) or `off`. |
 | `nativeActions` | `true` | Off: actions are plain text lines in one step instead of Bash/Edit/Write rows. |
 | `richRows` | `false` | Experimental: guarded Agent spawn, SendMessage and TaskStop rows; plans prefer TodoWrite, then paired TaskCreate/TaskUpdate, then `codex_plan`. All use reported results without execution; `nativeActions: false` shows full text. Desktop scope/paint checks remain pending. |
+| `nestedAgents` | `true` | With app-server, create hidden observation agents for existing Codex children, with their own guarded transcript and direct/tree usage. Off: Batch 5 behavior. Attachment and host depth/concurrency refusals retain lifecycle/report rows. |
 | `progressIntervalMs` | `1000` | At most one action step per interval (0 to 60000). |
 | `maxActionsPerStep` | `10` | Most actions shown in one step (1 to 50). |
 | `timeoutMinutes` | `0` | Stop a run after this many minutes and report `codex failed: timeout`. `0`: no limit. |
@@ -185,6 +186,30 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `pruneDays` | `2` | Delete stored agent records (thread, model, effort) unused for this many days. |
 
 `handbackMode: "tool"` can lose answers in a session where the host does not offer `SubagentHandback`; keep `auto`.
+
+Nested agents use the parent's app-server connection to rejoin an existing child
+with `thread/resume`, without starting a child turn or changing its settings.
+The hidden `codex-mod:codex-child` host loop only reads that child's public
+journal. The parent Agent link references the actual host agent ID; commands
+and changes still use the display guards. Host nesting stops at depth 3.
+Launch ownership uses the spawning step's recorded parent and a one-time
+token/tool ID, including hosts that omit parent/cwd fields from spawn events.
+Debug logs retain phase/reason codes and non-secret field summaries for refused
+launches, and call/check admissions with their tool ID. Nested re-entry logs
+flush when the parent's spawn call settles; prompt tokens are never logged.
+Exec, failed rejoin, unavailable history and host admission failures keep the
+Batch 5 view and log the reason. A lost mirror or owner is never relaunched
+automatically. Running child messages use child-specific steering; idle or
+stale messages are rejected explicitly rather than starting new work.
+
+Full footers show direct usage plus `tree` usage when descendants exist.
+Responses and cumulative turn snapshots are deduplicated; cache and reasoning
+subtotals are not added twice. Missing observations are labeled partial.
+Codex counts stay out of host provider counters. The parent currently waits
+for observed children to drain before handing back its final tree snapshot.
+Native Desktop navigation/live forwarding, GPT badges and auxiliary host
+summary requests still need a new-session check using the
+[nested harness](tests/fixtures/nested-harness.md).
 
 To set `transport` from a settings file:
 
