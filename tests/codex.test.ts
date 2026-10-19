@@ -1,6 +1,6 @@
 import { test, expect } from 'claude-code/testing'
 import type { BuiltinToolResults, On } from 'claude-code'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, register as codexRegister } from '../hooks/codex.ts'
+import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, fileAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -134,7 +134,7 @@ type WorldOpts = {
   handback?: boolean
   /** `$.session.messages({ as: "api" })` is denied (rows only). */
   noApi?: boolean
-  sessionId?: string
+  sessionId?: string | (() => string)
   clockNow?: (now: number) => number | Promise<number>
 }
 
@@ -167,7 +167,7 @@ function world(on: On, opts: WorldOpts = {}) {
   const toolSpecs: any[] = []
   const toolLists: string[][] = []
   on('tool.list', () => {
-    const names = opts.availableTools ?? ['Agent', 'TodoWrite']
+    const names = opts.availableTools ?? ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite']
     toolLists.push([...names])
     if (opts.toolListThrows) throw new Error('tool list unavailable')
     return { value: names.map(name => ({ name, description: name, mcp: false })) }
@@ -191,7 +191,7 @@ function world(on: On, opts: WorldOpts = {}) {
     return { value: Object.entries(AGENT_TYPES).map(([id, type]) => ({ id, type, description: id, status: status.get(id) ?? ('running' as const) })) }
   })
   on('session.cwd', () => ({ value: location.cwd }))
-  on('session.id', () => ({ value: opts.sessionId ?? 'sess-1' }))
+  on('session.id', () => ({ value: typeof opts.sessionId === 'function' ? opts.sessionId() : opts.sessionId ?? 'sess-1' }))
   on('clock.now', async () => ({ value: opts.clockNow ? await opts.clockNow(clock.now) : clock.now }))
   on('clock.sleep', (_$, e: any) => {
     sleeps.push(e.ms)
@@ -297,9 +297,9 @@ async function step($: any, agentId?: string, index = 0, turnId = 'turn-1') {
 /** The tool calls a step emitted: `{ id, name, input }` each. */
 const callsOf = (chunks: any[]) =>
   chunks.filter(c => c.kind === 'tool').map(c => ({ id: c.id as string, name: c.name as string, input: JSON.parse(chunks.find(i => i.kind === 'input' && i.index === c.index).json) }))
-// Registered tools accept text, content blocks, or no result; never an MCP envelope.
+// Display answers use the confirmed content-block array contract, never an MCP envelope.
 const validDisplayResult = (result: unknown): boolean =>
-  result === undefined || typeof result === 'string' || (Array.isArray(result) && result.every(block =>
+  (Array.isArray(result) && result.every(block =>
     block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string'))
 const assertDisplayAnswer = (tool: string, answer: any) => {
   if (/^mcp__.*__(codex_(tool|plan)|coordinator_message)$/.test(tool) && !('deny' in answer)) {
@@ -374,7 +374,7 @@ test('a codex agent step is answered by codex, with no model request and no head
   expect(result.stopReason).toBe('tool_use')
   expect(chunks.at(-1)).toEqual({ kind: 'stop', stopReason: 'tool_use', usage: null })
   expect(chunks.at(-3)).toMatchObject({ kind: 'tool', index: 0, name: 'SubagentHandback' })
-  expect(chunks.at(-3).id.startsWith('toolu_codexmod_')).toBe(true)
+  expect(chunks.at(-3).id.startsWith('toolu_codexhandback_')).toBe(true)
   expect(chunks.at(-2)).toEqual({ kind: 'input', index: 0, json: JSON.stringify({ message }) })
 })
 
@@ -620,7 +620,7 @@ test('a command is a Bash call, interim message as text before it, answered with
   expect(s1.chunks.at(-1)).toEqual({ kind: 'stop', stopReason: 'tool_use', usage: null })
   // the engine raises tool.call for it: the guard answers, core never sees it
   const [r] = await runCalls($, s1.chunks, 'agent-progress')
-  expect(r.result).toEqual({ stdout: 'a.txt\nb.txt', stderr: '', interrupted: false })
+  expect(r.result).toEqual({ stdout: 'a.txt\nb.txt\n', stderr: '', interrupted: false })
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
   const s2 = await step($, 'agent-progress', 1)
@@ -637,7 +637,7 @@ test('a failed command keeps its output and says its exit code', async ($, on) =
   const s1 = await step($, 'agent-progress', 0)
   expect(callsOf(s1.chunks)[0]!.input).toEqual({ command: 'ls nope', description: 'List files' })
   const [r] = await runCalls($, s1.chunks, 'agent-progress')
-  expect(r.result).toEqual({ stdout: 'ls: nope: No such file or directory', stderr: 'Exit code 1', interrupted: false })
+  expect(r.deny).toBe('Codex command failed (exit code 1):\nls: nope: No such file or directory\n')
 })
 
 test('file changes: add is Write (content from disk), update is Edit (old/new), delete is a comment-only Bash row', async ($, on) => {
@@ -963,7 +963,7 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
-  expect(registered[1]).toMatchObject({ tools: ['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message'])
   expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
@@ -2308,7 +2308,7 @@ test('helpers: runner lines, versions, model_provider, runner argv, footer with 
   expect(parseCodexLine('{"type":"codexmod.protocol","unknown_methods":["a/b"],"unknown_items":["c"]}')).toEqual({ kind: 'protocol', types: ['method a/b', 'item c'] })
   expect(parseCodexLine('{"type":"codexmod.fatal","message":"boom"}')).toEqual({ kind: 'fatal', text: 'boom' })
   expect(parseCodexLine('{"type":"codexmod.future"}')).toEqual({ kind: 'other' })
-  expect(parseCodexLine('{"type":"item.updated","item":{}}')).toEqual({ kind: 'other' })
+  expect(parseCodexLine('{"type":"item.updated","item":{}}')).toEqual({ kind: 'unknown', type: 'item undefined' })
   expect(parseCodexLine('{"type":"turn.started"}')).toEqual({ kind: 'other' })
   expect(parseCodexLine('{"type":"x.y"}')).toEqual({ kind: 'unknown', type: 'x.y' })
   expect(parseCodexLine('{"no":"type"}')).toEqual({ kind: 'unknown', type: 'untyped' })
@@ -2647,23 +2647,23 @@ test('phase 3 parser: real-shaped exec lines, repeated id keys, completed search
   const event: any = parseCodexLine('{"type":"item.completed","item":{"id":"item_1","type":"web_search","id":"exec-1","query":"example docs","action":{"type":"search","query":"example docs"},"results":[{"type":"text_result","title":"Docs","url":"https://example.test","snippet":"Reference"}]}}')
   expect(event.kind).toBe('action')
   expect(event.action.tool).toBe('WebSearch')
-  expect(event.action.input).toEqual({ query: 'example docs' })
+  expect(event.action.input).toEqual({ query: 'example docs', mode: 'standard' })
   expect(event.action.result.results[0].content).toEqual([{ title: 'Docs', url: 'https://example.test', snippet: 'Reference' }])
   for (const [action, query] of [
     [{ type: 'openPage', url: 'https://example.test' }, 'https://example.test'],
     [{ type: 'findInPage', pattern: 'flags', url: 'https://example.test' }, 'flags in https://example.test'],
   ] as const) {
     const ev: any = parseCodexLine(itemLine({ type: 'web_search', action, query: '', results: { unexpected: true } }))
-    expect(ev.action.input).toEqual({ query })
-    expect(ev.action.result.results).toEqual(['Searched by Codex'])
+    expect(ev.action.input).toEqual({ query, mode: 'standard' })
+    expect(ev.action.result.results).toEqual(['Searched by Codex', 'Duration unreported (0-second display sentinel)'])
   }
   const encoded: any = parseCodexLine(itemLine({ ...webItem, results: JSON.stringify(webItem.results) }))
   expect(encoded.action.result.results[0].content[0].title).toBe('Example docs')
 })
 
 test('display result validator mirrors the registered-tool union', async () => {
-  for (const result of [undefined, 'ok', [], [{ type: 'text', text: 'ok' }]]) expect(validDisplayResult(result)).toBe(true)
-  for (const result of [null, {}, { content: [{ type: 'text', text: 'ok' }] }, [null], [{ type: 'text', text: 1 }], [{ type: 'image', text: 'ok' }]]) expect(validDisplayResult(result)).toBe(false)
+  for (const result of [[], [{ type: 'text', text: 'ok' }]]) expect(validDisplayResult(result)).toBe(true)
+  for (const result of [undefined, 'ok', null, {}, { content: [{ type: 'text', text: 'ok' }] }, [null], [{ type: 'text', text: 1 }], [{ type: 'image', text: 'ok' }]]) expect(validDisplayResult(result)).toBe(false)
 })
 
 test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, plans and notes', async () => {
@@ -2672,8 +2672,8 @@ test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, p
   expect(parseCodexLine(itemLine({ type: 'reasoning', content: ['PRIVATE'] }))).toEqual({ kind: 'other' })
   expect(parseCodexLine(itemLine({ type: 'reasoning', summary: [], text: 'PRIVATE' }))).toEqual({ kind: 'other' })
   expect(parseCodexLine(itemLine(mcpItem))).toMatchObject({ kind: 'action', display: 'codex_tool', action: { input: { server: 'docs', name: 'lookup', arguments: { topic: 'options' } }, result: [{ type: 'text', text: 'Found options.' }] } })
-  expect(parseCodexLine(itemLine({ ...mcpItem, status: 'failed', result: null, error: { message: 'Unavailable' } }))).toMatchObject({ action: { isError: true, result: [{ type: 'text', text: 'Unavailable' }] } })
-  expect(parseCodexLine(itemLine({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: [1], success: false, content_items: [{ type: 'inputText', text: 'Failed' }, { type: 'inputImage', imageUrl: 'PRIVATE_IMAGE' }] }))).toMatchObject({ display: 'codex_tool', action: { input: { server: 'local', name: 'inspect', arguments: [1] }, isError: true, result: [{ type: 'text', text: 'Failed' }] } })
+  expect(parseCodexLine(itemLine({ ...mcpItem, status: 'failed', result: null, error: { message: 'Unavailable' } }))).toMatchObject({ action: { error: 'Codex tool call failed: Unavailable', result: [{ type: 'text', text: 'Unavailable' }] } })
+  expect(parseCodexLine(itemLine({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: [1], success: false, content_items: [{ type: 'inputText', text: 'Failed' }, { type: 'inputImage', imageUrl: 'PRIVATE_IMAGE' }] }))).toMatchObject({ display: 'codex_tool', action: { input: { server: 'local', name: 'inspect', arguments: [1] }, error: 'Codex tool call failed: Failed', result: [{ type: 'text', text: 'Failed' }] } })
   for (const type of ['item.started', 'item.updated', 'item.completed']) {
     expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: 'Plan updated by Codex' }], input: { steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] } } })
   }
@@ -2715,7 +2715,7 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(registered.length).toBe(1)
-  expect(registered[0].tools).toEqual(['Read', 'Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message'])
+  expect(registered[0].tools).toEqual(['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message'])
   const first = await step($, 'agent-progress')
   expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
   expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
@@ -2726,7 +2726,7 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   expect(results[0].result.results[0].content[0].url).toBe('https://example.test/docs')
   expect(results[1].result).toEqual([{ type: 'text', text: 'Found options.' }])
   expect(results[2]).toEqual({ result: [{ type: 'text', text: 'Plan updated by Codex' }] })
-  expect(results[3]).toEqual({ isError: true, result: [{ type: 'text', text: 'Inspection failed.' }] })
+  expect(results[3]).toEqual({ deny: 'Codex tool call failed: Inspection failed.' })
   const second = await step($, 'agent-progress', 1)
   const texts = second.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
   expect(texts).toContain('Proposed plan:\n1. Verify')
@@ -2878,7 +2878,7 @@ const spawnItem = {
 const spawnResult: Extract<BuiltinToolResults['Agent'], { status: 'completed' }> = {
   agentId: 'codex-child-1', agentType: 'codex-mod:codex', status: 'completed',
   prompt: spawnItem.prompt, canContinueAgent: false, resolvedModel: 'gpt-6.1-sol',
-  content: [{ type: 'text', text: 'Codex reported child-1 (reviewer): running, model gpt-6.1-sol' }],
+  content: [{ type: 'text', text: 'Codex reported child-1 (reviewer): running, model gpt-6.1-sol. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported.' }],
   totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
   usage: {
     input_tokens: 0, output_tokens: 0,
@@ -2912,7 +2912,7 @@ test('rich parser: completed spawns use Agent input fields and a Codex text resu
   expect(long.action.input.prompt).toBe(`${'A'.repeat(80)}\nSecond line`)
   const unnamed: any = parseCodexLine(itemLine({ type: 'collab_tool_call', tool: 'spawn_agent', status: 'failed' }), true)
   expect(unnamed.action.input).toEqual({ description: 'Codex sub-agent', prompt: '', subagent_type: 'codex-mod:codex' })
-  expect(unnamed.action.result.content[0].text).toBe('Codex reported agent: failed')
+  expect(unnamed.action.result.content[0].text).toBe('Codex reported agent: failed. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported.')
   expect(unnamed.action.result).toMatchObject({ agentId: 'codex-agent', status: 'completed', canContinueAgent: false })
   expect(unnamed.action.result.resolvedModel).toBe(undefined)
   for (const tool of ['send_input', 'close_agent', 'wait', 'wait_agent']) {
@@ -2958,7 +2958,7 @@ for (const [richRows, available] of [[false, false], [false, true], [true, false
       expect(s.tools.includes('Agent')).toBe(richRows)
       expect(s.tools.includes('TodoWrite')).toBe(richRows && available)
     }
-    expect(w.toolLists.length).toBe(richRows ? 1 : 0)
+    expect(w.toolLists.length).toBe(1)
   })
 }
 
@@ -2974,22 +2974,23 @@ for (const toolListThrows of [false, true]) {
     await startSession($)
     expect(w.toolLists).toEqual([['Agent']])
     expect(specs.length).toBe(1)
-    expect(specs[0].tools.includes('Agent')).toBe(true)
+    expect(specs[0].tools.includes('Agent')).toBe(!toolListThrows)
     expect(specs[0].tools.includes('TodoWrite')).toBe(false)
     const first = await step($, 'agent-progress')
     const calls = callsOf(first.chunks)
-    expect(calls.map(c => c.name)).toEqual(['Agent', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__codex_plan'])
+    expect(calls.map(c => c.name)).toEqual([toolListThrows ? 'mcp__codex-mod__codex_tool' : 'Agent', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__codex_plan'])
     expect(calls[1].input).toEqual({ steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] })
     expect(calls[2].input).toEqual({ explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }] })
     const results: any[] = await runCalls($, first.chunks, 'agent-progress')
-    expect(results[0].result).toEqual(spawnResult)
+    if (toolListThrows) expect(results[0].result[0].text).toContain('Agent unavailable')
+    else expect(results[0].result).toEqual(spawnResult)
     expect(results.slice(1)).toEqual([
       { result: [{ type: 'text', text: 'Plan updated by Codex' }] },
       { result: [{ type: 'text', text: 'Plan updated by Codex' }] },
     ])
     const final = await step($, 'agent-progress', 1)
     expect(handback(final.result)).toContain('3 actions')
-    expect(w.logs.some(l => l.includes('TodoWrite availability unknown'))).toBe(toolListThrows)
+    expect(w.logs.some(l => l.includes('tool availability unknown'))).toBe(toolListThrows)
     expect(w.core).toEqual([])
     expect(w.checks).toEqual([])
   })
@@ -3094,4 +3095,554 @@ test('rich rows with nativeActions false degrade to text and retain action count
   expect(s.result.answer).toContain('2 actions')
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
+})
+
+// ---- Batch 1: public wire, schemas, capabilities and guard isolation --------
+
+const foundationItems: Record<string, any>[] = [
+  {
+    "type": "userMessage",
+    "id": "user",
+    "clientId": "cli-1",
+    "content": [
+      {
+        "type": "text",
+        "text": "Task",
+        "text_elements": []
+      }
+    ]
+  },
+  {
+    "type": "hookPrompt",
+    "id": "hook",
+    "fragments": [
+      {
+        "text": "Hook instruction",
+        "hookRunId": "hook-run"
+      }
+    ]
+  },
+  {
+    "type": "agentMessage",
+    "id": "message",
+    "text": "Working",
+    "phase": "partial_answer",
+    "memoryCitation": {
+      "entries": []
+    },
+    "delivery": "async",
+    "questions": []
+  },
+  {
+    "type": "functionCallOutput",
+    "id": "output",
+    "name": "inspect",
+    "namespace": null,
+    "output": [
+      {
+        "type": "inputText",
+        "text": "Result"
+      }
+    ]
+  },
+  {
+    "type": "plan",
+    "id": "plan",
+    "text": "Inspect then test"
+  },
+  {
+    "type": "reasoning",
+    "id": "reason",
+    "summary": [
+      "Public summary"
+    ],
+    "content": [
+      "PRIVATE_RAW_REASONING"
+    ]
+  },
+  {
+    "type": "commandExecution",
+    "id": "command",
+    "pluginId": null,
+    "scriptPath": null,
+    "command": "cat a.txt",
+    "cwd": "/work",
+    "processId": "pty-1",
+    "source": "unifiedExecStartup",
+    "status": "completed",
+    "commandActions": [
+      {
+        "type": "read",
+        "command": "cat a.txt",
+        "name": "a.txt",
+        "path": "a.txt"
+      }
+    ],
+    "aggregatedOutput": "a\r\n\n",
+    "exitCode": null,
+    "durationMs": 17
+  },
+  {
+    "type": "fileChange",
+    "id": "patch",
+    "status": "completed",
+    "changes": [
+      {
+        "path": "a.txt",
+        "kind": {
+          "type": "update",
+          "move_path": "b.txt"
+        },
+        "diff": "@@ -1 +1 @@\n-a\n+b\n"
+      }
+    ]
+  },
+  {
+    "type": "mcpToolCall",
+    "id": "mcp",
+    "server": "docs",
+    "tool": "inspect",
+    "status": "completed",
+    "arguments": {
+      "tool": "Bash",
+      "agentId": "spoof"
+    },
+    "appContext": {
+      "connectorId": "docs",
+      "linkId": null,
+      "resourceUri": "ui://a",
+      "appName": "Docs",
+      "actionName": "Inspect"
+    },
+    "mcpAppUi": {
+      "resourceUri": "ui://a",
+      "preferredModelDisplayMode": "inline"
+    },
+    "pluginId": null,
+    "readOnlyHint": true,
+    "result": {
+      "content": [],
+      "structuredContent": {
+        "answer": 42
+      },
+      "_meta": {
+        "key": "value"
+      }
+    },
+    "error": null,
+    "durationMs": 9
+  },
+  {
+    "type": "dynamicToolCall",
+    "id": "dynamic",
+    "namespace": null,
+    "tool": "inspect",
+    "arguments": {},
+    "status": "failed",
+    "contentItems": [
+      {
+        "type": "inputAudio",
+        "audioUrl": "data:audio/wav;base64,AUDIO"
+      }
+    ],
+    "success": false,
+    "durationMs": 3
+  },
+  {
+    "type": "collabAgentToolCall",
+    "id": "collab",
+    "tool": "spawnAgent",
+    "status": "completed",
+    "senderThreadId": "thread",
+    "receiverThreadIds": [
+      "child"
+    ],
+    "prompt": "Inspect",
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "high",
+    "agentsStates": {
+      "child": {
+        "status": "running",
+        "message": null
+      }
+    }
+  },
+  {
+    "type": "subAgentActivity",
+    "id": "activity",
+    "kind": "started",
+    "agentThreadId": "child",
+    "agentPath": "/root/child",
+    "model": "gpt-6.1-sol",
+    "reasoningEffort": "high"
+  },
+  {
+    "type": "webSearch",
+    "id": "web",
+    "query": "docs",
+    "action": {
+      "type": "search",
+      "query": null,
+      "queries": [
+        "docs",
+        "api"
+      ]
+    },
+    "results": [
+      {
+        "title": "Docs",
+        "url": "https://example.test"
+      }
+    ]
+  },
+  {
+    "type": "imageView",
+    "id": "view",
+    "path": "image.png"
+  },
+  {
+    "type": "sleep",
+    "id": "sleep",
+    "durationMs": 14
+  },
+  {
+    "type": "imageGeneration",
+    "id": "generation",
+    "status": "failed",
+    "revisedPrompt": "Actual prompt",
+    "result": "IMAGE_BYTES",
+    "transparentBackground": true,
+    "failure": {
+      "type": "usageLimitExceeded",
+      "limitId": "images",
+      "resetsAt": null
+    },
+    "savedPath": "image.png"
+  },
+  {
+    "type": "enteredReviewMode",
+    "id": "review-start",
+    "review": "Full review request\nline two"
+  },
+  {
+    "type": "exitedReviewMode",
+    "id": "review-end",
+    "review": "Full review result\nline two"
+  },
+  {
+    "type": "contextCompaction",
+    "id": "compact"
+  }
+]
+
+const sourceSnake = (key: string) => key.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`)
+const execItem = (item: Record<string, any>) => Object.fromEntries(Object.entries(item).map(([key, value]) =>
+  [sourceSnake(key), key === 'type' ? ({ collabAgentToolCall: 'collab_tool_call', plan: 'proposed_plan' } as Record<string, string>)[value] ?? sourceSnake(value) : value]))
+
+for (const item of foundationItems) for (const transport of ['exec', 'app-server'] as const) {
+  test(`foundation wire: ${transport} ${item.type} retains public fields and identity`, () => {
+    const raw = transport === 'exec' ? execItem(item) : item
+    const line = transport === 'exec'
+      ? JSON.stringify({ type: 'item.completed', thread_id: 'thread', turn_id: 'turn', item: raw })
+      : JSON.stringify({ type: 'item.completed', item: { type: 'source_only' }, source: { transport, event: 'item/completed', threadId: 'thread', turnId: 'turn', item: raw, startedAtMs: 100, completedAtMs: 120 } })
+    const source = normalizeSource(line, { cwd: '/fallback' })!
+    expect(source).toMatchObject({ transport, threadId: 'thread', turnId: 'turn', itemId: item.id, cwd: item.cwd ?? '/fallback' })
+    for (const [key, value] of Object.entries(item)) {
+      if (key === 'content' && item.type === 'reasoning') continue
+      expect(source.item![key]).toEqual(value)
+    }
+    expect(JSON.stringify(source)).not.toContain('PRIVATE_RAW_REASONING')
+    if (transport === 'app-server') expect(source).toMatchObject({ startedAtMs: 100, completedAtMs: 120 })
+  })
+}
+
+test('foundation ledger: start/complete/replay, distinct source namespaces, snake status, patch and terminal evidence', () => {
+  const ledger = new SourceLedger()
+  const capture = (item: any, event = 'item.completed', turnId = 'turn') => ledger.capture(normalizeSource(JSON.stringify({ type: event, thread_id: 'thread', turn_id: turnId, item }))!)
+  const started = capture({ type: 'command_execution', id: 'same', status: 'in_progress', process_id: 'pty', command: 'cat a' }, 'item.started')
+  expect(started.record.item).toMatchObject({ status: 'inProgress', sourceStatus: 'in_progress', processId: 'pty' })
+  expect(capture({ type: 'command_execution', id: 'same', status: 'in_progress' }, 'item.started').render).toBe(false)
+  expect(capture({ type: 'command_execution', id: 'same', status: 'completed', aggregated_output: 'a\n' }).record.item).toMatchObject({ command: 'cat a', processId: 'pty', aggregatedOutput: 'a\n' })
+  expect(capture({ type: 'command_execution', id: 'same', status: 'completed' }).render).toBe(false)
+  expect(capture({ type: 'command_execution', id: 'same', status: 'in_progress' }, 'item.started').render).toBe(false)
+  expect(capture({ type: 'command_execution', id: 'same', status: 'completed' }, 'item.completed', 'other').render).toBe(true)
+  const notification = (event: string, data: any) => ledger.capture(normalizeSource(JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event, threadId: 'thread', turnId: 'turn', data } }))!)
+  notification('item/fileChange/patchUpdated', { itemId: 'patch', changes: foundationItems[7].changes })
+  expect(capture({ type: 'file_change', id: 'patch', status: 'completed', changes: [] }).record.item!.changes).toEqual(foundationItems[7].changes)
+  notification('item/commandExecution/terminalInteraction', { itemId: 'same', processId: 'pty', stdin: 'q' })
+  expect(ledger.records.at(-1)!.data).toMatchObject({ processId: 'pty', stdin: 'q' })
+  const count = ledger.records.length
+  notification('turn/diff/updated', { diff: 'aggregate only' })
+  expect(ledger.records.length).toBe(count + 1)
+  expect(ledger.items.size).toBe(3)
+})
+
+test('foundation schema boundary: every baseline success, malformed Agent/search/display and mismatched fields', () => {
+  const spawn: any = parseCodexLine(itemLine(spawnItem), true)
+  const web: any = parseCodexLine(itemLine(webItem))
+  web.action.result.results[0].tool_use_id = 'real-display-id'
+  const plan: any = parseCodexLine(itemLine(planItem), true, true)
+  const actions = [commandAction('printf ok', 'ok\n', null), fileAction({ path: '/a', kind: 'add' }, 'a', undefined, 'new\n'), fileAction({ path: '/a', kind: 'update' }, 'a', 'old\n', 'new\n'), web.action, spawn.action, plan.action,
+    { tool: 'codex_tool', input: { server: 'docs', name: 'inspect', arguments: {} }, result: [{ type: 'text', text: 'ok' }] }]
+  for (const a of actions) expect(validAction(a)).toBe(true)
+  for (const a of [
+    { ...spawn.action, result: { agentId: 'fake' } },
+    { ...spawn.action, result: { ...spawn.action.result, status: 'async_launched' } },
+    { ...spawn.action, result: { ...spawn.action.result, usage: {} } },
+    { ...web.action, input: { query: 'example docs' } },
+    { ...web.action, result: { ...web.action.result, results: [{ tool_use_id: '', content: [] }] } },
+    { ...actions[0], result: { stdout: '', stderr: '', interrupted: false, exitCode: 0 } },
+    { ...actions[1], result: { ...actions[1].result, content: 'wrong' } },
+    { ...actions[2], result: { ...actions[2].result, structuredPatch: [{}] } },
+    { ...actions[6], result: { content: [{ type: 'text', text: 'ok' }] } },
+  ]) expect(validAction(a)).toBe(false)
+})
+
+for (const richRows of [false, true]) for (const nativeActions of [false, true]) {
+  test(`foundation guards: all protected names, normal/known/restarted/missing owners, both hooks (${richRows}/${nativeActions})`, { options: { richRows, nativeActions } }, async ($, on) => {
+    const w = world(on)
+    for (const tool of NATIVE_TOOLS) {
+      for (const agentId of [undefined, 'agent-gp']) {
+        const e = { tool, tool_use_id: 'host-id', agentId }
+        expect((await $.tool.call(e as any) as any).result.stdout).toBe('REALLY RAN')
+        expect((await $.tool.check({ ...e, input: {} } as any)).decision).toBe('allow')
+      }
+      for (const agentId of ['agent-codex', 'agent-restarted', 'foundation-unlisted']) {
+        expect((await $.tool.call({ tool, tool_use_id: 'host-id', agentId } as any) as any).deny).toContain('not executed')
+        expect((await $.tool.check({ tool, tool_use_id: 'host-id', input: {}, agentId } as any)).decision).toBe('deny')
+      }
+    }
+    for (const tool of ['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message']) {
+      for (const agentId of [undefined, 'agent-gp', 'agent-codex', 'foundation-unlisted']) {
+        expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId } as any) as any).deny).toContain('not executed')
+        expect((await $.tool.check({ tool, tool_use_id: 'ordinary', input: {}, agentId } as any)).decision).toBe('deny')
+      }
+    }
+    for (const tool of [...NATIVE_TOOLS, 'Read', 'Glob', 'Grep', 'WebFetch', 'TaskCreate', 'TaskUpdate', 'TaskStop', 'ReportFindings', 'AskUserQuestion', 'SubagentHandback', 'mcp__external__real', 'FutureTool']) {
+      for (const agentId of [undefined, 'agent-gp', 'agent-codex', 'foundation-unlisted']) {
+        expect((await $.tool.call({ tool, tool_use_id: `${ID_PREFIX}missing`, agentId } as any) as any).deny).toContain('not executed')
+        expect((await $.tool.check({ tool, tool_use_id: `${ID_PREFIX}missing`, input: {}, agentId } as any)).decision).toBe('deny')
+      }
+    }
+    for (const tool of ['Read', 'Glob', 'Grep', 'WebFetch', 'TaskCreate', 'TaskUpdate', 'TaskStop', 'ReportFindings', 'AskUserQuestion', 'mcp__external__real']) {
+      for (const agentId of [undefined, 'agent-gp']) {
+        expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId } as any) as any).result.stdout).toBe('REALLY RAN')
+        expect((await $.tool.check({ tool, input: {}, tool_use_id: 'ordinary', agentId } as any)).decision).toBe('allow')
+      }
+    }
+    expect(w.core.length).toBe(NATIVE_TOOLS.length * 2 + 20)
+    expect(w.checks.length).toBe(w.core.length)
+  })
+}
+
+test('foundation input binding: changed, added, stolen, swapped, session and replay calls refuse without consuming the answer', async ($, on) => {
+  const w = world(on, { pieces: [cmdDone('printf original', 'original\n'), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  const [c] = callsOf(s.chunks)
+  for (const change of [{ command: 'printf forged' }, { extra: true }, { description: 'forged' }, { tool: 'Read' }, { agentId: 'agent-gp' }, { agentId: undefined }]) {
+    const answer: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress', ...change } as any)
+    expect(answer.deny).toContain('not executed')
+  }
+  const reversed = Object.fromEntries(Object.entries(c.input).reverse())
+  const answer: any = await $.tool.call({ tool: c.name, ...reversed, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+  expect(answer.result).toEqual({ stdout: 'original\n', stderr: '', interrupted: false })
+  expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+  const final = await step($, 'agent-progress', 1)
+  const [hb] = callsOf(final.chunks)
+  expect(hb.name).toBe('SubagentHandback')
+  expect(hb.id.startsWith(HANDBACK_ID_PREFIX)).toBe(true)
+  expect(hb.id.startsWith(ID_PREFIX)).toBe(false)
+  await runCalls($, final.chunks, 'agent-progress')
+  expect(w.core.map(c => c.tool)).toEqual(['SubagentHandback'])
+  expect(w.spawned.length).toBe(1)
+})
+
+test('foundation errors: failed/declined/null/nonzero commands and failed spawns deny with actual output', { options: { richRows: true } }, async ($, on) => {
+  const output = 'full output\r\n' + 'x'.repeat(31000) + '\n'
+  const items = [
+    { type: 'command_execution', id: 'null', command: 'unknown', aggregated_output: output, exit_code: null, status: 'completed' },
+    { type: 'command_execution', id: 'nonzero', command: 'false', aggregated_output: 'actual failure\n', exit_code: 2, status: 'completed' },
+    { type: 'command_execution', id: 'declined', command: 'denied', aggregated_output: 'actual decline', exit_code: null, status: 'declined' },
+    { type: 'collab_tool_call', id: 'spawn', tool: 'spawn_agent', status: 'failed', prompt: 'Inspect', receiver_thread_ids: [], agents_states: {} },
+  ]
+  const w = world(on, { pieces: [out(items.map(i => itemLine(i)).join('\n')), MESSAGE('Done')] })
+  const first = await step($, 'agent-progress')
+  const answers: any[] = await runCalls($, first.chunks, 'agent-progress')
+  expect(answers[0].result.stdout).toBe(output)
+  expect(answers[0].result.stderr).toBe('')
+  expect(answers[1].deny).toContain('exit code 2')
+  expect(answers[1].deny).toContain('actual failure\n')
+  expect(answers[2].deny).toContain('actual decline')
+  expect(answers[3].deny).toContain('spawn failed')
+  expect(w.core).toEqual([])
+  await step($, 'agent-progress', 1)
+  const rec: any = w.store.get('agent:sess-1:agent-progress')
+  expect(rec.wire.records.filter((r: any) => r.item?.type === 'commandExecution').length).toBe(3)
+  expect(Object.keys(rec.wire.rows).length).toBe(4)
+})
+
+test('foundation replay: one command row, one file row, no aggregate-diff row and one handback', async ($, on) => {
+  const command = { type: 'command_execution', id: 'cmd', command: 'printf ok', status: 'completed', exit_code: 0, aggregated_output: 'ok\n' }
+  const patch = { type: 'file_change', id: 'patch', status: 'completed', changes: [{ path: 'a', kind: { type: 'add' }, diff: '+new\n' }] }
+  const transcript = [itemLine({ ...command, status: 'in_progress' }, 'item.started'), itemLine(command), itemLine(command), itemLine(patch), itemLine(patch), JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event: 'turn/diff/updated', threadId: 'thread', turnId: 'turn', data: { diff: '+new\n' } } }), itemLine({ type: 'agent_message', id: 'final', text: 'Done' }), itemLine({ type: 'agent_message', id: 'final', text: 'Done' })].join('\n')
+  const w = world(on, { pieces: [out(transcript)], files: new Map([['/tmp/project/a', 'new\n']]) })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['Bash', 'Write'])
+  await runCalls($, first.chunks, 'agent-progress')
+  const final = await step($, 'agent-progress', 1)
+  expect(callsOf(final.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  expect(handback(final.result).split('Done').length).toBe(2)
+  expect(w.spawned.length).toBe(1)
+  expect(w.core).toEqual([])
+})
+
+test('foundation capability failure: only registered tools are admitted; absent native rows fall back without execution', async ($, on) => {
+  const w = world(on, { availableTools: [], pieces: [cmdDone('printf actual', 'actual\n'), MESSAGE('Done')] })
+  const specs: any[] = []
+  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  await startSession($)
+  expect(specs[0].tools).toEqual(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'])
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['mcp__codex-mod__codex_tool'])
+  const [answer]: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer.result[0].text).toContain('Bash unavailable')
+  expect(answer.result[0].text).toContain('actual')
+  expect(w.core).toEqual([])
+})
+
+test('foundation restart: durable Codex ownership survives list failure and ordinary cached ownership passes', async ($, on) => {
+  const w = world(on, { listThrows: true, store: new Map([['agent:sess-1:foundation-restored', { model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', agentName: 'codex', updatedAt: 1 }]]) })
+  for (const tool of NATIVE_TOOLS) {
+    expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId: 'foundation-restored' } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool, input: {}, tool_use_id: 'ordinary', agentId: 'foundation-restored' } as any)).decision).toBe('deny')
+  }
+  expect(w.core).toEqual([])
+})
+
+test('foundation all baseline answer inputs bind exactly, including nested arguments and source/session identity', { options: { richRows: true } }, async ($, on) => {
+  const editPath = '/tmp/project/edit.txt'
+  const files = new Map([[editPath, 'before\n'], ['/tmp/project/add.txt', 'added\n']])
+  const items = [
+    { type: 'command_execution', id: 'cmd', command: 'printf ok', status: 'completed', aggregated_output: 'ok\n', exit_code: 0 },
+    { type: 'file_change', id: 'write', status: 'completed', changes: [{ path: 'add.txt', kind: 'add' }] },
+    { type: 'file_change', id: 'edit', status: 'completed', changes: [{ path: editPath, kind: 'update' }] },
+    { ...webItem, id: 'web' }, { ...spawnItem, id: 'spawn' }, { ...planItem, id: 'plan' },
+    { ...mcpItem, id: 'mcp', arguments: { nested: { token: 'original' } } },
+  ]
+  let sid = 'sess-1'
+  const w = world(on, { sessionId: () => sid, files, pieces: [fileEv('item.started', editPath, 'update'), () => { files.set(editPath, 'after\n'); return true }, out(items.map(i => itemLine(i)).join('\n')), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  const calls = callsOf(s.chunks)
+  expect(calls.map(c => c.name)).toEqual(['Bash', 'Write', 'Edit', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool'])
+  for (const c of calls) {
+    const input = JSON.parse(JSON.stringify(c.input))
+    const key = Object.keys(input)[0]!
+    input[key] = 'changed'
+    expect((await $.tool.call({ tool: c.name, ...input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool: c.name, input: c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)).decision).toBe('deny')
+    sid = 'other-session'
+    expect((await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    sid = 'sess-1'
+  }
+  const mcp = calls.at(-1)!
+  expect((await $.tool.call({ tool: mcp.name, ...mcp.input, arguments: { nested: { token: 'changed' } }, tool_use_id: mcp.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+  const results: any[] = await runCalls($, s.chunks, 'agent-progress')
+  for (let i = 0; i < results.length; i++) {
+    expect(results[i].deny).toBe(undefined)
+    expect(validAction({ tool: calls[i].name, input: calls[i].input, result: results[i].result })).toBe(true)
+    expect((await $.tool.call({ tool: calls[i].name, ...calls[i].input, tool_use_id: calls[i].id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+  }
+  expect(w.core).toEqual([])
+})
+
+test('foundation source-only notifications, unsupported variants, warnings and partial answers survive final handback', async ($, on) => {
+  const sourceLine = (event: string, data: any) => JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', threadId: 'thread', turnId: 'turn', event, data } })
+  const w = world(on, { stdout: [
+    sourceLine('item/fileChange/patchUpdated', { itemId: 'patch', changes: foundationItems[7].changes }),
+    sourceLine('item/commandExecution/terminalInteraction', { itemId: 'cmd', processId: 'pty', stdin: 'q' }),
+    sourceLine('thread/goal/updated', { goal: { objective: 'Inspect', status: 'active' } }),
+    itemLine({ type: 'futureItem', id: 'future', arbitrary: { value: null } }),
+    itemLine({ type: 'error', id: 'warning', message: 'Configuration warning' }),
+    itemLine({ type: 'agent_message', id: 'partial', phase: 'partial_answer', text: 'Incomplete' }),
+  ].join('\n') })
+  const s = await step($, 'agent-progress')
+  expect(handback(s.result)).toContain('codex failed:')
+  expect(handback(s.result)).not.toContain('Incomplete')
+  expect(s.chunks.some(c => c.kind === 'text' && c.text === 'Incomplete')).toBe(true)
+  const wire: any = (w.store.get('agent:sess-1:agent-progress') as any).wire
+  expect(wire.records.length).toBe(6)
+  expect(wire.records[0].item.changes[0].kind.move_path).toBe('b.txt')
+  expect(wire.records[1].data.stdin).toBe('q')
+  expect(wire.records[3].item.arbitrary).toEqual({ value: null })
+  expect(wire.records[4].item.message).toBe('Configuration warning')
+  expect(w.core).toEqual([])
+})
+
+test('foundation guard catches protect every reserved-prefix tool even with unknown name, main scope and next.called', async () => {
+  const guards = new Map<string, { handler: any; catcher: any }>()
+  codexRegister(((name: string, ...args: any[]) => {
+    const entry = { handler: args.at(-1), catcher: undefined as any }
+    guards.set(name, entry)
+    return { catch: (catcher: any) => { entry.catcher = catcher } }
+  }) as any, {})
+  for (const hook of ['tool.call', 'tool.check']) for (const tool of [...NATIVE_TOOLS, 'Read', 'FutureTool', 'SubagentHandback', 'mcp__external__real']) {
+    const entry = guards.get(hook)!
+    const next: any = () => { throw new Error('Executor must not run') }
+    next.called = true
+    const result = entry.catcher({}, { tool, tool_use_id: `${ID_PREFIX}missing` }, next)
+    expect(hook === 'tool.call' ? result.deny : result.decision).toBe(hook === 'tool.call' ? 'codex-mod: not executed' : 'deny')
+  }
+})
+
+test('foundation verified ordinary ownership stays cached during a later lookup outage', async ($, on) => {
+  const opts = { listThrows: false }
+  const w = world(on, opts)
+  expect((await $.tool.call({ tool: 'Bash', command: 'true', tool_use_id: 'normal', agentId: 'agent-gp' } as any) as any).result.stdout).toBe('REALLY RAN')
+  opts.listThrows = true
+  for (const tool of NATIVE_TOOLS) {
+    expect((await $.tool.call({ tool, tool_use_id: 'normal', agentId: 'agent-gp' } as any) as any).result.stdout).toBe('REALLY RAN')
+    expect((await $.tool.check({ tool, input: {}, tool_use_id: 'normal', agentId: 'agent-gp' } as any)).decision).toBe('allow')
+  }
+  expect((await $.tool.call({ tool: 'Bash', tool_use_id: 'normal', agentId: 'foundation-unresolved-outage' } as any) as any).deny).toContain('not executed')
+  expect(w.core.length).toBe(7)
+})
+
+test('foundation missing native and display tools drain to exactly one handback with literal fallback', async ($, on) => {
+  const w = world(on, { availableTools: [], toolRegisterThrows: 'codex_tool', pieces: [cmdDone('printf first', 'first\n'), cmdDone('printf second', 'second\n'), MESSAGE('Finished')] })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  expect(handback(s.result)).toContain('Finished')
+  const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  expect(text).toContain('Bash unavailable')
+  expect(text).toContain('first')
+  expect(text).toContain('second')
+  expect(w.spawned.length).toBe(1)
+  expect(w.core).toEqual([])
+})
+
+test('foundation public wire excludes private reasoning inside turn/thread snapshots and retains envelope metadata', () => {
+  const line = JSON.stringify({ type: 'future.event', transportMeta: { exact: true }, thread: { turns: [{ items: [{ type: 'reasoning', id: 'reasoning', summary: ['Public'], content: ['PRIVATE_RAW_REASONING'] }] }] } })
+  const record = normalizeSource(line)!
+  expect(JSON.stringify(record)).not.toContain('PRIVATE_RAW_REASONING')
+  expect(record.data!.thread.turns[0].items[0].summary).toEqual(['Public'])
+  expect(record.envelope).toMatchObject({ transportMeta: { exact: true } })
+})
+
+test('foundation compatibility records inherit their actual transport and source turn', () => {
+  const record = normalizeSource(itemLine({ type: 'plan_update', steps: [] }, 'item.updated'), { transport: 'app-server', threadId: 'thread', turnId: 'turn' })!
+  expect(record).toMatchObject({ transport: 'app-server', threadId: 'thread', turnId: 'turn' })
+})
+
+test('foundation coordinator registration retry respects the existing agent tool allowlist', async ($, on) => {
+  const opts: WorldOpts = { task: 'first', toolRegisterThrows: 'coordinator_message', store: new Map([['agent:sess-1:agent-coordinator', quietCoordinatorRecord('Full receipt')]]) }
+  const w = world(on, opts)
+  const specs: any[] = []
+  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  await startSession($)
+  expect(specs[0].tools.includes('mcp__codex-mod__coordinator_message')).toBe(false)
+  opts.toolRegisterThrows = undefined
+  const s = await step($, 'agent-coordinator')
+  expect(coordinatorCalls(s.chunks)).toEqual([])
+  expect(s.chunks.some(c => c.kind === 'text' && c.text === 'Coordinator message:\n\nFull receipt')).toBe(true)
+  expect(w.core).toEqual([])
 })

@@ -110,6 +110,7 @@
 // written or deleted by this module.
 
 import type {
+  BuiltinToolInputs,
   BuiltinToolResults,
   EngineInterface,
   HookStream,
@@ -153,8 +154,7 @@ const MAX_REDELIVER = 6
 const SLOW_AFTER = 60
 const SLOW_MS = 5000
 const MAX_ACTION_STEPS = 300
-// What one action shows at most: a command's output, a file's content.
-const OUTPUT_MAX = 30000
+// File preview bound; command output is retained verbatim.
 const FILE_MAX = 100000
 const STORE_PREFIX = 'agent:'
 const SESSION_PREFIX = 'session:'
@@ -162,8 +162,9 @@ const DAY_MS = 24 * 60 * 60 * 1000
 // In this host a subagent's result reaches its caller through this tool when
 // it is active for the agent; its input is `{ message }`.
 const HANDBACK_TOOL = 'SubagentHandback'
-/** Every tool_use id this module mints starts with it. */
+/** Reserved for nonexecuting display calls, including unknown future tools. */
 export const ID_PREFIX = 'toolu_codexmod_'
+export const HANDBACK_ID_PREFIX = 'toolu_codexhandback_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
 export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
 const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite'])
@@ -416,6 +417,8 @@ export type AgentRecord = Profile & {
   coordinator?: { received: string[]; pending: { uuid: string; text: string }[] }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
+  // Latest run's public wire evidence, including unsupported source variants.
+  wire?: { records: SourceRecord[]; rows: Record<string, SourceRecord | null> }
   updatedAt: number
 }
 
@@ -427,7 +430,113 @@ export type AgentRecord = Profile & {
  */
 export type FollowUp = { text: string; count: number; uuid?: string }
 
-export type FileChange = { path: string; kind: string }
+export type FileChange = { path: string; kind: string; sourceKind?: Record<string, unknown>; diff?: string }
+
+/** Public source evidence, independent of the current choice of display row. */
+export type SourceRecord = {
+  transport: Transport
+  event: string
+  threadId?: string
+  turnId?: string
+  itemId?: string
+  cwd?: string
+  startedAtMs?: number
+  completedAtMs?: number
+  item?: Record<string, any>
+  data?: Record<string, any>
+  envelope?: Record<string, unknown>
+}
+
+/** Turn/thread snapshots can contain reasoning items too, not only item events. */
+function publicSource(value: any): any {
+  if (Array.isArray(value)) return value.map(publicSource)
+  if (value === null || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => value.type !== 'reasoning' || key !== 'content')
+    .map(([key, child]) => [key, publicSource(child)]))
+}
+
+const ITEM_TYPES: Record<string, string> = {
+  user_message: 'userMessage', hook_prompt: 'hookPrompt', agent_message: 'agentMessage',
+  function_call_output: 'functionCallOutput', proposed_plan: 'plan', reasoning: 'reasoning',
+  command_execution: 'commandExecution', file_change: 'fileChange', mcp_tool_call: 'mcpToolCall',
+  dynamic_tool_call: 'dynamicToolCall', collab_tool_call: 'collabAgentToolCall',
+  sub_agent_activity: 'subAgentActivity', web_search: 'webSearch', image_view: 'imageView',
+  sleep: 'sleep', image_generation: 'imageGeneration', entered_review_mode: 'enteredReviewMode',
+  exited_review_mode: 'exitedReviewMode', context_compaction: 'contextCompaction',
+}
+const SOURCE_FIELDS = ['aggregatedOutput', 'exitCode', 'commandActions', 'processId', 'durationMs',
+  'senderThreadId', 'receiverThreadIds', 'agentsStates', 'reasoningEffort', 'contentItems',
+  'agentThreadId', 'agentPath', 'revisedPrompt', 'savedPath', 'transparentBackground', 'memoryCitation',
+  'clientId', 'pluginId', 'scriptPath', 'appContext', 'mcpAppUi', 'mcpAppResourceUri', 'readOnlyHint']
+const snake = (key: string) => key.replace(/[A-Z]/g, c => `_${c.toLowerCase()}`)
+
+/** Preserve unknown fields too; only private reasoning is deliberately removed. */
+export function normalizeSource(line: string, context: { transport?: Transport; threadId?: string; turnId?: string; cwd?: string } = {}): SourceRecord | undefined {
+  let ev: any
+  try { ev = publicSource(JSON.parse(line)) } catch { return undefined }
+  if (ev === null || typeof ev !== 'object') return undefined
+  const src = ev.source
+  const raw = src?.item ?? ev.item
+  const item = raw && typeof raw === 'object' ? { ...raw, sourceType: raw.type, type: ITEM_TYPES[raw.type] ?? raw.type } : undefined
+  if (item) {
+    for (const key of SOURCE_FIELDS) if (key in raw || snake(key) in raw) item[key] = key in raw ? raw[key] : raw[snake(key)]
+    if (item.type === 'reasoning') delete item.content
+    if (typeof item.status === 'string') {
+      item.sourceStatus = item.status
+      if (item.status === 'in_progress') item.status = 'inProgress'
+    }
+    if (Array.isArray(item.changes)) item.changes = item.changes.map((c: any) => ({ ...c,
+      kind: typeof c.kind === 'string' ? { type: c.kind, ...(c.move_path !== undefined ? { move_path: c.move_path } : {}) } : c.kind }))
+  }
+  if (!src && !item && typeof ev.type !== 'string') return undefined
+  return {
+    transport: src?.transport ?? context.transport ?? 'exec',
+    event: src?.event ?? ev.type,
+    threadId: src?.threadId ?? ev.thread_id ?? context.threadId,
+    turnId: src?.turnId ?? ev.turn_id ?? context.turnId,
+    itemId: typeof item?.id === 'string' ? item.id : src?.data?.itemId,
+    cwd: item?.cwd ?? context.cwd,
+    ...(typeof src?.startedAtMs === 'number' ? { startedAtMs: src.startedAtMs } : {}),
+    ...(typeof src?.completedAtMs === 'number' ? { completedAtMs: src.completedAtMs } : {}),
+    ...(item ? { item, ...(src?.data ? { data: src.data } : {}) } : { data: src?.data ?? ev }),
+    ...(!src ? { envelope: Object.fromEntries(Object.entries(ev).filter(([key]) => !['item', 'source'].includes(key))) } : {}),
+  }
+}
+
+/** One lifecycle per source identity. Deltas are evidence, never new actions. */
+export class SourceLedger {
+  records: SourceRecord[] = []
+  items = new Map<string, SourceRecord>()
+  private completed = new Set<string>()
+  private started = new Set<string>()
+  private plans = new Map<string, string>()
+
+  capture(record: SourceRecord): { record: SourceRecord; render: boolean } {
+    const key = JSON.stringify([record.threadId, record.turnId, record.itemId])
+    const end = ['item.completed', 'item/completed'].includes(record.event)
+    const start = ['item.started', 'item/started'].includes(record.event)
+    if (record.itemId && ((end && this.completed.has(key)) || (start && (this.started.has(key) || this.completed.has(key))))) return { record: this.items.get(key) ?? record, render: false }
+    if (record.itemId) {
+      const previous = this.items.get(key)
+      record = { ...previous, ...record, ...(record.item ? { item: { ...previous?.item, ...record.item } } : {}) }
+      if (end && record.item?.type === 'fileChange' && !record.item.changes?.length && previous?.item?.changes?.length) record.item.changes = previous.item.changes
+      if (record.event === 'item/fileChange/patchUpdated') record.item = { ...previous?.item, type: 'fileChange', id: record.itemId, changes: record.data?.changes }
+      this.items.set(key, record)
+      if (end) this.completed.add(key)
+      if (start) this.started.add(key)
+    }
+    this.records.push(record)
+    // Exec todos can repeat the same snapshot at started/updated/completed.
+    if (['todo_list', 'plan_update'].includes(record.item?.type)) {
+      const planKey = JSON.stringify([record.threadId, record.turnId, record.itemId, record.item?.type])
+      const value = stableJSON(record.item)
+      if (this.plans.get(planKey) === value) return { record, render: false }
+      this.plans.set(planKey, value)
+    }
+    return { record, render: true }
+  }
+}
 
 /** What one `codex exec --json` line means to us. */
 export type CodexEvent =
@@ -453,7 +562,60 @@ export type CodexEvent =
 type ActionResult = Record<string, unknown> | { type: 'text'; text: string }[]
 
 /** One of Codex's actions as a tool call, and the result it is answered with. */
-export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; isError?: true }
+export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord }
+
+type NativeName = typeof NATIVE_TOOLS[number]
+type NativeResult = BuiltinToolResults[NativeName]
+type DisplayResult = { type: 'text'; text: string }[]
+type GuardAnswer = { result: NativeResult | DisplayResult } | { deny: string }
+const object = (v: unknown): v is Record<string, any> => v !== null && typeof v === 'object' && !Array.isArray(v)
+const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(s => typeof s === 'string')
+const number = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+const keysOnly = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).every(key => keys.includes(key))
+const textBlocks = (v: unknown): v is DisplayResult => Array.isArray(v) && v.every(b => object(b) && keysOnly(b, ['type', 'text']) && b.type === 'text' && typeof b.text === 'string')
+const hunks = (v: unknown): boolean => Array.isArray(v) && v.every(h => object(h) &&
+  keysOnly(h, ['oldStart', 'oldLines', 'newStart', 'newLines', 'lines']) &&
+  ['oldStart', 'oldLines', 'newStart', 'newLines'].every(k => number(h[k]) && Number.isInteger(h[k])) && strings(h.lines))
+const todos = (v: unknown): boolean => Array.isArray(v) && v.every(t => object(t) &&
+  keysOnly(t, ['content', 'status', 'activeForm']) && typeof t.content === 'string' && typeof t.activeForm === 'string' && ['pending', 'in_progress', 'completed'].includes(t.status))
+
+/** Canonical, collision-free JSON binding, including nested display arguments. */
+const stableJSON = (value: unknown): string => JSON.stringify(value, (_key, v) =>
+  object(v) ? Object.fromEntries(Object.keys(v).sort().map(key => [key, v[key]])) : v)
+
+/** Validate our deliberately bounded result subset before emission AND consumption. */
+export function validAction(a: Action): a is Action & { result: NativeResult | DisplayResult } {
+  const i = a.input
+  const r = a.result
+  if (!object(i)) return false
+  let inputOK = false
+  if (a.tool === 'Bash') inputOK = keysOnly(i, ['command', 'description']) && typeof i.command === 'string' && typeof i.description === 'string'
+  else if (a.tool === 'Edit') inputOK = keysOnly(i, ['file_path', 'old_string', 'new_string', 'replace_all']) && ['file_path', 'old_string', 'new_string'].every(k => typeof i[k] === 'string') && (i.replace_all === undefined || i.replace_all === false)
+  else if (a.tool === 'Write') inputOK = keysOnly(i, ['file_path', 'content']) && typeof i.file_path === 'string' && typeof i.content === 'string'
+  else if (a.tool === 'WebSearch') inputOK = keysOnly(i, ['query', 'mode']) && typeof i.query === 'string' && i.query !== '' && ['standard', 'extended'].includes(i.mode)
+  else if (a.tool === 'Agent') inputOK = keysOnly(i, ['description', 'prompt', 'subagent_type']) && typeof i.description === 'string' && typeof i.prompt === 'string' && i.subagent_type === 'codex-mod:codex'
+  else if (a.tool === 'TodoWrite') inputOK = keysOnly(i, ['todos']) && todos(i.todos)
+  else if (isDisplay(a.tool) || a.tool === 'codex_tool') inputOK = keysOnly(i, ['server', 'name', 'arguments']) && typeof i.server === 'string' && typeof i.name === 'string' && 'arguments' in i
+  // Display names are host-owned; use their registered identity to choose the input schema.
+  if (a.tool === displayTools.codex_plan || a.tool === 'codex_plan') inputOK = keysOnly(i, ['steps', 'explanation']) && (i.explanation === undefined || typeof i.explanation === 'string') && Array.isArray(i.steps) && i.steps.every(s => object(s) && keysOnly(s, ['step', 'status']) && typeof s.step === 'string' && ['pending', 'in_progress', 'completed'].includes(s.status))
+  if (a.tool === displayTools.coordinator_message) inputOK = keysOnly(i, ['sourceUuid', 'text']) && typeof i.sourceUuid === 'string' && typeof i.text === 'string'
+  if (!inputOK) return false
+  if (a.error !== undefined) return typeof a.error === 'string' && a.error !== ''
+  if (!isNative(a.tool)) return textBlocks(r)
+  if (!object(r)) return false
+  switch (a.tool) {
+    case 'Bash': return keysOnly(r, ['stdout', 'stderr', 'interrupted']) && typeof r.stdout === 'string' && typeof r.stderr === 'string' && typeof r.interrupted === 'boolean'
+    case 'Edit': return keysOnly(r, ['filePath', 'oldString', 'newString', 'originalFile', 'structuredPatch', 'userModified', 'replaceAll']) && r.filePath === i.file_path && r.oldString === i.old_string && r.newString === i.new_string && (r.originalFile === null || typeof r.originalFile === 'string') && hunks(r.structuredPatch) && r.userModified === false && r.replaceAll === false
+    case 'Write': return keysOnly(r, ['type', 'filePath', 'content', 'structuredPatch', 'originalFile']) && ['create', 'update'].includes(r.type) && r.filePath === i.file_path && r.content === i.content && hunks(r.structuredPatch) && (r.originalFile === null || typeof r.originalFile === 'string')
+    case 'WebSearch': return keysOnly(r, ['query', 'results', 'durationSeconds']) && r.query === i.query && number(r.durationSeconds) && Array.isArray(r.results) && r.results.every(s => typeof s === 'string' || (object(s) && keysOnly(s, ['tool_use_id', 'content']) && typeof s.tool_use_id === 'string' && s.tool_use_id !== '' && Array.isArray(s.content) && s.content.every(c => object(c) && keysOnly(c, ['title', 'url', 'snippet']) && typeof c.title === 'string' && typeof c.url === 'string' && (c.snippet === undefined || typeof c.snippet === 'string'))))
+    case 'TodoWrite': return keysOnly(r, ['oldTodos', 'newTodos']) && todos(r.oldTodos) && todos(r.newTodos) && stableJSON(r.newTodos) === stableJSON(i.todos)
+    case 'Agent': {
+      const u = r.usage
+      return keysOnly(r, ['agentId', 'agentType', 'status', 'prompt', 'content', 'canContinueAgent', 'totalToolUseCount', 'totalDurationMs', 'totalTokens', 'usage', 'resolvedModel']) && typeof r.agentId === 'string' && r.agentType === i.subagent_type && r.status === 'completed' && r.prompt === i.prompt && textBlocks(r.content) && r.canContinueAgent === false && ['totalToolUseCount', 'totalDurationMs', 'totalTokens'].every(k => r[k] === 0) && (r.resolvedModel === undefined || typeof r.resolvedModel === 'string') && object(u) && keysOnly(u, ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'server_tool_use', 'service_tier', 'cache_creation']) && u.input_tokens === 0 && u.output_tokens === 0 && ['cache_creation_input_tokens', 'cache_read_input_tokens', 'server_tool_use', 'service_tier', 'cache_creation'].every(k => u[k] === null)
+    }
+  }
+  return false
+}
 
 type Usage = { input: number; cached: number; output: number }
 
@@ -464,7 +626,7 @@ const oneLine = (text: string, max = 160): string => {
 
 const changesOf = (item: any): FileChange[] =>
   Array.isArray(item?.changes)
-    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ path: c.path, kind: String(c.kind ?? 'update') }))
+    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ ...c, kind: typeof c.kind === 'object' ? c.kind?.type : c.kind ?? 'update', ...(object(c.kind) ? { sourceKind: c.kind } : {}) }))
     : []
 
 /**
@@ -495,7 +657,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
   const item = ev?.item
   if (ev?.type === 'thread.started' && typeof ev.thread_id === 'string') return { kind: 'thread', id: ev.thread_id }
   if (ev?.type === 'item.completed' && item?.type === 'agent_message' && typeof item.text === 'string') {
-    return { kind: item.phase === 'commentary' ? 'interim' : 'message', text: item.text }
+    return { kind: ['commentary', 'partial_answer'].includes(item.phase) ? 'interim' : 'message', text: item.text }
   }
   if (ev?.type === 'item.completed' && item?.type === 'command_execution') {
     return {
@@ -524,7 +686,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
     }
   }
   // Only completed items have reliable queries and tool results. JSON.parse
-  // deliberately accepts exec's repeated id keys; rendering never keys on id.
+  // keeps exec's last repeated id key; the source ledger deduplicates that id.
   if (ev.type === 'item.completed') {
     if (item?.type === 'reasoning') {
       const text = Array.isArray(item.summary) ? item.summary.filter((s: unknown) => typeof s === 'string').join('\n\n') : typeof item.text === 'string' ? item.text : ''
@@ -537,7 +699,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
       return {
         kind: 'action', display: 'codex_tool', action: {
           tool: 'codex_tool', input: { server: String(item.server ?? item.namespace ?? 'dynamic'), name: String(item.tool ?? ''), arguments: item.arguments ?? {} },
-          result: [{ type: 'text', text }], ...(failed ? { isError: true as const } : {}),
+          result: [{ type: 'text', text }], ...(failed ? { error: `Codex tool call failed: ${text}` } : {}),
         },
       }
     }
@@ -567,6 +729,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
   }
   if (ev?.type === 'turn.failed') return { kind: 'error', text: String(ev.error?.message ?? 'turn failed') }
   if (ev?.type === 'error') return { kind: 'error', text: String(ev.message ?? 'error') }
+  if (item && ![...Object.keys(ITEM_TYPES), ...Object.values(ITEM_TYPES), 'note', 'todo_list', 'plan_update', 'source_only', 'error'].includes(item.type)) return { kind: 'unknown', type: `item ${String(item.type)}` }
   return { kind: 'other' }
 }
 
@@ -590,7 +753,7 @@ function spawnAction(item: any, receivers: unknown): Action {
   const result: Extract<BuiltinToolResults['Agent'], { status: 'completed' }> = {
     agentId: `codex-${ids[0] ?? (typeof item.id === 'string' ? item.id : 'agent')}`,
     agentType: 'codex-mod:codex', status: 'completed', prompt, canContinueAgent: false,
-    content: [{ type: 'text', text: `Codex reported ${reports.join('; ')}` }],
+    content: [{ type: 'text', text: `Codex reported ${reports.join('; ')}. Display-only host operation: zero Claude tools, tokens and duration; Codex child usage and duration unreported.` }],
     ...(typeof model === 'string' ? { resolvedModel: model } : {}),
     // No Claude work occurred; Codex did not report per-spawn usage or timing.
     totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
@@ -605,6 +768,7 @@ function spawnAction(item: any, receivers: unknown): Action {
     // Use only BuiltinToolInputs['Agent'] fields; Codex model names are not Claude models.
     input: { description: oneLine(prompt.split(/\r?\n/)[0]!, 60) || 'Codex sub-agent', prompt, subagent_type: 'codex-mod:codex' },
     result,
+    ...(['failed', 'declined'].includes(item.status) ? { error: `Codex spawn ${item.status}: ${JSON.stringify(item)}` } : {}),
   }
 }
 
@@ -627,8 +791,8 @@ function webAction(item: any): Action {
   const sources = (Array.isArray(results) ? results : []).filter(r => typeof r?.title === 'string' && typeof r?.url === 'string')
     .map(r => ({ title: r.title, url: r.url, ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}) }))
   return {
-    tool: 'WebSearch', input: { query },
-    result: { query, results: sources.length ? [{ tool_use_id: '', content: sources }] : ['Searched by Codex'], durationSeconds: 0 },
+    tool: 'WebSearch', input: { query, mode: 'standard' } satisfies BuiltinToolInputs['WebSearch'],
+    result: { query, results: [...(sources.length ? [{ tool_use_id: '', content: sources }] : ['Searched by Codex']), 'Duration unreported (0-second display sentinel)'], durationSeconds: 0 },
   }
 }
 
@@ -951,22 +1115,23 @@ export function describeCommand(command: string): string {
   return DESCRIBE[prog] ?? (prog ? `Run ${prog}` : 'Run a command')
 }
 
-const clipTail = (text: string, max: number): string =>
-  text.length > max ? `[... ${text.length - max} earlier characters not shown]\n${text.slice(-max)}` : text
 const clipHead = (text: string, max: number): string =>
   text.length > max ? `${text.slice(0, max)}\n[... ${text.length - max} more characters not shown]` : text
 
 /** A finished command as a `Bash` call answered with Codex's output and exit code. */
-export function commandAction(command: string, output: string, exitCode: number | null): Action {
+export function commandAction(command: string, output: string, exitCode: number | null, status?: string): Action {
   const inner = unwrapShell(command)
   return {
     tool: 'Bash',
-    input: { command: inner, description: describeCommand(inner) },
+    input: { command: inner, description: `${describeCommand(inner)}${exitCode === null ? ' (exit unreported)' : ''}` },
     result: {
-      stdout: clipTail(output.replace(/\n$/, ''), OUTPUT_MAX),
-      stderr: exitCode !== null && exitCode !== 0 ? `Exit code ${exitCode}` : '',
+      stdout: output,
+      stderr: '',
       interrupted: false,
-    },
+    } satisfies BuiltinToolResults['Bash'],
+    ...((exitCode !== null && exitCode !== 0) || ['failed', 'declined'].includes(status ?? '') ? {
+      error: `Codex command ${status === 'declined' ? 'was declined' : 'failed'}${exitCode !== null ? ` (exit code ${exitCode})` : ''}:\n${output}`,
+    } : {}),
   }
 }
 
@@ -1064,7 +1229,8 @@ export function actionLine(a: Action): string {
   const cmd = String(a.input.command)
   if (cmd.startsWith('# codex apply_patch: ')) return `${String(a.input.description)}: ${cmd.slice('# codex apply_patch: '.length).replace(/^\S+\s+/, '')}`
   const err = String(result.stderr ?? '')
-  return `$ ${oneLine(cmd, 300)}${err !== '' ? ` (${err.toLowerCase()})` : ''}`
+  const status = a.error ? /exit code \d+/.exec(a.error)?.[0] ?? 'failed or declined' : err.toLowerCase()
+  return `$ ${oneLine(cmd, 300)}${status !== '' ? ` (${status})` : ''}`
 }
 
 // ---- launch ------------------------------------------------------------------
@@ -1225,6 +1391,9 @@ export function steerNote(what: 'accepted' | 'finished' | 'queued'): string {
 
 /** One Codex child and what has been read from it so far. */
 type Run = {
+  sessionId: string
+  ledger: SourceLedger
+  rows: Record<string, SourceRecord | null>
   agentId: string
   name: string
   prof: Profile
@@ -1291,7 +1460,10 @@ const runs = new Map<string, Run>()
 const deliveries = new Map<string, { uuid: string; text: string }[]>()
 const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
-const answers = new Map<string, { agentId: string; tool: string; result: ActionResult; isError?: true }>()
+type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
+const answers = new Map<string, HeldAnswer>()
+// Retained after consumption: provenance belongs to the row, not its executor guard.
+const sourceRows = new Map<string, { sessionId: string; agentId: string; source?: SourceRecord }>()
 let seq = 0
 // Set by session.start when Codex is missing or logged out.
 let preflight: string | undefined
@@ -1301,6 +1473,8 @@ let catalog: ModelInfo[] | null | undefined
 let cfg: Config = parseConfig({})
 // Unavailable until registration confirms the session offers it; guards stay on.
 let todoWriteAvailable = false
+let availableTools: Set<string> | undefined
+const agentTools = new Map<string, Set<string>>()
 // Session-start snapshot, refreshed only when registration is retried, never on cwd changes.
 let projectRoles = new Map<string, ProjectRole>()
 const projectNotified = new Set<string>()
@@ -1323,21 +1497,38 @@ const isNative = (tool: unknown): boolean => (NATIVE_TOOLS as readonly unknown[]
 const isDisplay = (tool: unknown): boolean => typeof tool === 'string' && displayNames.has(tool)
 /** A display call this module must answer or refuse: never one the engine may run. */
 const guarded = (e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): boolean =>
-  isDisplay(e.tool) || (isNative(e.tool) && (hasPrefix(e.tool_use_id) || isCodexAgent(e.agentId)))
+  hasPrefix(e.tool_use_id) || isDisplay(e.tool) || (isNative(e.tool) && isCodexAgent(e.agentId))
 /** A built-in display call of a subagent whose type is not resolved yet. */
 const unresolved = (e: { tool?: unknown; agentId?: unknown }): boolean =>
   isNative(e.tool) && typeof e.agentId === 'string' && !known.has(e.agentId)
 
 /** The answer to a guarded call: the stored result of our own action, else a refusal. Never runs anything. */
-export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown }): { result: ActionResult; isError?: true } | { deny: string } {
+export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown; [key: string]: unknown }, sid: string): GuardAnswer {
   const id = typeof e.tool_use_id === 'string' ? e.tool_use_id : ''
   const held = hasPrefix(id) ? answers.get(id) : undefined
   // e.tool is the dispatch name, distinct from codex_tool's input.name.
-  if (held === undefined || held.agentId !== e.agentId || held.tool !== e.tool || !isCodexAgent(e.agentId)) {
+  const row = sourceRows.get(id)
+  const input = Object.fromEntries(Object.entries(e).filter(([key]) => !['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'].includes(key)))
+  if (held === undefined || held.sessionId !== sid || held.agentId !== e.agentId || held.action.tool !== e.tool || !isCodexAgent(e.agentId) ||
+    row?.sessionId !== sid || row.agentId !== e.agentId || stableJSON(input) !== held.inputDigest || stableJSON(row.source ?? null) !== held.sourceDigest || !validAction(held.action)) {
     return { deny: `${NOT_EXECUTED} (${String(e.tool)} is display-only for Codex agents; only a stored Codex result can answer this call)` }
   }
   answers.delete(id)
-  return { result: held.result, ...(held.isError ? { isError: true as const } : {}) }
+  return held.action.error !== undefined ? { deny: held.action.error } : { result: held.action.result }
+}
+
+function holdAnswer(id: string, sid: string, agentId: string, action: Action): boolean {
+  if (!validAction(action)) return false
+  const status = action.source?.item?.status
+  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status)) return false
+  if (['failed', 'declined'].includes(status) && !action.error) return false
+  // Snapshot before handing anything to core; later caller/input mutations must
+  // never alter the answer or its source binding.
+  const snapshot: Action = JSON.parse(JSON.stringify(action))
+  const source = snapshot.source
+  sourceRows.set(id, { sessionId: sid, agentId, source })
+  answers.set(id, { sessionId: sid, agentId, action: snapshot, inputDigest: stableJSON(snapshot.input), sourceDigest: stableJSON(source ?? null) })
+  return true
 }
 
 /** The profile of an agent type name; undefined for a name this module does not define. */
@@ -1399,18 +1590,18 @@ export const register: Register = (on, options) => {
   // else is refused. A subagent not seen yet (after a worker restart, say) has
   // its type resolved first; if that fails, `.catch` refuses the call.
   on('tool.call', async ($, e, next) => {
-    if (guarded(e)) return answerGuarded(e) as never
-    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e) as never
+    if (guarded(e)) return answerGuarded(e, await sessionId($))
+    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
     return next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { deny: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => (guarded(e) || unresolved(e) ? { deny: NOT_EXECUTED } : next(e)))
 
   // GUARD 2. `tool.check` runs inside `tool.call`'s `next`, which guard 1
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
   on('tool.check', async ($, e, next) => {
-    if (unresolved(e)) await agentName($, e.agentId!)
+    if (!hasPrefix(e.tool_use_id) && !isDisplay(e.tool) && unresolved(e)) await agentName($, e.agentId!)
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
+  }).catch(($, e, next) => (guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)))
 
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
     if (!dimNotes.has(e.props.text)) return next(e)
@@ -1703,14 +1894,7 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
   // without the display tools their rows degrade to text; the agents must still register
   await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
   await loadProjectRoles($, config)
-  todoWriteAvailable = false
-  if (config.richRows) {
-    try {
-      todoWriteAvailable = (await $.tool.list()).some(tool => tool.name === 'TodoWrite')
-    } catch (err) {
-      $.ui.log(`codex-mod: TodoWrite availability unknown (${errText(err)}); plan updates use codex_plan`, { to: 'debug' })
-    }
-  }
+  await loadCapabilities($, true)
   let failed = false
   const list = catalog ?? undefined
   const models = list !== undefined ? ` Codex models available here: ${catalogLine(list)}.` : ''
@@ -1726,25 +1910,38 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
   }
   for (const s of specs) {
     try {
+      const tools = [...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (config.richRows || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)]
       await $.agent.register({
         name: s.name,
         description: s.description,
         prompt: PLACEHOLDER_PROMPT,
         // the tools Codex's actions are drawn as must be the agent's own, or
         // the engine refuses them before the tool.call guard answers them
-        tools: ['Read', ...NATIVE_TOOLS.filter(tool => (config.richRows || !RICH_TOOLS.has(tool)) && (tool !== 'TodoWrite' || todoWriteAvailable)), ...Object.values(displayTools)],
+        tools,
         model: 'haiku',
         effort: 'low',
         maxTurns: 400,
         background: true,
         omitClaudeMd: true,
       })
+      agentTools.set(s.name, new Set(tools))
     } catch (err) {
       failed = true
       $.ui.log(`codex-mod: agent ${s.name} not registered: ${errText(err)}`, { to: 'debug' })
     }
   }
   return !failed
+}
+
+async function loadCapabilities($: EngineInterface, refresh = false): Promise<void> {
+  if (availableTools !== undefined && !refresh) return
+  availableTools = new Set()
+  try {
+    availableTools = new Set((await $.tool.list()).map(tool => tool.name))
+  } catch (err) {
+    $.ui.log(`codex-mod: tool availability unknown (${errText(err)}); native rows use display fallback`, { to: 'debug' })
+  }
+  todoWriteAvailable = cfg.richRows && availableTools.has('TodoWrite')
 }
 
 /**
@@ -1758,12 +1955,22 @@ async function agentName($: EngineInterface, agentId: string): Promise<string | 
   try {
     list = await $.agent.list()
   } catch {
-    list = await $.agent.list()
+    try { list = await $.agent.list() } catch {
+      const rec = await loadRecord($, agentId)
+      if (rec !== undefined) {
+        known.set(agentId, rec.agentName)
+        return rec.agentName
+      }
+      throw new Error('agent ownership unavailable')
+    }
   }
   const info = list.find(a => a.id === agentId)
   if (info === undefined) {
     // not listed (dropped already): one we ran before still has its record
-    return (await loadRecord($, agentId))?.agentName
+    const rec = await loadRecord($, agentId)
+    if (rec === undefined) throw new Error('agent ownership unavailable')
+    known.set(agentId, rec.agentName)
+    return rec.agentName
   }
   const prefix = `${$.plugin.name}:`
   const mine = info.type.startsWith(prefix) ? info.type.slice(prefix.length) : undefined
@@ -2218,7 +2425,11 @@ async function* startRun(
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   }
 
+  await loadCapabilities($)
   const run: Run = {
+    sessionId: await sessionId($),
+    ledger: new SourceLedger(),
+    rows: {},
     agentId,
     name,
     prof,
@@ -2249,6 +2460,7 @@ async function* startRun(
     unknown: 0,
     unknownTypes: [],
   }
+  rec.wire = { records: run.ledger.records, rows: run.rows }
   if (config.timeoutMs > 0) {
     try {
       run.timer = $.clock.after(config.timeoutMs, () => {
@@ -2391,8 +2603,18 @@ async function feed($: EngineInterface, run: Run, piece: ProcessSpawnChunk): Pro
   while ((nl = run.buffered.indexOf('\n')) >= 0) {
     const line = run.buffered.slice(0, nl).trim()
     run.buffered = run.buffered.slice(nl + 1)
-    if (line !== '') await handle($, run, parseCodexLine(line, cfg.richRows, todoWriteAvailable))
+    if (line !== '') await feedLine($, run, line)
   }
+}
+
+async function feedLine($: EngineInterface, run: Run, line: string): Promise<void> {
+  const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
+  if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
+  const captured = source ? run.ledger.capture(source) : undefined
+  if (captured?.render === false) return
+  const ev = parseCodexLine(line, cfg.richRows, todoWriteAvailable)
+  if (ev.kind === 'files' && captured?.record.item) ev.changes = changesOf(captured.record.item)
+  await handle($, run, ev, captured?.record)
 }
 
 const absolute = (cwd: string, p: string) => (p.startsWith('/') ? p : `${cwd.replace(/\/$/, '')}/${p}`)
@@ -2416,7 +2638,7 @@ const remember = (run: Run, path: string, text: string | undefined) => {
   else run.snapshots.delete(path)
 }
 
-async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<void> {
+async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: SourceRecord): Promise<void> {
   if (ev.kind === 'thread') {
     run.thread = ev.id
     const rec = records.get(run.agentId)
@@ -2432,6 +2654,16 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
     if (ev.kind === 'note' && ev.dim) dimNotes.add(ev.text)
   } else if (ev.kind === 'action') {
     run.actions++
+    ev.action.source = source
+    if (source?.item?.status === 'inProgress') return
+    if (['failed', 'declined'].includes(source?.item?.status) && !ev.action.error) ev.action.error = `Codex ${source!.item!.type} ${source!.item!.status}: ${JSON.stringify(source!.item)}`
+    if (ev.action.tool === 'WebSearch' && object(ev.action.result)) {
+      const duration = source?.item?.durationMs ?? (source?.startedAtMs !== undefined && source.completedAtMs !== undefined ? source.completedAtMs - source.startedAtMs : undefined)
+      if (number(duration)) {
+        ev.action.result.durationSeconds = duration / 1000
+        ev.action.result.results = (ev.action.result.results as unknown[]).filter(r => r !== 'Duration unreported (0-second display sentinel)')
+      }
+    }
     if (ev.display) {
       await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
       const tool = displayTools[ev.display]
@@ -2481,7 +2713,8 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
     run.usage = { input: u.input + ev.input, cached: u.cached + ev.cached, output: u.output + ev.output }
   } else if (ev.kind === 'command') {
     run.actions++
-    run.queue.push({ kind: 'action', action: commandAction(ev.command, ev.output, ev.exitCode) })
+    if (source?.item?.status === 'inProgress') return
+    run.queue.push({ kind: 'action', action: { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
   } else if (ev.kind === 'fileStart') {
     // the text before the patch, when it is read in time (best effort)
     for (const c of ev.changes) {
@@ -2489,12 +2722,18 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent): Promise<voi
       if (c.kind !== 'add' && !run.snapshots.has(path)) remember(run, path, await readText($, path))
     }
   } else if (ev.kind === 'files') {
+    if (source?.item?.status === 'inProgress') return
     for (const c of ev.changes) {
       run.actions++
       const path = absolute(run.cwd, c.path)
       const before = run.snapshots.get(path)
       const after = c.kind === 'delete' ? undefined : await readText($, path)
-      run.queue.push({ kind: 'action', action: fileAction({ path, kind: c.kind }, relative(run.cwd, path), before, after) })
+      const action = fileAction({ ...c, path }, relative(run.cwd, path), before, after)
+      action.source = source
+      if (['failed', 'declined'].includes(source?.item?.status)) {
+        action.error = `Codex patch ${source!.item!.status}: ${JSON.stringify(source!.item)}`
+      }
+      run.queue.push({ kind: 'action', action })
       remember(run, path, after)
     }
   }
@@ -2554,7 +2793,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
           if (wait > 0) await $.clock.sleep(wait, { signal })
           if (signal.aborted || run.killed) throw new Error('aborted')
           run.lastEmit = await $.clock.now()
-          return yield* actionStep(e, run)
+          return yield* actionStep($, e, signal, run)
         }
       }
       if (run.ended) break
@@ -2572,7 +2811,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
       if (run.killed) throw new Error('killed')
       if (r.done) {
         run.ended = true
-        if (run.buffered.trim() !== '') await handle($, run, parseCodexLine(run.buffered.trim(), cfg.richRows, todoWriteAvailable))
+        if (run.buffered.trim() !== '') await feedLine($, run, run.buffered.trim())
         run.buffered = ''
         continue
       }
@@ -2638,7 +2877,9 @@ async function* withCoordinatorMessages(
           if (parts.length === 0) parts.push('')
           for (let part = 0; part < parts.length; part++) {
             const text = parts.length > 1 ? `(part ${part + 1}/${parts.length})\n${parts[part]}` : parts[part]!
-            const tool = cfg.nativeActions ? displayTools.coordinator_message : undefined
+            const registered = cfg.nativeActions ? displayTools.coordinator_message : undefined
+            const ownTools = agentTools.get(known.get(e.agentId!) ?? '')
+            const tool = registered && (ownTools === undefined || ownTools.has(registered)) ? registered : undefined
             if (tool === undefined) {
               const echo = `Coordinator message:\n\n${text}`
               answer += echo
@@ -2648,7 +2889,7 @@ async function* withCoordinatorMessages(
               const id = mintId(e)
               const input = { sourceUuid: message.uuid, text }
               coordinatorRows.set(id, { tool, text })
-              answers.set(id, { agentId: e.agentId!, tool, result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })
+              if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })) throw new Error('invalid coordinator display answer')
               yield { kind: 'tool', index, id, name: tool }
               yield { kind: 'input', index: index++, json: JSON.stringify(input) }
               inserted.push({ at: originalTools, name: tool, input })
@@ -2677,7 +2918,9 @@ async function* withCoordinatorMessages(
  * (at most maxActionsPerStep): each message a text block, each action a
  * call whose answer is stored for the `tool.call` guard.
  */
-async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSignal, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  await loadCapabilities($)
+  const tools = agentTools.get(run.name) ?? new Set([...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (cfg.richRows || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)])
   let cut = -1
   let n = 0
   for (let i = 0; i < run.queue.length && n < cfg.maxActionsPerStep; i++) {
@@ -2704,11 +2947,38 @@ async function* actionStep(e: TurnStepInput, run: Run): AsyncGenerator<TurnStepC
       if (q.action.tool === 'WebSearch' && !Array.isArray(q.action.result) && Array.isArray(q.action.result.results)) {
         for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
       }
-      answers.set(id, { agentId: run.agentId, tool: q.action.tool, result: q.action.result, ...(q.action.isError ? { isError: true as const } : {}) })
+      if (!tools.has(q.action.tool)) {
+        const original = q.action
+        const reason = `${original.tool} unavailable in this agent's tools`
+        if (displayTools.codex_tool && tools.has(displayTools.codex_tool)) {
+          q.action = { tool: displayTools.codex_tool,
+            input: { server: 'codex', name: original.tool, arguments: original.input },
+            result: [{ type: 'text', text: `${reason}\n${JSON.stringify(original.result)}` }],
+            source: original.source, ...(original.error ? { error: original.error } : {}) }
+        } else {
+          blocks.push({ text: `${reason}; display tool unavailable\n${JSON.stringify(original.input)}\n${original.error ?? JSON.stringify(original.result)}` })
+          continue
+        }
+      }
+      if (!holdAnswer(id, run.sessionId, run.agentId, q.action)) {
+        blocks.push({ text: `codex-mod: output-schema rejection (${q.action.tool}); not executed\n${JSON.stringify(q.action.input)}\n${q.action.error ?? JSON.stringify(q.action.result)}` })
+        continue
+      }
+      run.rows[id] = q.action.source ?? null
       blocks.push({ tool: q.action.tool, id, input: q.action.input })
     }
   }
+  if (!blocks.some(b => 'tool' in b)) {
+    // A text fallback must not end a still-running agent before its handback.
+    run.queue.unshift(...blocks.map((b): Queued => 'thinking' in b ? { kind: 'thinking', text: b.thinking } : { kind: 'interim', text: 'text' in b ? b.text : '' }))
+    return yield* pump($, e, signal, run)
+  }
   run.actionSteps++
+  const rec = records.get(run.agentId)
+  if (rec !== undefined) {
+    rec.wire = { records: run.ledger.records, rows: run.rows }
+    await saveRecord($, run.agentId, rec)
+  }
   return yield* emit(e, blocks)
 }
 
@@ -2854,7 +3124,7 @@ const failStep = (e: TurnStepInput, name: string, body: string, handback: boolea
 /** The final blocks of a run: the SubagentHandback call, or the final text. */
 async function* finalBlocks(e: TurnStepInput, body: string, foot: string, handback: boolean, after?: { index: number; answer: string }, leading: Block[] = []): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const message = [body, foot].filter(Boolean).join('\n\n')
-  const blocks: Block[] = handback ? [{ tool: HANDBACK_TOOL, id: mintId(e), input: { message } }] : message === '' ? [] : [{ text: message }]
+  const blocks: Block[] = handback ? [{ tool: HANDBACK_TOOL, id: `${HANDBACK_ID_PREFIX}${e.turnId.replace(/[^A-Za-z0-9]/g, '').slice(-12)}_${e.index}_${++seq}`, input: { message } }] : message === '' ? [] : [{ text: message }]
   return yield* emit(e, [...leading, ...blocks], after)
 }
 

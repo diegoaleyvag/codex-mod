@@ -28,7 +28,8 @@ const usage = (i, c, o) => ({ total: { totalTokens: i + o, inputTokens: i, cache
 const complete = status => {
   if (!turnActive) return
   turnActive = false
-  note('turn/completed', { threadId: THREAD, turn: { id: TURN, status, error: status === 'failed' ? { message: 'boom' } : null, items: [] } })
+  note('turn/completed', { threadId: THREAD, turn: { id: TURN, status, error: status === 'failed' ? { message: 'boom' } : null,
+    items: scenario === 'batch1-wire' ? [{ type: 'reasoning', id: 'snapshot-reasoning', summary: ['Public snapshot summary'], content: ['PRIVATE_RAW_REASONING'] }] : [] } })
 }
 const work = () => {
   note('turn/started', { threadId: THREAD, turn: { id: TURN, status: 'inProgress' } })
@@ -84,6 +85,26 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch1-wire') {
+        const items = JSON.parse(readFileSync(new URL('./batch1-wire-items.json', import.meta.url), 'utf8'))
+        for (const item of items) {
+          const start = { ...item, ...('status' in item ? { status: 'inProgress' } : {}) }
+          note('item/started', { threadId: THREAD, turnId: TURN, item: start, startedAtMs: 100 })
+          if (item.type === 'commandExecution') {
+            note('item/commandExecution/outputDelta', { threadId: THREAD, turnId: TURN, itemId: item.id, delta: 'a\r\n\n' })
+            note('item/commandExecution/terminalInteraction', { threadId: THREAD, turnId: TURN, itemId: item.id, processId: 'pty-1', stdin: 'q' })
+          }
+          if (item.type === 'fileChange') note('item/fileChange/patchUpdated', { threadId: THREAD, turnId: TURN, itemId: item.id, changes: item.changes })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item, completedAtMs: 120 })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item, completedAtMs: 120 })
+        }
+        for (const method of ['turn/diff/updated', 'turn/plan/updated', 'thread/goal/updated', 'thread/goal/cleared', 'configWarning', 'error', 'future/notification']) {
+          note(method, { threadId: THREAD, turnId: TURN, diff: 'aggregate only', explanation: 'Plan', plan: [], goal: { objective: 'Goal', status: 'active' }, error: { message: 'retrying' }, willRetry: true })
+        }
+        note('item/completed', { threadId: THREAD, turnId: TURN, item: { type: 'futureItem', id: 'future', payload: { exact: true } } })
+        out({ id: ++reqId, method: 'item/tool/requestUserInput', params: { threadId: THREAD, turnId: TURN, itemId: 'question', questions: [], isBlocking: true } })
+        return setTimeout(finishNormally, 50)
+      }
       if (scenario === 'malformed') process.stdout.write('this is not json\n')
       if (scenario === 'unknown') {
         note('brand/new/notification', { threadId: THREAD, turnId: TURN })

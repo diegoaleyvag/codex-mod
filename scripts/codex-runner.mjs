@@ -40,7 +40,6 @@ const OPT_OUT = [
   'item/reasoning/summaryTextDelta',
   'item/reasoning/summaryPartAdded',
   'item/reasoning/textDelta',
-  'item/commandExecution/outputDelta',
   'item/fileChange/outputDelta',
 ]
 // Notifications / item types we know about (handled or deliberately ignored).
@@ -54,6 +53,7 @@ const KNOWN_METHODS = new Set([
   'item/autoApprovalReview/started', 'item/autoApprovalReview/completed', 'serverRequest/resolved',
   'item/fileChange/patchUpdated', 'item/plan/delta', 'item/mcpToolCall/progress',
   'item/commandExecution/terminalInteraction', 'mcpServer/startupStatus/updated',
+  'item/commandExecution/outputDelta',
   'account/updated', 'account/rateLimits/updated', 'model/rerouted', 'model/verification',
   'model/safetyBuffering/updated', 'skills/changed', 'app/list/updated', 'remoteControl/status/changed',
   ...OPT_OUT,
@@ -75,6 +75,15 @@ const emit = obj => {
   } catch {
     stdoutBroken = true
   }
+}
+
+// Completed turn/thread snapshots may contain private reasoning as well.
+const publicSource = value => {
+  if (Array.isArray(value)) return value.map(publicSource)
+  if (value === null || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => value.type !== 'reasoning' || key !== 'content')
+    .map(([key, child]) => [key, publicSource(child)]))
 }
 
 // --- args / config values ---------------------------------------------------
@@ -163,8 +172,8 @@ function makeControlDir(dir) {
 /** Completed items only: started searches and calls do not carry usable results. */
 function completedItem(item, changesOf) {
   switch (item?.type) {
-    case 'fileChange': return { type: 'file_change', changes: changesOf(item), status: item.status }
-    case 'commandExecution': return { type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? '', exit_code: item.exitCode ?? null }
+    case 'fileChange': return { ...item, type: 'file_change', changes: changesOf(item) }
+    case 'commandExecution': return { ...item, type: 'command_execution', aggregated_output: item.aggregatedOutput, exit_code: item.exitCode }
     case 'agentMessage': return { type: 'agent_message', text: item.text ?? '', ...(item.phase != null ? { phase: item.phase } : {}) }
     // Only the public summary crosses the pipe; never reasoning.content.
     case 'reasoning': return { type: 'reasoning', text: (Array.isArray(item.summary) ? item.summary : []).filter(s => typeof s === 'string').join('\n\n') }
@@ -228,6 +237,7 @@ async function main() {
   let badLineReported = false
   const unknownMethods = new Set()
   const unknownItems = new Set()
+  const itemLifecycles = new Set()
   let baseline // total usage before this turn
   let lastTotal
   const turnWaiters = []
@@ -414,13 +424,30 @@ async function main() {
   const changesOf = item =>
     (Array.isArray(item.changes) ? item.changes : [])
       .filter(c => typeof c?.path === 'string' && c.path !== '')
-      .map(c => ({ path: c.path, kind: c.kind?.type ?? 'update' }))
+      .map(c => ({ ...c }))
 
   const handleNotification = m => {
     const p = m.params ?? {}
     if (!KNOWN_METHODS.has(m.method)) unknownMethods.add(m.method)
     const item = p.item
+    if (item?.id && ['item/started', 'item/completed'].includes(m.method)) {
+      const key = JSON.stringify([threadId, turnId, item.id, m.method])
+      if (itemLifecycles.has(key) || (m.method === 'item/started' && itemLifecycles.has(JSON.stringify([threadId, turnId, item.id, 'item/completed'])))) return
+      itemLifecycles.add(key)
+    }
     if (item && typeof item.type === 'string' && !KNOWN_ITEMS.has(item.type)) unknownItems.add(item.type)
+    // The compatibility view below keeps today's rows. This parallel record
+    // keeps the source contract, including variants without a renderer. Raw
+    // reasoning is intentionally excluded from both views and from deltas.
+    const publicItem = publicSource(item)
+    const source = { transport: 'app-server', event: m.method, threadId, turnId,
+      ...(p.startedAtMs !== undefined ? { startedAtMs: p.startedAtMs } : {}),
+      ...(p.completedAtMs !== undefined ? { completedAtMs: p.completedAtMs } : {}),
+      ...(item ? { item: publicItem } : {}),
+      data: publicSource(Object.fromEntries(Object.entries(p).filter(([key]) => key !== 'item'))) }
+    if (!['item/started', 'item/completed', 'rawResponseItem/completed', 'item/reasoning/textDelta'].includes(m.method)) {
+      emit({ type: 'codexmod.source', source })
+    }
     switch (m.method) {
       case 'thread/tokenUsage/updated': {
         const u = p.tokenUsage
@@ -439,11 +466,11 @@ async function main() {
         break
       }
       case 'item/started':
-        if (item?.type === 'fileChange') emit({ type: 'item.started', item: { type: 'file_change', changes: changesOf(item) } })
+        emit({ type: 'item.started', item: item?.type === 'fileChange' ? completedItem(item, changesOf) : { type: 'source_only' }, source })
         break
       case 'item/completed': {
         const translated = completedItem(item, changesOf)
-        if (translated) emit({ type: 'item.completed', item: translated })
+        emit({ type: 'item.completed', item: translated ?? { type: 'source_only' }, source })
         break
       }
       case 'turn/plan/updated':
@@ -530,6 +557,10 @@ async function main() {
       return
     }
     if (m.id !== undefined && typeof m.method === 'string') {
+      if (m.params?.threadId === undefined || m.params.threadId === threadId) {
+        emit({ type: 'codexmod.source', source: { transport: 'app-server', event: m.method, threadId, turnId,
+          data: publicSource({ ...m.params, requestId: m.id, response: { code: -32601, message: 'unsupported by codex-mod' } }) } })
+      }
       try {
         child.stdin.write(JSON.stringify({ id: m.id, error: { code: -32601, message: 'unsupported by codex-mod' } }) + '\n')
       } catch {}

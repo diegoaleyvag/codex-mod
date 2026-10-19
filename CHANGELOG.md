@@ -8,6 +8,7 @@
 
 ### Added
 
+- Batch 1 native-parity foundation: retain public source items and notifications with source IDs, cwd, command actions/process/status/timing, patch kinds/moves/diffs, web/tool results, child model/effort/states, image/review/failure fields and row provenance. Preserve unsupported variants; deduplicate item lifecycles without rendering terminal interactions or aggregate turn diffs as new actions. Private reasoning content stays excluded.
 - Full coordinator messages in the Codex subagent view through guarded, display-only `coordinator_message` rows and a Coordinator card, with source UUID deduplication across worker restarts, numbered parts above 90,000 characters, and plain text fallback. Steering/queuing status notes remain, without message excerpts; receipt display never substitutes for Codex's answer or confirms steering.
 - Experimental `richRows` (default `false`): draw Codex sub-agent spawns as guarded, completed Agent rows and plan updates as guarded TodoWrite rows when the session offers that tool (otherwise `codex_plan`). Both are answered with native result shapes by the plugin, never executed, counted in the footer and shown as text with `nativeActions: false`.
 - Codex reasoning summaries as best-effort live thinking, completed web searches as guarded WebSearch rows, and MCP/dynamic tool results and plan updates as display-only `codex_tool`/`codex_plan` rows. All new rows are counted in the footer and degrade to text with `nativeActions: false`.
@@ -18,6 +19,8 @@
 
 ### Fixed
 
+- Bind display answers to the session, agent, exact tool, immutable emitted input and source record; intercept every reserved display ID, including unknown tool names, in both guards and catches. Give real handback calls a separate namespace. Cache verified ordinary ownership and restore Codex ownership from durable records during lookup outages.
+- Filter each Codex agent's native tool list by availability, with admitted display/text fallbacks. Validate baseline native answers and registered content-block arrays before emission and consumption; include required WebSearch mode and completed Agent fields. Report failed/declined operations through `deny`, preserve full shell output and trailing newlines, and keep partial assistant answers out of final handback.
 - In `handbackMode: auto`, use text directly when the complete API conversation has no handback signal, and remember failed handbacks per session so new agents avoid repeating an unavailable `SubagentHandback` call. Explicit tool signals still take precedence.
 
 ## 1.1.0 - 2026-10-18

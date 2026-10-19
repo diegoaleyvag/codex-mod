@@ -66,18 +66,22 @@ test('normal turn: exec-compatible lines, turn-scoped usage, exit 0', async () =
   assert.deepEqual(l[0], { type: 'thread.started', thread_id: 'thr-1' })
   assert.deepEqual(l[1], { type: 'codexmod.turn', turn_id: 'turn-1' })
   const cmd = l.find(x => x.item?.type === 'command_execution')
-  assert.deepEqual(cmd, { type: 'item.completed', item: { type: 'command_execution', command: 'ls', aggregated_output: 'a\n', exit_code: 0 } })
+  assert.equal(cmd.item.id, 'c1')
+  assert.equal(cmd.item.aggregated_output, 'a\n')
+  assert.equal(cmd.item.exit_code, 0)
+  assert.equal(cmd.source.threadId, 'thr-1')
+  assert.equal(cmd.source.turnId, 'turn-1')
   const started = l.find(x => x.type === 'item.started')
-  assert.deepEqual(started.item, { type: 'file_change', changes: [{ path: '/x/a.txt', kind: 'add' }] })
+  assert.deepEqual(started.item.changes, [{ path: '/x/a.txt', kind: { type: 'add' }, diff: '' }])
   const done = l.find(x => x.type === 'item.completed' && x.item.type === 'file_change')
-  assert.deepEqual(done.item.changes, [{ path: '/x/a.txt', kind: 'add' }, { path: '/x/b.txt', kind: 'update' }])
+  assert.deepEqual(done.item.changes, [{ path: '/x/a.txt', kind: { type: 'add' }, diff: '' }, { path: '/x/b.txt', kind: { type: 'update', move_path: null }, diff: '' }])
   assert.deepEqual(l.filter(x => x.item?.type === 'agent_message').map(x => x.item.text), ['all done'])
   // baseline = first total - first last (992,98,48); final total 1500/300/80
   assert.deepEqual(l.at(-1), { type: 'turn.completed', usage: { input_tokens: 508, cached_input_tokens: 202, output_tokens: 32 } })
   const s = r.sent()
   assert.deepEqual(s.map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
   assert.equal(s[0].params.clientInfo.name, 'codex-mod')
-  assert.ok(s[0].params.capabilities.optOutNotificationMethods.includes('item/commandExecution/outputDelta'))
+  assert.ok(!s[0].params.capabilities.optOutNotificationMethods.includes('item/commandExecution/outputDelta'))
   assert.equal(s[2].params.approvalPolicy, 'never')
   assert.equal(s[2].params.sandbox, 'workspace-write')
   assert.equal(s[2].params.config.model_reasoning_effort, 'low')
@@ -340,7 +344,7 @@ test('phase 3 translates each completed app-server item and plan notification, w
       assert.equal(web.length, 3)
       assert.equal(web[0].results[0].url, 'https://example.test/docs')
       assert.deepEqual(web.map(i => i.action.type), ['search', 'openPage', 'findInPage'])
-      assert.equal(lines.filter(l => l.type === 'item.started').length, 1) // existing file change only
+      assert.equal(lines.filter(l => l.type === 'item.started').length, 22) // all public source starts, including deferred variants
     })
     await t.test('MCP results and errors stay exec-compatible', () => {
       const mcp = items.filter(i => i.type === 'mcp_tool_call')
@@ -381,5 +385,42 @@ test('phase 3 handled items do not conceal unknown-item drift', async () => {
   try {
     assert.equal((await r.exit).code, 0)
     assert.deepEqual(r.lines().find(l => l.type === 'codexmod.protocol'), { type: 'codexmod.protocol', unknown_methods: [], unknown_items: ['futureWidget'] })
+  } finally { r.cleanup() }
+})
+
+test('batch 1 wire: all 19 public source variants, lifecycle replay and notifications remain lossless', async t => {
+  const r = start('batch1-wire')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const lines = r.lines()
+    const fixtures = JSON.parse(readFileSync(join(here, 'fixtures', 'batch1-wire-items.json'), 'utf8'))
+    for (const item of fixtures) await t.test(item.type, () => {
+      const events = lines.filter(l => l.source?.item?.id === item.id)
+      assert.equal(events.length, 2)
+      const done = events.find(l => l.type === 'item.completed')
+      const publicItem = { ...item }
+      if (item.type === 'reasoning') delete publicItem.content
+      assert.deepEqual(done.source.item, publicItem)
+      assert.equal(done.source.threadId, 'thr-1')
+      assert.equal(done.source.turnId, 'turn-1')
+      assert.equal(done.source.completedAtMs, 120)
+      assert.equal(events.find(l => l.type === 'item.started').source.startedAtMs, 100)
+    })
+    await t.test('patch/aggregate/terminal/goal/warning/unsupported/request records remain separate', () => {
+      const sources = lines.filter(l => l.type === 'codexmod.source').map(l => l.source)
+      const byMethod = method => sources.find(s => s.event === method)
+      assert.deepEqual(byMethod('item/fileChange/patchUpdated').data.changes, fixtures.find(i => i.type === 'fileChange').changes)
+      assert.equal(byMethod('turn/diff/updated').data.diff, 'aggregate only')
+      assert.equal(byMethod('item/commandExecution/outputDelta').data.delta, 'a\r\n\n')
+      assert.equal(byMethod('item/commandExecution/terminalInteraction').data.stdin, 'q')
+      for (const method of ['thread/goal/updated', 'thread/goal/cleared', 'configWarning', 'error', 'future/notification']) assert.ok(byMethod(method))
+      assert.equal(byMethod('error').data.willRetry, true)
+      assert.equal(byMethod('item/tool/requestUserInput').data.requestId, 101)
+      assert.equal(byMethod('item/tool/requestUserInput').data.response.code, -32601)
+      assert.deepEqual(lines.find(l => l.source?.item?.id === 'future').source.item, { type: 'futureItem', id: 'future', payload: { exact: true } })
+      assert.ok(!JSON.stringify(lines).includes('PRIVATE_RAW_REASONING'))
+      assert.ok(!lines.some(l => l.type === 'turn.failed'))
+      assert.deepEqual(r.sent().find(m => m.id === 101 && !m.method).error, { code: -32601, message: 'unsupported by codex-mod' })
+    })
   } finally { r.cleanup() }
 })

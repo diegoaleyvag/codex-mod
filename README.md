@@ -39,6 +39,10 @@ Messages received from the coordinator appear in the Codex subagent view as disp
 
 Experimental `richRows: true` draws Codex sub-agent spawns as completed Agent rows and plan updates as TodoWrite rows when the session offers that tool (otherwise `codex_plan`), answered by the plugin without launching Claude agents or changing Claude's task list.
 
+Native rows are admitted only when the tool is available and included in that Codex agent's own tools. An unavailable tool falls back to `codex_tool`, or attributed text when registration also fails. Results are checked against the supported native shapes before emission and again before answering; failed or declined operations return a native denial with Codex's actual report. Bash results retain the full combined output, including trailing newlines; an unreported exit stays unknown.
+
+The latest run's public source records and row provenance are retained in its agent record under the existing `pruneDays` policy. These include source IDs, command actions/cwd/process/status/timing, exact patch kinds/moves/diffs, tool and web results, child models/states, image/review/failure data and notifications, including unsupported variants. Repeated item completions produce one row; aggregate turn diffs and terminal interactions are retained without extra action rows. Private reasoning content is excluded. This foundation preserves evidence for later native mappings; it does not add new visual mappings.
+
 Reasoning summaries appear as best-effort live thinking (not saved in the transcript). App-server commentary and proposed plans appear between rows, with short notes for agent activity, compaction, review, sleep and image generation. The final answer still arrives through the handback. Image viewing is deferred. `nativeActions: false` shows plain text lines instead. See the [Codex UI map](docs/codex-ui-map.md) for transport coverage and rendering limits.
 
 ## Requirements
@@ -214,14 +218,15 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - The plugin relies on early-access APIs (`turn.step`, `tool.call`, `$.agent.register`, `SubagentHandback`) that may change.
 - Installing or editing the plugin takes effect in a new session.
 - In `workspace-write`, Codex usually cannot commit inside a git worktree or use the network; let the caller commit and push.
-- Only finished actions, messages and available reasoning summaries are shown; raw reasoning is never shown. Codex reports file changes without a diff, so Edit rows are reconstructed from file text seen before and after.
+- Only finished actions, messages and available reasoning summaries are shown; raw reasoning is never shown. Source patch diffs are retained, but the current Edit/Write previews still use file text sampled before and after. Exact source-diff adapters are deferred.
 - With `app-server`, a steer is applied at Codex's next step boundary, not instantly.
 - A run does not survive a restart of the plugin worker: the agent reports `codex failed: run lost`, and a follow-up resumes its thread.
 
 ## Safety model
 
 - Codex's actions are never executed by Claude. The native rows are answered from what Codex already did, without reaching the permission system or the tool.
-- Any other Bash, Edit, Write or WebSearch call from a codex-mod agent, or from a subagent whose type cannot be resolved, is refused. A failing guard refuses too, and a `tool.check` hook denies such a call as a backstop. The registered `codex_tool` and `codex_plan` tools also refuse calls from the main model or any call without a stored Codex result. No option turns this off.
+- Every reserved display ID is intercepted, regardless of tool name, caller or options. An answer must match its held session, agent, exact tool, emitted input and source record, and can be consumed once. Handback uses a separate ID namespace so its real delivery still executes.
+- Other Bash, Edit, Write, WebSearch, Agent and TodoWrite calls from Codex agents are refused. Both guards and their catches remain active with all option values. Registered `codex_tool`, `codex_plan` and `coordinator_message` names refuse every caller without a matching held answer. Verified ordinary Claude/main calls with ordinary IDs pass unchanged. If both agent lookup and durable ownership lookup fail for an unseen protected subagent call, it is refused; verified ordinary ownership is cached through later lookup outages.
 - Launch guard: at most one launch per new message and `maxRunsPerWindow` launches per agent in 10 minutes. Beyond that the agent hands back `codex failed: launch guard tripped`. Counters live in the stored record, so a restart does not reset them.
 - Engine notices (reminders, nudges) are never treated as tasks; they re-deliver the last answer without a Codex run.
 - Codex itself runs under the sandbox of the chosen agent. Prefer `read-only` or `workspace-write`; `danger-full-access` requires `defaultSandbox` for the generic agent or the user-level `allowProjectFullAccess` opt-in for project roles.
