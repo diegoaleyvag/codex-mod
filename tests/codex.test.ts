@@ -134,6 +134,7 @@ type Spawned = { argv: readonly string[]; input?: string; cwd?: string; env?: Re
 type Piece = { stream: 'stdout' | 'stderr'; text: string }
 type WorldOpts = {
   /** `$.agent.list` rejects. */
+  sendDelivery?: ($: any, e: any) => Promise<any>
   listThrows?: boolean
   agentList?: () => any[]
   registeredAgents?: any[]
@@ -221,6 +222,7 @@ function world(on: On, opts: WorldOpts = {}) {
     logs.push(String(e.text ?? ''))
     return { value: undefined }
   })
+  on('session.receive', (_$, e) => ({ text: e.text }))
   on('session.start', () => ({ cwd: '/tmp/project' }))
   on('agent.list', () => {
     if (opts.listThrows) throw new Error('agent list unavailable')
@@ -262,7 +264,8 @@ function world(on: On, opts: WorldOpts = {}) {
     if (opts.storeKeysThrows) throw new Error('store recovery unavailable')
     return { value: [...store.keys()] }
   })
-  on('tool.call', (_$, e: any) => {
+  on('tool.call', async ($, e: any) => {
+    if (e.tool === 'SendMessage' && opts.sendDelivery) return opts.sendDelivery($, e)
     core.push({ tool: e.tool, id: e.tool_use_id, agentId: e.agentId })
     return { result: { stdout: 'REALLY RAN', stderr: '', interrupted: false } } as any
   })
@@ -1400,14 +1403,14 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high', 'gpt-6-1-sol', 'gpt-6-luna'])
   expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
-  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'])
-  expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
+  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question', 'codex_message_status'])
+  expect(w.toolSpecs.filter(t => t.name !== 'codex_message_status').every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
   expect(w.toolSpecs[1].inputSchema.properties.steps.items.properties.status.enum).toEqual(['pending', 'in_progress', 'completed'])
   // The host spreads arguments beside its envelope fields, so display schemas
   // must keep these keys out of their top-level inputs.
   const envelopeKeys = ['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent', 'input', 'ceiling']
-  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text'], ['server', 'name', 'arguments']])
+  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text'], ['server', 'name', 'arguments'], ['targetAgentId', 'messageId']])
   for (const spec of w.toolSpecs) {
     expect(spec.inputSchema.additionalProperties).toBe(false)
     expect(Object.keys(spec.inputSchema.properties).some(key => envelopeKeys.includes(key))).toBe(false)
@@ -1683,7 +1686,7 @@ test('coordinator delivery rendered as a reminder block is a message in the API 
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }, { type: 'text', text: DELIVERED('also lint') }] },
   ])
   const r1 = readConversation(same)
-  expect(r1.latest).toEqual({ text: 'also lint', count: 2 })
+  expect(r1.latest).toEqual({ text: 'also lint', count: 2, coordinator: true })
   expect(r1.textAfterResults).toBe(true)
   // placement 2: its own meta user message; seen again on a later step it keeps its count
   const own = [
@@ -1692,8 +1695,8 @@ test('coordinator delivery rendered as a reminder block is a message in the API 
     { role: 'assistant' as const, kind: 'use' as const, id: 'b', tool: 'Bash' },
     { role: 'user' as const, kind: 'result' as const, id: 'b', text: 'ok', isError: false },
   ]
-  expect(readConversation(own.slice(0, 4)).latest).toEqual({ text: 'also lint', count: 2 })
-  expect(readConversation(own).latest).toEqual({ text: 'also lint', count: 2 })
+  expect(readConversation(own.slice(0, 4)).latest).toEqual({ text: 'also lint', count: 2, coordinator: true })
+  expect(readConversation(own).latest).toEqual({ text: 'also lint', count: 2, coordinator: true })
   expect(readConversation(own).textAfterResults).toBe(false)
   // a peer's or a plugin's delivery is engine prose: a nudge, never a task
   const peer = readConversation([...same.slice(0, 3), { role: 'user', kind: 'text', text: PEER }, { role: 'user', kind: 'text', text: PLUGIN }])
@@ -1805,7 +1808,7 @@ test('coordinator receipt: full original message, returned name, UUID dedup acro
   expect(spec.description).toContain('Display-only coordinator message')
   expect(spec.description).toContain('Never call')
   const answers = await runCalls($, second.chunks, 'agent-coordinator')
-  expect(answers[0]).toEqual({ result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })
+  expect(answers[0]).toEqual({ result: [{ type: 'text', text: 'Queued after turn current' }] })
   conv.push(...toolResult('Bash'))
   await $.session.append(deliveryRow('agent-coordinator', 'full-row', text))
   const final = await step($, 'agent-coordinator', 2)
@@ -1962,7 +1965,7 @@ test('coordinator display guards: own answer only once, foreign IDs, wrong owner
   const check: any = await $.tool.check({ tool: call.name, input: call.input, tool_use_id: call.id, agentId: 'agent-coordinator' } as any)
   expect(check.decision).toBe('deny')
   const [answer] = await runCalls($, s.chunks, 'agent-coordinator')
-  expect(answer.result).toEqual([{ type: 'text', text: 'Received; delivery status is reported separately' }])
+  expect(answer.result).toEqual([{ type: 'text', text: 'Received · pending Codex acknowledgment' }])
   const replay: any = await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-coordinator' } as any)
   expect(replay.deny).toContain('not executed')
   expect(w.core).toEqual([])
@@ -2089,7 +2092,7 @@ test('coordinator plain text received mid-stream uses a separate block and never
     chunks.push(r.value)
   }
   expect(chunks.filter(c => c.kind === 'text').map(c => [c.index, c.text])).toEqual([
-    [0, '$ make'], [1, literalReceipt(text)], [2, '\n\n$ lint'],
+    [0, '$ make'], [1, `${literalReceipt(text)}\nQueued after turn current\n`], [2, `\n\n${steerNote('queued')}`], [2, '\n\n$ lint'],
   ])
   expect(result.answer).toContain(literalReceipt(text))
   expect(handback(result)).toContain('built')
@@ -2739,8 +2742,8 @@ test('provider: with openai (or none) the logged-out message suggests codex logi
 
 test('helpers: runner lines, versions, model_provider, runner argv, footer with transport and steers', async () => {
   expect(parseCodexLine('{"type":"codexmod.turn","turn_id":"tu-1"}')).toEqual({ kind: 'turn', id: 'tu-1' })
-  expect(parseCodexLine('{"type":"codexmod.steer","id":12,"status":"accepted"}')).toEqual({ kind: 'steer', id: '12', accepted: true })
-  expect(parseCodexLine('{"type":"codexmod.steer","id":"x","status":"rejected","reason":"turn finished"}')).toEqual({ kind: 'steer', id: 'x', accepted: false, reason: 'turn finished' })
+  expect(parseCodexLine('{"type":"codexmod.steer","id":12,"status":"accepted"}')).toMatchObject({ kind: 'steer', id: '12', accepted: true })
+  expect(parseCodexLine('{"type":"codexmod.steer","id":"x","status":"rejected","reason":"turn finished"}')).toMatchObject({ kind: 'steer', id: 'x', accepted: false, reason: 'turn finished' })
   expect(parseCodexLine('{"type":"codexmod.protocol","unknown_methods":["a/b"],"unknown_items":["c"]}')).toEqual({ kind: 'protocol', types: ['method a/b', 'item c'] })
   expect(parseCodexLine('{"type":"codexmod.fatal","message":"boom"}')).toEqual({ kind: 'fatal', text: 'boom' })
   expect(parseCodexLine('{"type":"codexmod.future"}')).toEqual({ kind: 'other' })
@@ -2822,7 +2825,7 @@ function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol
 }
 
 const startSession = ($: any) => $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
-const CONTROL = /^\/home\/t\/\.cache\/codex-mod\/runs\/sess-1-(agent-[\w-]+)-(\d+)$/
+const CONTROL = /^\/home\/t\/\.cache\/codex-mod\/runs\/[a-z0-9]+-[a-z0-9]+-\d+$/
 
 test('app-server: session start checks node, the runner and codex app-server; a launch runs the runner with the same profile', { options: { transport: 'app-server', extraConfig: ['tools.view_image=false'] } }, async ($, on) => {
   const w = appWorld(on, { files: new Map([['/home/t/.codex/config.toml', CONFIG_TOML], ['.claude/codex-mod.json', PROJECT_ROLES]]), pieces: [THREAD('t-60'), TURN('tu-1'), MESSAGE('PONG'), USAGE] })
@@ -2887,7 +2890,8 @@ test('app-server steer: a message arriving mid-run is written as a steer file; a
   conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_s'), user('codex-effort: high\nalso add tests')]
   const s2 = await step($, 'agent-app-steer', 1)
   const control = w.spawned[0]!.argv.at(-1)!
-  expect(w.writes).toEqual([{ path: `${control}/steer-000002.json`, text: JSON.stringify({ text: 'also add tests' }) }])
+  expect(w.writes.map(x => x.path)).toEqual([`${control}/steer-000002.json`])
+  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'also add tests', expectedTurnId: 'tu-1' })
   // the control dir was created private before any steer file went into it
   expect(w.runs.some(r => r[0] === 'mkdir' && r.slice(1, 4).join(' ') === '-p -m 700' && r.includes('/home/t/.cache/codex-mod/runs') && r.at(-1) === control)).toBe(true)
   // the status note precedes Codex's answer without repeating the message
@@ -2913,8 +2917,8 @@ test('app-server steer: a rejected steer runs after the handback, resuming the t
   conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_r'), user('also lint')]
   const s2 = await step($, 'agent-app-reject', 1)
   expect(lastLine(handback(s2.result))).not.toContain('steer')
-  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual([steerNote('finished'), 'built'])
-  expect(w.logs.some(l => l.includes('steer 2 rejected (turn finished)'))).toBe(true)
+  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual(['↪ Queued after turn tu-1 · turn finished', 'built'])
+  expect(w.logs.some(l => l.includes('steer 2 rejected; queued after turn'))).toBe(true)
   opts.pieces = [THREAD('t-63'), TURN('tu-2'), MESSAGE('linted')]
   conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
   const s3 = await step($, 'agent-app-reject', 2)
@@ -2928,7 +2932,7 @@ test('app-server steer: a rejected steer runs after the handback, resuming the t
   expect(handback(s3.result).startsWith('linted')).toBe(true)
 })
 
-test('app-server steer: a steer the runner never acked runs after the handback', { options: { transport: 'app-server' } }, async ($, on) => {
+test('app-server steer: a steer the runner never acked stays unknown without relaunch', { options: { transport: 'app-server' } }, async ($, on) => {
   let conv: any[] = [user('first')]
   const opts: WorldOpts = { messages: () => conv, pieces: [THREAD('t-64'), TURN('tu-1'), cmdDone('/bin/zsh -lc make'), MESSAGE('built')] }
   const w = appWorld(on, opts)
@@ -2937,14 +2941,13 @@ test('app-server steer: a steer the runner never acked runs after the handback',
   conv = [...conv, ...toolResult('Bash', 'toolu_codexmod_u'), user('and docs')]
   const s2 = await step($, 'agent-app-unacked', 1)
   expect(w.writes.length).toBe(1)
-  // never acked when the run ended: announced as running next, before the answer
-  expect(handback(s2.result).split('\n\n').slice(0, 2)).toEqual([steerNote('finished'), 'built'])
+  expect(handback(s2.result)).toContain('message outcome unknown; no automatic retry or relaunch')
   expect(lastLine(handback(s2.result))).not.toContain('steer')
   opts.pieces = [THREAD('t-64'), TURN('tu-2'), MESSAGE('documented')]
   conv = [...conv, ...toolResult('SubagentHandback', 'hb')]
   await step($, 'agent-app-unacked', 2)
-  expect(w.spawned.length).toBe(2)
-  expect(w.spawned[1]!.input).toBe('and docs')
+  expect(w.spawned.length).toBe(1)
+  expect((Object.values(savedState(w, 'agent:sess-1:agent-app-unacked').coordinator.outcomes)[0] as any).status).toBe('unknown')
 })
 
 test('app-server mid-step: while a step waits on the runner, a new message is steered within that same step', { timeoutMs: 15000, options: { transport: 'app-server' } }, async ($, on) => {
@@ -2959,7 +2962,7 @@ test('app-server mid-step: while a step waits on the runner, a new message is st
   const { result } = await pending
   expect(w.timers.filter(ms => ms === 2000).length >= 1).toBe(true)
   expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nlong task')
-  expect(w.writes.map(x => JSON.parse(x.text))).toEqual([{ text: 'Keep the change bounded.\n\nchange of plan' }])
+  expect(w.writes.map(x => JSON.parse(x.text))).toMatchObject([{ text: 'Keep the change bounded.\n\nchange of plan' }])
   // the pull that was pending when the checks ran was read on, nothing lost; the
   // accepted steer is announced before Codex's answer
   expect(handback(result).startsWith(`${steerNote('accepted')}\n\ndone, steered`)).toBe(true)
@@ -2998,7 +3001,8 @@ test('app-server: a coordinator delivery appended as an attachment mid-step is s
   await $.session.append(deliveryRow('agent-app-deliver', 'row-7', 'codex-effort: high\nchange of plan'))
   const { result } = await pending
   const control = w.spawned[0]!.argv.at(-1)!
-  expect(w.writes).toEqual([{ path: `${control}/steer-000001-row-7.json`, text: JSON.stringify({ text: 'change of plan' }) }])
+  expect(w.writes.map(x => x.path)).toEqual([`${control}/steer-000001-row-7.json`])
+  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'change of plan', messageId: 'row-7' })
   expect(handback(result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted'), 'steered, done'])
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
   expect(w.store.get('agent:sess-1:agent-app-deliver')).toMatchObject({ lastTask: 'long task', userCount: 1, launchKey: '1:codex-effort: high\nchange of plan' })
@@ -5343,4 +5347,210 @@ test('batch 7 project role wins a sanitized model alias collision and supplies t
   expect(argOf(w.spawned[0]!.argv, '-m')).toBe('gpt-6-luna')
   expect(w.spawned[0]!.argv).toContain('model_reasoning_effort="high"')
   expect(w.logs.some(l => l.includes('project role wins name collision'))).toBe(true)
+})
+
+// R5: real native delivery remains authoritative, with a model-only outcome.
+test('steer v2: native SendMessage receives early, correlates append by scoped IDs, and returns additive exec queue context', async ($, on) => {
+  const w = world(on, { task: 'first', pieces: [cmdDone('pwd'), MESSAGE('built')], sendDelivery: async (_$, e) => {
+    await $.session.receive({ agentId: e.to, origin: { kind: 'coordinator' }, text: e.message })
+    const early = savedState(w, 'agent:sess-1:agent-coordinator').coordinator.outcomes[`sess-1:${e.tool_use_id}`]
+    expect(early.status).toBe('queued')
+    expect(early.sourceUuid).toBe(undefined)
+    await $.session.append(deliveryRow(e.to, `row-${e.tool_use_id}`, e.message))
+    return { result: { status: 'completed', agentsStates: {} }, context: ['existing model context'] }
+  } })
+  await step($, 'agent-coordinator')
+  for (const id of ['send-1', 'send-2']) {
+    const result: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: id, to: 'agent-coordinator', message: 'Identical literal body' } as any)
+    expect(result.context[0]).toBe('existing model context')
+    expect(result.context[1]).toContain('Queued after turn')
+  }
+  const rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  const outcomes = Object.values(rec.coordinator.outcomes) as any[]
+  expect(outcomes.map(o => o.senderToolUseId)).toEqual(['send-1', 'send-2'])
+  expect(outcomes.map(o => o.sourceUuid)).toEqual(['row-send-1', 'row-send-2'])
+  expect(rec.followUps.length).toBe(2)
+  expect(w.spawned.length).toBe(1)
+  expect(w.modelCalls).toEqual([])
+})
+
+test('steer v2: status query hydrates an owned receipt and denies child and synthetic callers without core execution', async ($, on) => {
+  const rec: any = quietCoordinatorRecord('body')
+  rec.coordinator.outcomes = { msg: { messageId: 'msg', sourceUuid: 'saved-row', status: 'accepted', acceptedTurnId: 'turn-X', receivedAt: 1 } }
+  const w = world(on, { task: 'first', store: new Map([['agent:sess-1:agent-coordinator', rec]]) })
+  await $.session.start({ cwd: '/tmp/project', surface: null, isInteractive: false })
+  const tool = 'mcp__codex-mod__codex_message_status'
+  const result: any = await $.tool.call({ tool, targetAgentId: 'agent-coordinator', messageId: 'saved-row', tool_use_id: 'query' } as any)
+  expect(JSON.parse(result.result[0].text)).toMatchObject({ messageId: 'msg', status: 'accepted', acceptedTurnId: 'turn-X' })
+  for (const extra of [{ agentId: 'agent-coordinator', tool_use_id: 'query-child' }, { tool_use_id: 'toolu_codexmod_forged' }]) {
+    const denied: any = await $.tool.call({ tool, targetAgentId: 'agent-coordinator', messageId: 'msg', ...extra } as any)
+    expect(denied.deny).toContain('not executed')
+  }
+  expect(w.core).toEqual([])
+  expect(w.spawned).toEqual([])
+})
+
+test('steer v2: coordinator card subscribes to outcome state and redraws the same literal body after acceptance', { options: { transport: 'app-server' } }, async ($, on) => {
+  const w = appWorld(on, { task: 'first', pieces: [THREAD('card-thread'), TURN('turn-X'), cmdDone('pwd'), cmdDone('ls'),
+    out(JSON.stringify({ type: 'codexmod.steer', id: '000001-saved-row', messageId: 'saved-row', status: 'accepted', acceptedTurnId: 'turn-X', turnId: 'turn-X', receivedAt: 1 })), MESSAGE('built')] })
+  await step($, 'agent-coordinator')
+  await $.session.append(deliveryRow('agent-coordinator', 'saved-row', '<literal body>'))
+  const s = await step($, 'agent-coordinator', 1)
+  const call = coordinatorCalls(s.chunks)[0]
+  const render = () => $.ui.render({ component: 'ToolUse', surface: 'desktop', requestId: 'same-card', props: {
+    tool: call.name, tool_use_id: call.id, input: call.input, isRunning: false, isErrored: false, isInterrupted: false,
+  } } as any)
+  const first: any = await render()
+  expect(first.children[2].children[0]).toContain('Received')
+  await step($, 'agent-coordinator', 2)
+  const accepted: any = await render()
+  expect(accepted.children[1].children).toEqual(['<literal body>'])
+  expect(accepted.children[2].children).toEqual(['Accepted into turn turn-X'])
+  expect(savedState(w, 'agent:sess-1:agent-coordinator').coordinator.outcomes['saved-row'].status).toBe('accepted')
+})
+
+test('steer v2: API-form recovery cannot resubmit an authoritative appended source', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const w = world(on, { messages: () => conv, pieces: [cmdDone('pwd'), cmdDone('ls'), MESSAGE('built')] })
+  await step($, 'agent-coordinator')
+  await $.session.append(deliveryRow('agent-coordinator', 'source-uuid', 'One message'))
+  conv.push(user(DELIVERED('One message')))
+  await step($, 'agent-coordinator', 1)
+  await step($, 'agent-coordinator', 2)
+  const rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  expect(rec.followUps.length).toBe(1)
+  expect(Object.keys(rec.coordinator.outcomes)).toEqual(['source-uuid'])
+  expect(w.spawned.length).toBe(1)
+})
+
+test('steer v2: HTTP control acceptance reaches SendMessage context and never publishes a steer file', { options: { transport: 'app-server' } }, async ($, on) => {
+  const posts: any[] = []
+  const w = appWorld(on, { task: 'first', pieces: [THREAD('thread-X'), TURN('turn-X'), cmdDone('pwd'), MESSAGE('built')],
+    readFile: (path, text) => path.endsWith('/control.json') ? JSON.stringify({ version: 2, generation: 'g', channel: 'unix', socketPath: '/tmp/fake.sock', runId: path.slice(0, -13) }) : text,
+    sendDelivery: async (_$, e) => {
+      await $.session.receive({ agentId: e.to, origin: { kind: 'coordinator' }, text: e.message })
+      await $.session.append(deliveryRow(e.to, 'http-source', e.message))
+      return { result: { status: 'completed', agentsStates: {} }, context: ['original'] }
+    } })
+  on('http.fetch', (_$, e: any) => {
+    const body = e.init?.body ? JSON.parse(e.init.body) : undefined
+    if (body) posts.push(body)
+    const payload = e.url.endsWith('/health') ? { version: 2, generation: 'g', runId: w.spawned[0].argv.at(-1) }
+      : { ...body, status: 'accepted', acceptedTurnId: 'turn-X', turnId: 'turn-X', rpcRequestId: 4 }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(payload) } }
+  })
+  await step($, 'agent-coordinator')
+  const result: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: 'send-http', to: 'agent-coordinator', message: 'codex-effort: high\nKeep every literal line.' } as any)
+  expect(result.context[0]).toBe('original')
+  expect(result.context[1]).toContain('Accepted into turn turn-X')
+  expect(posts.length).toBe(1)
+  expect(posts[0]).toMatchObject({ messageId: 'sess-1:send-http', expectedTurnId: 'turn-X', text: 'Keep every literal line.' })
+  expect(w.writes).toEqual([])
+  const rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  expect(rec.coordinator.outcomes['sess-1:send-http']).toMatchObject({ sourceUuid: 'http-source', status: 'accepted' })
+  expect(rec.followUps).toBe(undefined)
+})
+
+for (const scenario of ['blocked-health', 'lost-response']) test(`steer v2: ${scenario} negotiates once without a dual submission`, { options: { transport: 'app-server' } }, async ($, on) => {
+  const w = appWorld(on, { task: 'first', pieces: [THREAD('thread-X'), TURN('turn-X'), cmdDone('pwd'), MESSAGE('built')],
+    readFile: (path, text) => path.endsWith('/control.json') ? JSON.stringify({ version: 2, generation: 'g', channel: 'unix', socketPath: '/tmp/fake.sock', runId: path.slice(0, -13) }) : text })
+  let posts = 0
+  on('http.fetch', (_$, e: any) => {
+    if (e.url.endsWith('/health') && scenario === 'lost-response') return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ version: 2, generation: 'g', runId: w.spawned[0].argv.at(-1) }) } }
+    if (!e.url.endsWith('/health')) posts++
+    throw new Error('simulated host transport failure')
+  })
+  await step($, 'agent-coordinator')
+  await $.session.append(deliveryRow('agent-coordinator', 'one-source', 'PRIVATE_BODY_SENT_ONCE'))
+  const rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  expect(w.writes.length).toBe(scenario === 'blocked-health' ? 1 : 0)
+  expect(posts).toBe(scenario === 'blocked-health' ? 0 : 1)
+  expect(rec.coordinator.outcomes['one-source'].status).toBe(scenario === 'blocked-health' ? 'pending' : 'unknown')
+  expect(w.logs.some(s => s.includes('PRIVATE_BODY_SENT_ONCE'))).toBe(false)
+})
+
+const senderRow = (uuid: string, ids: string[], text: string) => ({ uuid, door: 'response' as const,
+  origin: { kind: 'model' as const, model: 'claude-sonnet-5-5' },
+  message: { type: 'assistant' as const, role: 'assistant' as const, content: ids.map(id => ({ type: 'tool_use' as const, id, name: 'SendMessage', input: { to: 'steer-check', message: text } })) } })
+const nativeQueued = (id = 'agent-coordinator') => ({ result: { success: true,
+  message: 'Message queued for delivery at its next tool round.', pin: { id, name: 'steer-check', ref: 'ref' } }, context: ['existing'] })
+
+test('steer v2 live order: two identical named sends precede receive/append while a child pull is held; cards and outcomes precede the next host round', { options: { transport: 'app-server', richRows: true }, timeoutMs: 15000 }, async ($, on) => {
+  const posts: any[] = []
+  let pulling = false
+  const body = 'codex-effort: high\nKeep waiting; include MARKER in your answer.'
+  const ids = ['native-send-one', 'native-send-two']
+  const w = appWorld(on, { task: 'first',
+    agentList: () => [{ id: 'agent-coordinator', name: 'steer-check', type: 'codex-mod:codex', description: 'Different title', status: 'running' }],
+    pieces: [THREAD('thread-X'), TURN('turn-X'), cmdDone('pwd'), () => { pulling = true; return posts.length === 2 },
+      out(ids.map(id => JSON.stringify({ type: 'codexmod.steer', id, messageId: `sess-1:${id}`, status: 'accepted', acceptedTurnId: 'turn-X', receivedAt: 1 })).join('\n')), MESSAGE('built')],
+    readFile: (path, text) => path.endsWith('/control.json') ? JSON.stringify({ version: 2, generation: 'g', channel: 'unix', socketPath: '/tmp/fake.sock', runId: path.slice(0, -13) }) : text,
+    // Match CLI 2.1.302: return the pin, raise neither receive nor child append.
+    sendDelivery: async () => nativeQueued() })
+  on('http.fetch', (_$, e: any) => {
+    const input = e.init?.body ? JSON.parse(e.init.body) : undefined
+    if (input) posts.push(input)
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(input ? { ...input, status: 'accepted', acceptedTurnId: 'turn-X', turnId: 'turn-X' }
+      : { version: 2, generation: 'g', runId: w.spawned[0].argv.at(-1) }) } }
+  })
+  await step($, 'agent-coordinator')
+  const held = step($, 'agent-coordinator', 1)
+  for (let i = 0; !pulling && i < 100; i++) await new Promise<void>(r => setTimeout(r, 5))
+  expect(pulling).toBe(true)
+  // Parallel tool blocks share one persisted parent row UUID.
+  await $.session.append(senderRow('parent-source', ids, body))
+  const replies: any[] = await Promise.all(ids.map(id => $.tool.call({ tool: 'SendMessage', tool_use_id: id, to: 'steer-check', message: body } as any)))
+  expect(replies.map(r => r.context[0])).toEqual(['existing', 'existing'])
+  expect(replies.every(r => r.context[1].includes('Accepted into turn turn-X'))).toBe(true)
+  expect(posts.map(p => p.messageId)).toEqual(ids.map(id => `sess-1:${id}`))
+  expect(posts.every(p => p.text === 'Keep waiting; include MARKER in your answer.')).toBe(true)
+  const displayed = await held
+  const cards = coordinatorCalls(displayed.chunks)
+  expect(cards.map(c => c.input)).toEqual(ids.map(() => ({ sourceUuid: 'parent-source', text: body })))
+  expect(displayed.result.stopReason).toBe('tool_use')
+  // The real host drains the native copies only AFTER this guarded tool round.
+  for (const id of ids) {
+    const received = await $.session.receive({ agentId: 'agent-coordinator', origin: { kind: 'coordinator' }, text: body })
+    expect(received.consumed).toContain('already owned')
+    const answer: any = await $.tool.call({ tool: 'mcp__codex-mod__codex_message_status', tool_use_id: `query-${id}`, targetAgentId: 'agent-coordinator', messageId: id } as any)
+    expect(JSON.parse(answer.result[0].text)).toMatchObject({ messageId: `sess-1:${id}`, sourceUuid: 'parent-source', acceptedTurnId: 'turn-X' })
+  }
+  const ambiguous: any = await $.tool.call({ tool: 'mcp__codex-mod__codex_message_status', tool_use_id: 'query-parent', targetAgentId: 'agent-coordinator', messageId: 'parent-source' } as any)
+  expect(JSON.parse(ambiguous.result[0].text).reason).toContain('multiple messages')
+  expect(posts.length).toBe(2)
+  expect(w.writes).toEqual([])
+  expect(w.spawned.length).toBe(1)
+  expect(w.core).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
+
+test('steer v2 live order: append-only native copy reconciles with sender operation, while 1.1 unscoped queued_command still steers once', { options: { transport: 'app-server' } }, async ($, on) => {
+  const w = appWorld(on, { task: 'first', pieces: [THREAD('t'), TURN('turn'), cmdDone('pwd'), MESSAGE('built')], sendDelivery: async () => nativeQueued() })
+  await step($, 'agent-coordinator')
+  await $.session.append(senderRow('parent-source', ['sender'], 'Identical body'))
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'sender', to: 'agent-coordinator', message: 'Identical body' } as any)
+  expect(w.writes.length).toBe(1)
+  // Host versions without a receive dispatch retain the authoritative child row.
+  await $.session.append(deliveryRow('agent-coordinator', 'late-native-uuid', 'Identical body'))
+  await $.session.append(deliveryRow('agent-coordinator', 'late-native-uuid', 'Identical body'))
+  expect(w.writes.length).toBe(1)
+  let rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  expect(rec.coordinator.outcomes['sess-1:sender']).toMatchObject({ sourceUuid: 'parent-source', deliveryUuid: 'late-native-uuid' })
+  expect(rec.coordinator.pending.length).toBe(1)
+  await $.session.append(deliveryRow('agent-coordinator', 'legacy-uuid', 'Identical body'))
+  expect(w.writes.length).toBe(2)
+  rec = savedState(w, 'agent:sess-1:agent-coordinator')
+  expect(rec.coordinator.outcomes['legacy-uuid']).toMatchObject({ sourceUuid: 'legacy-uuid', status: 'pending' })
+  expect(JSON.parse(w.writes[1].text).messageId).toBe('legacy-uuid')
+  expect(w.spawned.length).toBe(1)
+})
+
+for (const pin of [undefined, 'agent-gp']) test(`steer v2: native failure or mismatched pin ${pin} cannot submit a sender receipt`, async ($, on) => {
+  const w = world(on, { task: 'first', pieces: [cmdDone('pwd'), MESSAGE('built')], sendDelivery: async () => pin ? nativeQueued(pin) : { result: { success: false } } })
+  await step($, 'agent-coordinator')
+  await $.session.append(senderRow('parent-source', ['sender'], 'One body'))
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'sender', to: 'agent-coordinator', message: 'One body' } as any)
+  expect(savedState(w, 'agent:sess-1:agent-coordinator').coordinator).toBe(undefined)
+  expect(w.writes).toEqual([])
+  expect(w.spawned.length).toBe(1)
 })

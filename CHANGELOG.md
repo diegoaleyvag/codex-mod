@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix steering on CLI 2.1.302 when a long Codex step delays native inbox drain: route successful SendMessage calls from their persisted parent source UUID/tool ID and confirmed recipient pin, reconcile delayed receive/append copies without replay, and emit the receipt card at a settled acknowledgment boundary. Preserve append-only 1.1 steering and keep steer-v2 fake scenarios free of unrelated command/patch output.
+
+- Steer bridge v2: per-run private HTTP/Unix control with health/generation negotiation and file fallback, durable stable message IDs, exact-turn acceptance, raw RPC rejections and explicit uncertain outcomes without replay. Exec retains a durable after-turn FIFO with the same outcome records.
+- Route scoped coordinator receipts at `session.receive`, bind authoritative UUIDs at append, redraw the same literal coordinator card through declared state, and expose additive SendMessage model context plus the guarded read-only `codex_message_status` query. Retain literal/status notes and bounded host-store/private-cache persistence.
+
 - Batch 8 mirror lifecycle: explicit parent relation in child titles and parent observation links for CLI 2.1.302's parentless depth-1 API spawns. Deduplicate message UUIDs in the owning runner, validate steer turn acknowledgements, persist delivery outcomes, distinguish stop requests from confirmed source interruption, and cascade stops through source descendants across hooks-worker recovery. Document native background-task support and unsupported reparenting, status/summary setters and separate-session adoption; add a stop/SendMessage headless harness. Desktop controls/progress and auxiliary summary traffic remain live checks.
 
 - Add `modelAgents` (default true): register each listed Codex model as `codex-mod:<slug>`, with catalog effort defaults and supported efforts in its description. The current host rejects dots in type names, so `gpt-6.1-sol` falls back to `gpt-6-1-sol` with a log note and exact executing model ID. Project roles win collisions; unreadable catalogs retain generic/role types only.

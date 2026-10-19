@@ -6,7 +6,8 @@
 // single string) and `codex app-server` exits as soon as stdin hits EOF, so the
 // hook cannot hold the app-server pipe open to send `turn/steer` or
 // `turn/interrupt` mid-run. This process owns app-server's stdin for exactly
-// one run; the hook talks to it through files in a control directory.
+// one run; the hook negotiates private HTTP/Unix control (protocol 2),
+// with control files as a compatibility fallback. Stdio events remain version 1.
 //
 // CLI:  node codex-runner.mjs run --codex <path> --cwd <dir> --model <m>
 //         --effort <e> --sandbox <s> [--thread <id>] [--config k=v]...
@@ -33,6 +34,7 @@ import { spawn } from 'node:child_process'
 import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { createSteerControl } from '../hooks/steer-control.mjs'
 import { TreeUsage } from '../hooks/tree-usage.mjs'
 import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
 
@@ -329,6 +331,7 @@ async function main() {
     if (finished) return
     finished = true
     ownerState()
+    bridge.close()
     clearTimeout(drainTimer)
     clearInterval(poller)
     clearInterval(parentWatch)
@@ -349,16 +352,17 @@ async function main() {
     await finish(1)
   }
 
-  const send = (method, params) =>
+  const send = (method, params, beforeWrite) =>
     new Promise((resolve, reject) => {
       const id = ++nextId
-      const timer = setTimeout(() => { pending.delete(id); reject({ code: -32000, message: `${method} outcome unknown (timeout)` }) }, 10000)
+      try { beforeWrite?.(id) } catch { reject({ code: -1, message: 'operation journal unavailable', transport: true }); return }
+      const timer = setTimeout(() => { pending.delete(id); reject({ code: -32000, message: `${method} outcome unknown (timeout)`, transport: true }) }, 10000)
       pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value) }, reject: error => { clearTimeout(timer); reject(error) } })
       try {
         child.stdin.write(JSON.stringify({ id, method, params }) + '\n')
       } catch (e) {
         pending.delete(id)
-        reject({ code: -1, message: String(e?.message ?? e) })
+        reject({ code: -1, message: String(e?.message ?? e), transport: true })
       }
     })
   const notify = method => {
@@ -414,7 +418,6 @@ async function main() {
     else emit(event)
   }
   const interrupted = new Set()
-  const submittedSteers = new Set()
   const stoppedThreads = new Set()
   const stoppedAncestor = state => {
     const seen = new Set()
@@ -477,21 +480,45 @@ async function main() {
     else emit({ type: 'codexmod.responseRejected', token, message: 'invalid question response; no answer delivered' })
   }
 
-  const handleSteer = async (name, path, text, target = { id: threadId, turnId }, messageId) => {
-    const id = fileId(name)
-    // Notifications can advance the live thread while the RPC is in flight.
-    const destination = { id: target.id, turnId: target.turnId }
-    remove(path)
-    // A hooks worker can replay a receipt after its bounded dedup window.
-    // The owning server lives longer: never resubmit the same source UUID.
-    const key = JSON.stringify([destination.id, messageId ?? id])
-    if (submittedSteers.has(key)) return
-    submittedSteers.add(key)
+  const bridge = createSteerControl({ control: args.control, generation,
+    destination: body => {
+      if (body.threadId && body.threadId !== threadId) {
+        const t = threads.get(body.threadId)
+        return t && !t.attaching && !t.failed ? t : undefined
+      }
+      return { id: threadId, turnId, done: turnDone || finished }
+    },
+    dispatch: (params, beforeWrite) => send('turn/steer', params, beforeWrite),
+    emit: event => {
+      const target = threads.get(event.threadId)
+      if (target && target.id !== threadId) childEmit(target, event)
+      else emit(event)
+    },
+    interrupt: async body => {
+      if (body.threadId && body.threadId !== threadId) {
+        const target = threads.get(body.threadId)
+        if (!target || target.turnId !== body.turnId) throw new Error('stale child interrupt')
+        stoppedThreads.add(target.id)
+        for (const state of threads.values()) if (stoppedAncestor(state)) void interruptThread(state, body.operationId)
+      } else {
+        if (body.turnId && body.turnId !== turnId) throw new Error('stale root interrupt')
+        parentStopping = true
+        for (const t of threads.values()) if (t.id !== threadId) void interruptThread(t, 'parent stop')
+        void interruptAndEnd()
+      }
+    },
+  })
+  await bridge.listen()
+  const handleSteer = async (name, path, body) => {
+    // The file remains until the durable journal owns the operation.
     try {
-      const result = await send('turn/steer', { threadId: destination.id, expectedTurnId: destination.turnId, input: [{ type: 'text', text, text_elements: [] }], ...(messageId ? { clientUserMessageId: messageId } : {}) })
-      ack(id, result?.turnId === destination.turnId ? 'accepted' : 'unknown', result?.turnId === destination.turnId ? undefined : 'steer acknowledgement did not match the source turn', destination)
-    } catch (e) {
-      ack(id, e?.code === -32000 || e?.code === -2 ? 'unknown' : 'rejected', String(e?.message ?? 'turn/steer failed'), destination)
+      const entry = await bridge.submit({ ...body, id: fileId(name), messageId: body.messageId ?? String(fileId(name)),
+        expectedTurnId: body.expectedTurnId ?? body.turnId })
+      remove(path)
+      await entry.done
+    } catch (error) {
+      remove(path)
+      ack(fileId(name), 'rejected', String(error?.message ?? error))
     }
   }
 
@@ -537,40 +564,19 @@ async function main() {
         continue
       }
       if (!/^steer-.+\.json$/.test(name) || inflight.has(name)) continue
-      if (final) {
-        remove(path)
-        ack(fileId(name), 'rejected', 'owner finished')
-        continue
-      }
-      if (!turnId) continue // hold until the turn id is known
-      let text
-      let target
-      let messageId
+      if (!turnId && !final) continue
+      let body
       try {
-        const body = JSON.parse(readFileSync(path, 'utf8'))
-        if (typeof body.messageId === 'string') messageId = body.messageId
-        if (body.threadId) {
-          target = threads.get(body.threadId)
-          if (!target || target.id === threadId || target.done || target.failed || !target.turnId || target.turnId !== body.turnId) {
-            remove(path)
-            ack(fileId(name), 'rejected', 'child turn stale or idle; no turn started', target)
-            continue
-          }
-        }
+        body = JSON.parse(readFileSync(path, 'utf8'))
         if (typeof body?.text !== 'string') throw new Error('no text')
-        if (!target && turnDone) { remove(path); ack(fileId(name), 'rejected', 'turn finished'); continue }
-        text = body.text
       } catch {
         const n = (retries.get(name) ?? 0) + 1
         retries.set(name, n)
-        if (n >= 10) {
-          remove(path)
-          ack(fileId(name), 'rejected', 'unparseable steer file')
-        }
+        if (n >= 10 || final) { remove(path); ack(fileId(name), 'rejected', 'unparseable steer file') }
         continue
       }
       inflight.add(name)
-      handleSteer(name, path, text, target, messageId).finally(() => inflight.delete(name))
+      handleSteer(name, path, body).finally(() => inflight.delete(name))
     }
   }
   const poller = setInterval(() => { ownerState(); sweepControl() }, 200)
@@ -772,6 +778,7 @@ async function main() {
   }
 
   const route = m => {
+    if (m.method === 'item/started' || m.method === 'item/completed') bridge.observe(m.params?.threadId, m.params?.turnId, m.params?.item)
     const p = m.params ?? {}
     if (!threadId) { buffered.push(m); return }
     const id = p.threadId ?? p.thread?.id ?? threadId
@@ -920,7 +927,7 @@ async function main() {
     }
   })
   child.on('exit', (code, signal) => {
-    for (const h of pending.values()) h.reject({ code: -2, message: 'app-server exited' })
+    for (const h of pending.values()) h.reject({ code: -2, message: 'app-server exited', transport: true })
     pending.clear()
     if (out.trim() !== '') {
       const rest = out

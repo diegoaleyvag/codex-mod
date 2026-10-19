@@ -73,7 +73,8 @@ async function persistState($: EngineInterface, key: string, value: State, legac
     delete snapshot.cachedState
     const body = JSON.stringify(snapshot)
     let cached = false
-    if (!sameFields(snapshot, compact)) {
+    const needsCache = !sameFields(snapshot, compact)
+    if (needsCache) {
       $.ui.log(`codex-mod: compacting store record ${key} (${body.length} -> ${size(compact)} characters; budget ${RECORD_BUDGET})`, { to: 'debug' })
       try {
         const path = await statePath($, key)
@@ -98,7 +99,7 @@ async function persistState($: EngineInterface, key: string, value: State, legac
       await $.store.set(key, compact)
     }
     pendingMigrations.delete(key)
-    return true
+    return !needsCache || cached
   } catch (err) {
     $.ui.log(`codex-mod: store write failed for ${key}: ${String(err)}`, { to: 'debug' })
     return false

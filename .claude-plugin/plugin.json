@@ -15,6 +15,7 @@
     "subagent",
     "mod"
   ],
+  "types": "./hooks/steer-contract.d.ts",
   "userConfig": {
     "codexPath": {
       "type": "string",

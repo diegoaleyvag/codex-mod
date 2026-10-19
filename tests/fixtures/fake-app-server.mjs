@@ -222,6 +222,10 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario.startsWith('steer-v2-')) {
+        note('turn/started', { threadId: THREAD, turn: { id: TURN, status: 'inProgress' } })
+        return
+      }
       if (scenario === 'batch6-images-modes') {
         const root = process.env.FAKE_IMAGE_ROOT && resolve(process.env.FAKE_IMAGE_ROOT)
         if (root) {
@@ -334,6 +338,19 @@ createInterface({ input: process.stdin }).on('line', line => {
       if (scenario === 'slow') return setTimeout(finishNormally, 1500)
       return setTimeout(finishNormally, 50)
     case 'turn/steer':
+      if (scenario.startsWith('steer-v2-')) {
+        if (scenario === 'steer-v2-rejected') return out({ id: m.id, error: { code: -32600, message: 'cannot steer a review turn', data: { turnKind: 'review' } } })
+        if (scenario === 'steer-v2-wrong-ack') return reply({ turnId: 'foreign-turn' })
+        if (scenario === 'steer-v2-lost-ack') return setTimeout(() => process.exit(1), 10)
+        const item = { type: 'userMessage', id: `echo-${m.id}`, clientId: m.params.clientUserMessageId, content: m.params.input }
+        note('item/started', { threadId: THREAD, turnId: TURN, item })
+        const accepted = () => {
+          reply({ turnId: TURN })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+        }
+        if (scenario === 'steer-v2-late-ack') return setTimeout(accepted, 400)
+        return accepted()
+      }
       if (scenario.startsWith('nested-') && m.params.threadId === CHILD) {
         if (!childActive || m.params.expectedTurnId !== CHILD_TURN) return out({ id: m.id, error: { code: -32000, message: 'stale child turn' } })
         if (scenario === 'nested-steer-wrong-ack') return reply({ turnId: 'foreign-turn' })

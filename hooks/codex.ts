@@ -49,16 +49,16 @@
 // acks, protocol drift, fatal). Everything else (pump, actions, handback,
 // footer, record, launch guard) is shared. Session start checks node, `codex
 // app-server --help` and the runner; any failure falls back to exec for the
-// session, and the footer says why. The hook talks to a live runner through
-// files in its control dir (`<cache>/codex-mod/runs/<session>-<agent>-<n>/`,
-// created mode 0700 at launch since steer files carry prompt text, pruned
-// with the records): `steer-<id>.json` and `interrupt`.
+// session, and the footer says why. Each per-run sidecar exposes HTTP over a
+// private Unix socket. The host's socketPath API is probed before submission;
+// unsupported or policy-blocked hosts negotiate file controls. Submitted
+// operations never switch paths. Journals and lossless bodies stay in the
+// private run cache, with bounded host-store metadata.
 //
-// Steer (app-server only): a user/coordinator message that arrives while the
-// run is active is written as a steer file instead of being queued; an
-// accepted steer counts as that message's launch, a rejected one (or one never
-// acked) runs after the handback, as an exec follow-up does. Messages are
-// looked for at each step and, while a step waits on the runner, every 2 s.
+// Steer: scoped session.receive routes early, session.append records the
+// authoritative UUID, and conversation polling remains a recovery path.
+// Successful RPC acceptance must match the expected turn; explicit rejection
+// can queue after it. Missing acknowledgments stay uncertain without replay.
 // A coordinator's SendMessage into a running turn is no user row: the engine
 // appends it as a `queued_command` attachment rendered as a reminder block
 // ("The coordinator sent a message while you were working: ...") and promotes
@@ -82,7 +82,7 @@
 // step sees the agent is no longer running, when the agent's turn completes
 // while a run is still active, when `timeoutMinutes` elapses, and when the
 // module unloads (the engine kills every spawn of an unloaded module). An
-// app-server run is first asked to stop (`interrupt` file) and given 1.5 s.
+// app-server run is first asked to stop (the negotiated control channel) and given 1.5 s.
 //
 // Continuity: one record per agent `{ thread, model, effort, sandbox,
 // lastTask, agentName, handedBack, handback, lastAnswer, handbackLock,
@@ -117,6 +117,8 @@ import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult 
 import { childRows, planRows, planText, emptyDisplayState } from './plans-children.ts'
 import { captureImage, validImage, generationAction, findingsAction, literalReceipt } from './images-modes.ts'
 import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuestion } from './questions.mjs'
+import { controlRequest, queryOutcome, publishOutcome, messageStatus } from './steer.ts'
+import type { MessageOutcome } from './steer.ts'
 import { compactStoreState, flushStoreMigrations, readStoreState, writeStoreState } from './store-state.ts'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
@@ -182,7 +184,7 @@ type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message' | 'codex_
 const displayTools: Partial<Record<DisplayTool, string>> = {}
 const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
 // Kept after the guard consumes its answer, so resolved rows still render.
-const coordinatorRows = new Map<string, { tool: string; text: string }>()
+const coordinatorRows = new Map<string, { tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
 const planCards = new Map<string, PlanInput>()
 type Question = { token: string; requestId: string | number; method: string; params: any; status: string; result?: any; error?: any }
 const questionRows = new Map<string, { session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
@@ -434,7 +436,7 @@ export type AgentRecord = Profile & {
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
   // Receipt IDs are bounded in the store; bodies recover from private cache files.
-  coordinator?: { received: string[]; pending: { uuid: string; text: string; mirrorClaimed?: true }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string }> }
+  coordinator?: { received: string[]; pending: { uuid: string; text: string; messageId?: string; sourceUuid?: string; mirrorClaimed?: true }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string; messageId?: string }> ; outcomes?: Record<string, MessageOutcome>; sources?: Record<string, string>; authoritative?: true; ingress?: { messageId: string; senderToolUseId: string; count: number; fromSend?: true; text?: string }[] }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
   // Runtime/cache only: never put lossless source evidence in the host store.
@@ -451,7 +453,7 @@ export type AgentRecord = Profile & {
  * an attachment, not a user row (see `deliveries`), also has the row's `uuid`
  * and shares the count of the message it interrupted.
  */
-export type FollowUp = { text: string; count: number; uuid?: string }
+export type FollowUp = { text: string; count: number; uuid?: string; messageId?: string; senderToolUseId?: string }
 
 export type FileChange = { path: string; kind: string | { type: string; move_path?: string | null }; move_path?: string | null; diff?: string; status?: string }
 
@@ -586,7 +588,7 @@ export type CodexEvent =
   | { kind: 'question'; question: Question }
   // runner-only lines (app-server transport)
   | { kind: 'turn'; id: string }
-  | { kind: 'steer'; id: string; accepted: boolean; reason?: string }
+  | { kind: 'steer'; id: string; accepted: boolean; reason?: string; outcome: MessageOutcome }
   | { kind: 'protocol'; types: string[] }
   | { kind: 'fatal'; text: string }
   // a line that is not JSON, or of a type `codex exec --json` does not print
@@ -704,7 +706,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
     if (type === 'codexmod.warning' || type === 'codexmod.responseRejected') return { kind: 'warning', text: String(ev.message ?? 'warning') }
     if (type === 'codexmod.turn' && typeof ev.turn_id === 'string') return { kind: 'turn', id: ev.turn_id }
     if (type === 'codexmod.steer' && (typeof ev.id === 'string' || typeof ev.id === 'number')) {
-      return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted', ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
+      return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted' || ev.status === 'observed', outcome: ev as unknown as MessageOutcome, ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
     }
     if (type === 'codexmod.protocol') {
       const names = (v: unknown, tag: string) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').map(x => `${tag} ${x}`) : [])
@@ -878,7 +880,7 @@ export type Reading = {
   /** An engine `[handback-send-enforce]` nudge is in the conversation. */
   enforce: boolean
   /** The newest genuine user message (cleaned) and how many genuine user messages there are. */
-  latest?: { text: string; count: number }
+  latest?: { text: string; count: number; coordinator?: true }
   /** Tool results after the last assistant block, each with the tool it answers when known. */
   results: { id: string; tool?: string; text: string; isError: boolean }[]
   /** A genuine user message follows those results. */
@@ -925,13 +927,14 @@ export function readConversation(items: readonly ConvItem[]): Reading {
     }
     else if (HANDBACK_MENTION.test(it.text)) signal = 'tool'
     // a coordinator's delivery rendered as a reminder block is a message, not engine prose
-    const text = coordinatorPayload(it.text) ?? cleanText(it.text)
+    const payload = coordinatorPayload(it.text)
+    const text = payload ?? cleanText(it.text)
     if (text === '') {
       if (sawAssistant) nudged = true
       continue
     }
     count++
-    latest = { text, count }
+    latest = { text, count, ...(payload !== undefined ? { coordinator: true as const } : {}) }
     if (results.length > 0) textAfterResults = true
   }
   return { signal, handbackFailed, enforce, latest, results, textAfterResults, nudged }
@@ -1403,7 +1406,15 @@ const runs = new Map<string, Run>()
 // block, role system), which `$.session.messages` does not carry as user rows:
 // `session.append` records them here, the next look for messages takes them.
 // In memory only: a hooks-worker restart loses one not taken yet.
-const deliveries = new Map<string, { uuid: string; text: string }[]>()
+const deliveries = new Map<string, { uuid: string; text: string; messageId?: string }[]>()
+// Scope native sends per target. Receive has no UUID: only a scoped delivery
+// gets early control; append-only/uncorrelated ingress uses its source UUID.
+// Parent assistant rows are persisted before tool dispatch, including parallel
+// tool blocks sharing a UUID. Tool IDs distinguish those source messages.
+const nativeSources = new Map<string, { uuid: string; text: string }>()
+const nativeSends = new Map<string, { id: string; received?: string }>()
+const sendGates = new Map<string, Promise<void>>()
+let statusTool: string | undefined
 const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
 type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
@@ -1797,7 +1808,7 @@ async function stopMirror($: EngineInterface, m: ChildMirror): Promise<void> {
     return
   }
   try {
-    await $.fs.write(`${m.control}/interrupt-${m.thread}.json`, JSON.stringify({ threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }))
+    await controlRequest($, m.control, '/interrupt', { threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }, `interrupt-${m.thread}.json`)
     $.ui.log(`codex-mod: mirror stop submitted: host=${m.host}; thread=${m.thread}; turn=${turnId}; awaiting source terminal`, { to: 'debug' })
   } catch (err) {
     $.ui.log(`codex-mod: mirror stop unknown: thread=${m.thread}; ${errText(err)}; no retry`, { to: 'debug' })
@@ -1932,10 +1943,16 @@ async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): 
       continue
     }
     try {
-      await $.fs.write(`${m.control}/steer-${m.thread}-${id}.json`, JSON.stringify({ text: message.text, messageId: message.uuid ?? id, threadId: m.thread, turnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn }))
+      const o: MessageOutcome = { messageId: message.uuid ?? `${m.thread}:${id}`, id: delivery.id, sourceUuid: message.uuid,
+        sessionId: m.session, agentId: m.host!, runId: m.control, threadId: m.thread,
+        expectedTurnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn, status: 'pending', receivedAt: Date.now() }
+      await recordOutcome($, m.host!, o)
+      const outcome = await controlRequest($, m.control, '/messages', { ...o, text: roleTask(rec.agentName, parseOverrides(message.text).rest.trim()), turnId: o.expectedTurnId }, `steer-${m.thread}-${id}.json`)
+      if (outcome) { await recordOutcome($, m.host!, outcome); delivery.status = ['accepted', 'observed'].includes(outcome.status) ? 'accepted' : outcome.status === 'rejected' ? 'rejected' : outcome.status === 'unknown' ? 'unknown' : 'submitted' }
       $.ui.log(`codex-mod: mirror steer submitted: host=${m.host}; thread=${m.thread}; id=${delivery.id}`, { to: 'debug' })
     } catch (err) {
       delivery.status = 'unknown'
+      await recordOutcome($, m.host!, { messageId: message.uuid ?? `${m.thread}:${id}`, sourceUuid: message.uuid, status: 'unknown', receivedAt: Date.now(), reason: 'control outcome unavailable; no retry' })
       await saveRecord($, m.host!, rec)
       $.ui.log(`codex-mod: mirror steer unknown: thread=${m.thread}; id=${delivery.id}; ${errText(err)}; no retry`, { to: 'debug' })
       continue
@@ -2035,6 +2052,23 @@ export const register: Register = (on, options) => {
     const held = heldMirrorCall(e, next.origin.plugin)
     flushMirrorDiagnostics($)
     if (held) return next(e)
+    if (e.tool === statusTool) {
+      if (e.agentId !== undefined || hasPrefix(e.tool_use_id)) return { deny: NOT_EXECUTED }
+      const agentId = (e as any).targetAgentId
+      const messageId = (e as any).messageId
+      if (typeof agentId !== 'string' || typeof messageId !== 'string' || await agentName($, agentId) === undefined) return { deny: 'codex-mod: unknown target or message' }
+      const rec = await loadRecord($, agentId)
+      const sourceId = rec?.coordinator?.sources?.[messageId] ?? messageId
+      const matches = Object.values(rec?.coordinator?.outcomes ?? {}).filter(v => v.sourceUuid === sourceId || v.senderToolUseId === messageId)
+      if (!rec?.coordinator?.outcomes?.[sourceId] && matches.length > 1) return { result: [{ type: 'text', text: JSON.stringify({ messageId, status: 'unknown', reason: 'source row contains multiple messages; use a message ID or sender tool-use ID' }) }] }
+      let o = rec?.coordinator?.outcomes?.[sourceId] ?? matches[0]
+      if (o?.runId && ['pending', 'received', 'unknown'].includes(o.status)) {
+        const updated = await queryOutcome($, o.runId, o.messageId).catch(() => undefined)
+        if (updated) { await recordOutcome($, agentId, updated); o = records.get(agentId)?.coordinator?.outcomes?.[o.messageId] }
+      }
+      if (!o && rec?.coordinator?.received.includes(sourceId)) o = { messageId: sourceId, sourceUuid: sourceId, status: 'received', receivedAt: rec.updatedAt }
+      return { result: [{ type: 'text', text: JSON.stringify(o ?? { messageId, status: 'unknown', reason: 'no owned receipt' }) }] }
+    }
     if (guarded(e)) return answerGuarded(e, await sessionId($))
     if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
     // The current host omits effort from agent.spawn but exposes the Agent
@@ -2043,8 +2077,60 @@ export const register: Register = (on, options) => {
       agentEfforts.set(e.tool_use_id, (e as any).effort)
       try { return await next(e) } finally { agentEfforts.delete(e.tool_use_id) }
     }
+    if (e.tool === 'SendMessage' && e.agentId === undefined && typeof (e as any).message === 'string' && (e as any).message !== '') {
+      const target = await nativeTarget($, (e as any).to)
+      if (target) {
+        const previous = sendGates.get(target)
+        let release!: () => void
+        const gate = new Promise<void>(resolve => { release = resolve })
+        sendGates.set(target, gate)
+        await previous
+        const ticket = { id: e.tool_use_id, received: undefined as string | undefined }
+        nativeSends.set(target, ticket)
+        try {
+          const result = await next(e)
+          if (result.deny !== undefined || result.isError) return result
+          const receipt = nativeSources.get(ticket.id)
+          // CLI 2.1.302 raises receive only when the child's next tool round
+          // drains its inbox. A long step cannot wait for that callback.
+          const pin = nativeSendPin(result)
+          const run = runs.get(target)
+          if (receipt && pin === target && run && !run.ended && !run.killed && !run.mirror &&
+              !Object.values(records.get(target)?.coordinator?.outcomes ?? {}).some(o => o.senderToolUseId === ticket.id)) {
+            const rec = records.get(target)!
+            const c = rec.coordinator ??= { received: [], pending: [] }
+            const messageId = `${await sessionId($)}:${ticket.id}`
+            ticket.received = messageId
+            c.authoritative = true
+            c.received.push(receipt.uuid)
+            c.pending.push({ uuid: messageId, sourceUuid: receipt.uuid, messageId, text: receipt.text })
+            c.ingress ??= []
+            c.ingress.push({ messageId, senderToolUseId: ticket.id, count: rec.userCount ?? 0, fromSend: true, text: receipt.text })
+            // UUID and tool ID come from the stored parent row; pin comes from
+            // the native result. No body marker or second native send is used.
+            await foldIn($, run, { uuid: receipt.uuid, messageId, senderToolUseId: ticket.id, text: receipt.text, count: rec.userCount ?? 0 })
+            $.ui.log(`codex-mod: steer v2 sender receipt target=${target} message=${messageId} source=${receipt.uuid}`, { to: 'debug' })
+          }
+          let o = Object.values(records.get(target)?.coordinator?.outcomes ?? {}).find(o => o.senderToolUseId === ticket.id)
+          // The sidecar independently advances this finite query, even when the
+          // child view has not pulled its next stdout chunk.
+          if (o?.runId && ['received', 'pending'].includes(o.status)) {
+            const updated = await queryOutcome($, o.runId, o.messageId).catch(() => undefined)
+            if (updated) { await recordOutcome($, target, updated); o = records.get(target)?.coordinator?.outcomes?.[o.messageId] }
+          }
+          const feedback = o ? `${messageStatus(o)} (messageId=${o.messageId}; targetAgentId=${target})`
+            : `Codex acknowledgment pending; query codex_message_status with targetAgentId=${target}, messageId=${ticket.received ?? ticket.id}`
+          return { ...result, context: [...(result.context ?? []), feedback] }
+        } finally {
+          nativeSends.delete(target)
+          release()
+          if (sendGates.get(target) === gate) sendGates.delete(target)
+        }
+      }
+    }
     return next(e)
   }).catch(($, e, next) => {
+    if (e.tool === statusTool) return { deny: NOT_EXECUTED }
     if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
     if (!guarded(e) && !unresolved(e)) return next(e)
     const held = typeof e.tool_use_id === 'string' ? answers.get(e.tool_use_id) : undefined
@@ -2055,6 +2141,7 @@ export const register: Register = (on, options) => {
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
   on('tool.check', async ($, e, next) => {
+    if (e.tool === statusTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
     const held = heldMirrorCall(e, next.origin.plugin, 'check')
     flushMirrorDiagnostics($)
     if (held) return next(e)
@@ -2096,8 +2183,8 @@ export const register: Register = (on, options) => {
         if (!isRecord(rec)) continue
         const saved = rec.coordinator?.rows?.[id]
         if (saved && saved.tool === e.props.tool && rec.coordinator!.received.includes(saved.sourceUuid)) {
-          row = saved
-          coordinatorRows.set(id, saved)
+          row = { ...saved, outcome: saved.messageId ? rec.coordinator?.outcomes?.[saved.messageId] : undefined }
+          coordinatorRows.set(id, row)
           break
         }
       }
@@ -2160,7 +2247,41 @@ export const register: Register = (on, options) => {
     return Box({ flexDirection: 'column', children: [
       Text({ weight: 'semibold', children: 'Coordinator' }),
       Text({ children: row.text }),
+      Text({ children: messageStatus(row.messageId ? (await $.state.get({ plugin: 'codex-mod', key: 'messageStatus', id: row.messageId })).value ?? row.outcome : undefined) }),
     ] })
+  }).catch(($, e, next) => next(e))
+
+  on('session.receive', async ($, e, next) => {
+    const target = e.agentId
+    const ticket = target && nativeSends.get(target)
+    const run = target && runs.get(target)
+    if (target && e.origin.kind === 'coordinator' && !('plugin' in e.origin) &&
+        await reconcileNativeCopy($, target, e.text)) {
+      return { consumed: 'codex-mod: coordinator message already owned by its recorded SendMessage operation' }
+    }
+    if (target && ticket && !ticket.received && run && e.origin.kind === 'coordinator' && !('plugin' in e.origin) && !run.mirror) {
+      const rec = records.get(target)
+      if (rec) {
+        const c = rec.coordinator ??= { received: [], pending: [] }
+        const messageId = `${await sessionId($)}:${ticket.id}`
+        ticket.received = messageId
+        // Native sends are serialized per target; keep their receive order as
+        // well as tool IDs, so identical bodies never identify operations.
+        c.ingress ??= []
+        c.ingress.push({ messageId, senderToolUseId: ticket.id, count: rec.userCount ?? 0 })
+        await saveRecord($, target, rec)
+        await foldIn($, run, { text: e.text, count: rec.userCount ?? 0, messageId, senderToolUseId: ticket.id })
+      }
+    }
+    const result = await next(e)
+    if (target && ticket?.received && result.consumed !== undefined) {
+      const rec = records.get(target)
+      if (rec?.coordinator) {
+        rec.coordinator.ingress = rec.coordinator.ingress?.filter(i => i.messageId !== ticket.received)
+        await saveRecord($, target, rec)
+      }
+    }
+    return result
   }).catch(($, e, next) => next(e))
 
   // A coordinator's message delivered into an agent's running turn is an
@@ -2168,10 +2289,18 @@ export const register: Register = (on, options) => {
   // request, so the conversation read never shows it: it is recorded here, as
   // the row is appended, for the next look for messages. Always relayed as is.
   on('session.append', async ($, e, next) => {
+    if (e.agentId === undefined && e.origin.kind === 'model' && e.message.type === 'assistant') {
+      for (const block of e.message.content) {
+        if (block.type !== 'tool_use' || block.name !== 'SendMessage' || typeof block.id !== 'string' ||
+            !object(block.input) || typeof block.input.message !== 'string') continue
+        nativeSources.set(block.id, { uuid: e.uuid, text: block.input.message })
+        while (nativeSources.size > 128) nativeSources.delete(nativeSources.keys().next().value!)
+      }
+    }
     // only the doors a delivery comes in by: a prompt row the API form carries is read there
-    if (e.agentId !== undefined && e.origin.kind === 'coordinator' && (e.door === 'attachment' || e.door === 'delivery')) {
+    if (e.agentId !== undefined && e.origin.kind === 'coordinator' && (e.door === 'attachment' || e.door === 'delivery' || e.door === 'prompt' && runs.has(e.agentId))) {
       const content = rowText(e.message.content)
-      const text = coordinatorPayload(content)
+      const text = coordinatorPayload(content) ?? (e.door === 'delivery' || e.door === 'prompt' ? content : undefined)
       const name = text === undefined ? undefined : await agentName($, e.agentId)
       if (text !== undefined && text !== '' && name !== undefined) {
         const loaded = await loadRecord($, e.agentId)
@@ -2180,12 +2309,42 @@ export const register: Register = (on, options) => {
         if (!isRecord(rec)) return next(e)
         const coordinator = rec.coordinator ??= { received: [], pending: [] }
         if (coordinator.received.includes(e.uuid)) return next(e)
+        // Older hosts may append without receive. Reconcile the known native
+        // copy by target FIFO plus its recorded source/tool identity and body.
+        if (await reconcileNativeCopy($, e.agentId, coordinatorPayload(content, true) ?? content, e.uuid)) return next(e)
+        const sender = !('plugin' in e.origin) ? nativeSends.get(e.agentId) : undefined
+        if (sender) {
+          sender.received ??= e.uuid
+          coordinator.sources = Object.fromEntries([...Object.entries(coordinator.sources ?? {}).filter(([id]) => id !== sender.id), [sender.id, e.uuid]].slice(-128))
+        }
+        coordinator.authoritative = true
         coordinator.received.push(e.uuid)
-        coordinator.pending.push({ uuid: e.uuid, text: coordinatorPayload(content, true) ?? text })
+        coordinator.pending.push({ uuid: e.uuid, text: coordinatorPayload(content, true) ?? content })
+        const ordinal = sender?.received ? coordinator.ingress?.findIndex(i => i.messageId === sender.received) ?? -1 : 0
+        const ingress = !('plugin' in e.origin) && ordinal >= 0 ? coordinator.ingress?.splice(ordinal, 1)[0] : undefined
+        if (ingress) {
+          const outcome = coordinator.outcomes?.[ingress.messageId]
+          if (outcome) {
+            outcome.sourceUuid = e.uuid
+            await publishOutcome($, outcome)
+          }
+        }
         // Publish without an await so simultaneous first receipts share state.
         records.set(e.agentId, rec)
         await saveRecord($, e.agentId, rec, true)
         if (rec.mirror) { await mirrorMessages($, rec, runs.get(e.agentId)); return next(e) }
+        $.ui.log(`codex-mod: agent ${e.agentId}: coordinator message delivered mid-run (${e.door}${e.message.name ? ` ${e.message.name}` : ''}, row ${e.uuid})`, { to: 'debug' })
+        const run = runs.get(e.agentId)
+        if (ingress) {
+          for (const f of [...(run?.pendingSteers ?? []), ...(run?.followUps ?? [])]) if (f.messageId === ingress.messageId) f.uuid = e.uuid
+          await saveRecord($, e.agentId, rec, true)
+          return next(e)
+        }
+        const message = { uuid: e.uuid, text }
+        if (run && !run.ended && !run.killed) {
+          await foldIn($, run, { ...message, count: rec.userCount ?? 0 })
+          return next(e)
+        }
         const list = deliveries.get(e.agentId) ?? []
         if (!list.some(d => d.uuid === e.uuid)) list.push({ uuid: e.uuid, text })
         deliveries.set(e.agentId, list.slice(-MAX_DELIVERIES))
@@ -2532,6 +2691,13 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
     displayTools[name] = registered.tool
     displayNames.add(registered.tool)
   }
+  if (!statusTool) {
+    const registered = await $.tool.register({ name: 'codex_message_status', isDeferred: false,
+      description: 'Read a Codex coordinator message outcome. Use the target agent ID and message ID, source UUID or SendMessage tool use ID. Never sends messages or starts work.',
+      inputSchema: { type: 'object', additionalProperties: false,
+        properties: { targetAgentId: { type: 'string' }, messageId: { type: 'string' } }, required: ['targetAgentId', 'messageId'] } })
+    statusTool = registered.tool
+  }
 }
 
 /** Registers generic, project and optional catalog types; all use haiku as
@@ -2670,6 +2836,43 @@ async function conversation($: EngineInterface, agentId: string): Promise<{ item
 const followUpsOf = (rec: AgentRecord | undefined): FollowUp[] =>
   (rec?.followUps ?? []).map(f => (typeof f === 'string' ? { text: f, count: rec?.userCount ?? 0 } : f))
 
+/** Only a native success pin confirms which local recipient was queued. */
+function nativeSendPin(answer: { result?: unknown; text?: string }): string | undefined {
+  let result = answer.result
+  if (!object(result) && typeof answer.text === 'string') {
+    try { result = JSON.parse(answer.text) } catch { return }
+  }
+  return object(result) && result.success === true && object(result.pin) && typeof result.pin.id === 'string' ? result.pin.id : undefined
+}
+
+/** Receive order is per owned target and all matching native sends are
+ * serialized. Text is an integrity check, never the identity of an operation. */
+async function reconcileNativeCopy($: EngineInterface, agentId: string, text: string, deliveryUuid?: string): Promise<boolean> {
+  const rec = records.get(agentId) ?? await loadRecord($, agentId)
+  const c = rec?.coordinator
+  const head = c?.ingress?.[0]
+  const o = head && c?.outcomes?.[head.messageId]
+  if (!rec || !c || !head?.fromSend || head.text !== text || !o || o.senderToolUseId !== head.senderToolUseId) return false
+  c.ingress!.shift()
+  if (deliveryUuid) {
+    c.received.push(deliveryUuid)
+    c.sources = Object.fromEntries([...Object.entries(c.sources ?? {}), [deliveryUuid, head.messageId]].slice(-128))
+    o.deliveryUuid = deliveryUuid
+  }
+  await saveRecord($, agentId, rec)
+  $.ui.log(`codex-mod: steer v2 native copy reconciled target=${agentId} message=${head.messageId}${deliveryUuid ? ` row=${deliveryUuid}` : ''}`, { to: 'debug' })
+  return true
+}
+
+async function nativeTarget($: EngineInterface, to: unknown): Promise<string | undefined> {
+  const value = typeof to === 'string' ? to : object(to) && typeof to.agentId === 'string' ? to.agentId : undefined
+  if (!value) return
+  const list = await $.agent.list()
+  const matches = list.filter(a => a.id === value || a.name === value)
+  if (matches.length !== 1) return
+  return await agentName($, matches[0]!.id) !== undefined ? matches[0]!.id : undefined
+}
+
 /** The text of a row's blocks: API text blocks, or an attachment's recorded rendering (`{ content }`). */
 const rowText = (content: unknown): string =>
   typeof content === 'string' ? content : Array.isArray(content) ? content.map(b => (typeof b?.text === 'string' ? b.text : typeof b?.content === 'string' ? b.content : '')).join('\n') : ''
@@ -2677,20 +2880,20 @@ const rowText = (content: unknown): string =>
 /**
  * The coordinator deliveries recorded for the agent, taken (each once) as
  * follow-ups under `count`, the count of the message they interrupted; one
- * whose text the transcript shows as the newest message anyway is dropped.
+ * identified by source UUID rather than by body text.
  */
-function takeDeliveries(agentId: string, count: number, shown?: string): FollowUp[] {
+function takeDeliveries(agentId: string, count: number): FollowUp[] {
   const list = deliveries.get(agentId)
   if (list === undefined || list.length === 0) return []
   deliveries.delete(agentId)
-  return list.filter(d => d.text !== shown).map(d => ({ text: d.text, count, uuid: d.uuid }))
+  return list.map(d => ({ ...d, count }))
 }
 
 /** Two follow-ups are the same message: by row for a delivery, by count for a transcript message. */
-const sameFollowUp = (a: FollowUp) => (b: FollowUp) => (a.uuid !== undefined || b.uuid !== undefined ? a.uuid === b.uuid : a.count === b.count)
+const sameFollowUp = (a: FollowUp) => (b: FollowUp) => a.messageId && b.messageId ? a.messageId === b.messageId : (a.uuid !== undefined || b.uuid !== undefined ? a.uuid === b.uuid : a.count === b.count)
 
 /** The file id of a steer: the message count, zero-padded so the runner's name order is arrival order; a delivery adds its row id. */
-const steerFileId = (f: FollowUp) => (f.uuid === undefined ? steerId(f.count) : `${steerId(f.count)}-${f.uuid.replace(/[^A-Za-z0-9_-]/g, '_')}`)
+const steerFileId = (f: FollowUp) => (f.uuid === undefined ? f.senderToolUseId ? `${steerId(f.count)}-${f.senderToolUseId.replace(/[^A-Za-z0-9_-]/g, '_')}` : steerId(f.count) : `${steerId(f.count)}-${f.uuid.replace(/[^A-Za-z0-9_-]/g, '_')}`)
 
 // ---- records ---------------------------------------------------------------
 
@@ -2838,7 +3041,7 @@ async function* answerWithCodex(
   if (rec !== undefined) {
     rec.followUps = followUpsOf(rec)
     // a coordinator delivery that came after the run ended runs as a follow-up
-    const arrived = takeDeliveries(agentId, rd.latest?.count ?? rec.userCount ?? 0, rd.latest?.text).filter(d => !rec.followUps!.some(sameFollowUp(d)))
+    const arrived = takeDeliveries(agentId, rd.latest?.count ?? rec.userCount ?? 0).filter(d => !rec.followUps!.some(sameFollowUp(d)))
     if (arrived.length > 0) {
       rec.followUps.push(...arrived)
       await saveRecord($, agentId, rec)
@@ -2896,7 +3099,7 @@ async function* answerWithCodex(
 
   // 3. Only a genuinely new user/coordinator message launches Codex. Engine
   // nudges and reminders are never tasks (cleanText leaves them empty).
-  const isNew = latest !== undefined && (rec?.lastTask === undefined || latest.text !== rec.lastTask || (rec.userCount !== undefined && latest.count > rec.userCount))
+  const isNew = latest !== undefined && !(latest.coordinator && rec?.coordinator?.authoritative) && (rec?.lastTask === undefined || latest.text !== rec.lastTask || (rec.userCount !== undefined && latest.count > rec.userCount))
   if (isNew) {
     const base = fallback()
     // a queued follow-up that is this very message runs now, not again later
@@ -2960,41 +3163,78 @@ async function noteFollowUp($: EngineInterface, run: Run): Promise<void> {
   const latest = readConversation(conv.items).latest
   const rec = records.get(run.agentId)
   const fresh: FollowUp[] = []
-  let shown: string | undefined
   if (latest !== undefined && !isCompactionText(latest.text)) {
     const seen = rec?.userCount
     if (seen !== undefined ? latest.count > seen : latest.text !== rec?.lastTask) {
-      fresh.push(latest)
-      shown = latest.text
+      if (!(latest.coordinator && rec?.coordinator?.authoritative)) fresh.push(latest)
     }
   }
-  fresh.push(...takeDeliveries(run.agentId, latest?.count ?? rec?.userCount ?? 0, shown))
+  fresh.push(...takeDeliveries(run.agentId, latest?.count ?? rec?.userCount ?? 0))
   for (const f of fresh) {
     const same = sameFollowUp(f)
+    if (f.uuid && Object.values(rec?.coordinator?.outcomes ?? {}).some(o => o.sourceUuid === f.uuid)) continue
     if (run.followUps.some(same) || run.pendingSteers.some(same) || followUpsOf(rec).some(same)) continue
     await foldIn($, run, f)
   }
 }
 
-/** Steers one follow-up into an app-server run (a steer file), else keeps it for after the run, with its `↪` note. */
+/** Persist an outcome and redraw its owned receipt without touching transcript rows. */
+async function recordOutcome($: EngineInterface, agentId: string, o: MessageOutcome): Promise<boolean> {
+  const rec = records.get(agentId) ?? await loadRecord($, agentId)
+  if (!rec) return false
+  const c = rec.coordinator ??= { received: [], pending: [] }
+  const previous = c.outcomes?.[o.messageId]
+  // A delayed pending reply must not overwrite a stdout acknowledgment.
+  if (previous && !['received', 'pending'].includes(previous.status) && ['received', 'pending'].includes(o.status)) return true
+  const outcome = { ...previous, ...o, sourceUuid: o.sourceUuid ?? previous?.sourceUuid,
+    ...(previous?.status === 'queued' && o.status === 'rejected' ? { status: 'queued' as const, queuedAfterTurnId: previous.queuedAfterTurnId } : {}) }
+  c.outcomes = Object.fromEntries([...Object.entries(c.outcomes ?? {}).filter(([id]) => id !== o.messageId), [o.messageId, outcome]].slice(-128))
+  const saved = await saveRecord($, agentId, rec)
+  await publishOutcome($, outcome)
+  return saved
+}
+
 async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> {
-  // override lines cannot change a running turn's model: the rest is steered
+  const rec = records.get(run.agentId)
+  const messageId = f.messageId ?? f.uuid ?? `cm-${Array.from({ length: 4 }, () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0')).join('')}`
+  f.messageId = messageId
+  const previous = rec?.coordinator?.outcomes?.[messageId]
+  if (previous) return
+  const o: MessageOutcome = { id: steerFileId(f), messageId, sourceUuid: f.uuid, sessionId: run.sessionId, agentId: run.agentId,
+    senderToolUseId: f.senderToolUseId ?? nativeSends.get(run.agentId)?.id, runId: run.control, threadId: run.thread, expectedTurnId: run.turnId,
+    status: 'received', receivedAt: Date.now() }
+  // Journal ownership before any transport call, including the exec FIFO.
+  if (rec && !f.uuid && !o.senderToolUseId) { rec.userCount = f.count; rec.lastTask = f.text }
+  if (!await recordOutcome($, run.agentId, o)) {
+    await recordOutcome($, run.agentId, { ...o, status: 'unknown', reason: 'receipt checkpoint unavailable; no submission' })
+    return
+  }
   const text = parseOverrides(f.text).rest.trim()
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
+    run.pendingSteers.push(f)
     try {
-      await $.fs.write(`${run.control}/steer-${steerFileId(f)}.json`, JSON.stringify({ text: roleTask(run.name, text) }))
-      run.pendingSteers.push(f)
-      $.ui.log(`codex-mod: agent ${run.agentId}: message received mid-run; steered into the running turn`, { to: 'debug' })
-      return
-    } catch (err) {
-      $.ui.log(`codex-mod: agent ${run.agentId}: steer not written (${errText(err)}); it runs after this one`, { to: 'debug' })
+      const outcome = await controlRequest($, run.control, '/messages', { ...o, id: steerFileId(f), text: roleTask(run.name, text),
+        ...(run.mirror ? { threadId: run.mirror.thread } : {}) }, `steer-${steerFileId(f)}.json`)
+      if (outcome) await handle($, run, { kind: 'steer', id: String(outcome.id), accepted: ['accepted', 'observed'].includes(outcome.status), reason: outcome.reason, outcome })
+      else await recordOutcome($, run.agentId, { ...o, status: 'pending' })
+    } catch {
+      await recordOutcome($, run.agentId, { ...o, status: 'unknown', reason: 'control outcome unavailable; no retry' })
     }
+    return
   }
   run.followUps.push(f)
-  if (run.transport !== 'app-server') {
-    if (!run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote('queued') })
-    run.queuedNoted = true
-  } else run.queue.push({ kind: 'note', text: steerNote('finished') })
+  if (rec) rec.followUps = [...followUpsOf(rec).filter(f => !run.followUps.some(sameFollowUp(f))), ...run.followUps]
+  const saved = rec && await saveRecord($, run.agentId, rec)
+  await recordOutcome($, run.agentId, { ...o, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId,
+    reason: saved ? undefined : 'follow-up checkpoint unavailable; no retry' })
+  if (!saved) {
+    run.followUps = run.followUps.filter(v => !sameFollowUp(f)(v))
+    if (rec?.followUps) rec.followUps = rec.followUps.filter(v => !sameFollowUp(f)(v))
+    run.queue.push({ kind: 'note', text: '↪ follow-up checkpoint unavailable; outcome unknown, no automatic retry' })
+    return
+  }
+  if (run.transport === 'app-server' || !run.queuedNoted) run.queue.push({ kind: 'note', text: steerNote(run.transport === 'app-server' ? 'finished' : 'queued') })
+  run.queuedNoted = true
   $.ui.log(`codex-mod: agent ${run.agentId}: follow-up received mid-run; it runs after this one`, { to: 'debug' })
 }
 
@@ -3087,7 +3327,11 @@ async function* startRun(
     // a fresh control dir per run: no file of an earlier run may steer this one
     rec.runSeq = (rec.runSeq ?? 0) + 1
     await saveRecord($, agentId, rec)
-    const safe = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_')
+    const safe = (s: string) => {
+      let a = 2166136261, b = 5381
+      for (const c of s) { a = Math.imul(a ^ c.charCodeAt(0), 16777619); b = Math.imul(b, 33) ^ c.charCodeAt(0) }
+      return `${(a >>> 0).toString(36)}${(b >>> 0).toString(36)}`
+    }
     const runs = await runsDir($)
     control = `${runs}/${safe(await sessionId($))}-${safe(agentId)}-${rec.runSeq}`
     await $.process.run(['rm', '-rf', control], { timeoutMs: 10000 }).catch(() => undefined)
@@ -3228,10 +3472,10 @@ const cancel = (timer: Timer | undefined) => {
   }
 }
 
-/** Writes the run's `interrupt` file, then reads the run until it ends or INTERRUPT_GRACE_MS passes. */
+/** Request interruption once, then drain until terminal evidence or the grace deadline. */
 async function interruptRun($: EngineInterface, run: Run): Promise<void> {
   try {
-    await $.fs.write(`${run.control}/interrupt`, 'interrupt\n')
+    await controlRequest($, run.control!, '/interrupt', { turnId: run.turnId }, 'interrupt')
   } catch (err) {
     $.ui.log(`codex-mod: agent ${run.agentId}: interrupt not written (${errText(err)}); killing the runner`, { to: 'debug' })
     return
@@ -3480,10 +3724,21 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
   }
   else if (ev.kind === 'turn') { run.turnId = ev.id; if (run.mirror) run.mirror.activeTurn = ev.id }
   else if (ev.kind === 'steer') {
-    if (run.mirror) { run.queue.push({ kind: 'note', text: `↪ child steer ${ev.id}: ${ev.accepted ? 'accepted' : ev.reason ?? 'rejected'}; no automatic retry` }); return }
-    const i = run.pendingSteers.findIndex(f => (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
-    if (i < 0) return
+    if (run.mirror) {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      run.queue.push({ kind: 'note', text: `↪ child steer ${ev.id}: ${ev.accepted ? 'accepted' : ev.reason ?? 'rejected'}; no automatic retry` }); return }
+    if (ev.outcome.status === 'pending' || ev.outcome.status === 'received') {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      return
+    }
+    const i = run.pendingSteers.findIndex(f => (ev.outcome.messageId && f.messageId === ev.outcome.messageId) || (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
+    if (i < 0) {
+      if (ev.outcome.messageId) await recordOutcome($, run.agentId, ev.outcome)
+      return
+    }
     const [s] = run.pendingSteers.splice(i, 1)
+    const outcome = { ...ev.outcome, messageId: ev.outcome.messageId ?? s!.messageId!, sourceUuid: s!.uuid }
+    await recordOutcome($, run.agentId, outcome)
     if (ev.accepted) {
       run.steers++
       // the steered message had its launch: it never also runs after the handback
@@ -3499,10 +3754,20 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
       }
       run.queue.push({ kind: 'note', text: steerNote('accepted') })
       $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} accepted`, { to: 'debug' })
+    } else if (ev.outcome.status === 'unknown') {
+      run.queue.push({ kind: 'note', text: `↪ ${messageStatus(outcome)}; no automatic retry` })
     } else {
       run.followUps.push(s!)
-      run.queue.push({ kind: 'note', text: steerNote('finished') })
-      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} rejected (${ev.reason ?? 'no reason'}); it runs after this one`, { to: 'debug' })
+      const rec = records.get(run.agentId)
+      if (rec) rec.followUps = [...followUpsOf(rec).filter(f => !run.followUps.some(sameFollowUp(f))), ...run.followUps]
+      const saved = rec && await saveRecord($, run.agentId, rec)
+      await recordOutcome($, run.agentId, { ...outcome, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId })
+      if (!saved) {
+        run.followUps = run.followUps.filter(v => !sameFollowUp(s!)(v))
+        if (rec?.followUps) rec.followUps = rec.followUps.filter(v => !sameFollowUp(s!)(v))
+      }
+      run.queue.push({ kind: 'note', text: `↪ ${messageStatus({ ...outcome, status: saved ? 'queued' : 'unknown', queuedAfterTurnId: run.turnId })}` })
+      $.ui.log(`codex-mod: agent ${run.agentId}: steer ${ev.id} rejected; ${saved ? 'queued after turn' : 'checkpoint unavailable'}`, { to: 'debug' })
     }
   } else if (ev.kind === 'protocol') {
     run.unknown += ev.types.length
@@ -3623,6 +3888,11 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
           return yield* actionStep($, e, signal, run)
         }
       }
+      // A sender receipt can wake this pull through the steer ack. Returning
+      // here emits its guarded card and lets the host drain its native inbox;
+      // no child pull is left pending and Codex keeps the same running turn.
+      if (!run.ended && cfg.nativeActions && !run.pull && displayTools.coordinator_message &&
+          records.get(run.agentId)?.coordinator?.pending.some(p => p.messageId)) return yield* emit(e, [])
       if (run.ended) break
       let r: IteratorResult<ProcessSpawnChunk, ProcessSpawnResult>
       try {
@@ -3710,17 +3980,19 @@ async function* withCoordinatorMessages(
             const ownTools = agentTools.get(known.get(e.agentId!) ?? '')
             const tool = registered && (ownTools === undefined || ownTools.has(registered)) ? registered : undefined
             if (tool === undefined) {
-              const echo = literalReceipt(text)
+              const o = message.messageId ? coordinator.outcomes?.[message.messageId] : Object.values(coordinator.outcomes ?? {}).find(o => o.sourceUuid === message.uuid)
+              const echo = literalReceipt(text) + (o ? `\n${messageStatus(o)}\n` : '')
               answer += echo
               textInserted = true
               yield { kind: 'text', index: index++, text: echo }
             } else {
               const id = mintId(e)
-              const input = { sourceUuid: message.uuid, text }
-              coordinatorRows.set(id, { tool, text })
+              const input = { sourceUuid: message.sourceUuid ?? message.uuid, text }
+              const o = message.messageId ? coordinator.outcomes?.[message.messageId] : Object.values(coordinator.outcomes ?? {}).find(o => o.sourceUuid === message.uuid)
+              coordinatorRows.set(id, { tool, text, messageId: o?.messageId, outcome: o })
               const rows = coordinator.rows ??= {}
-              rows[id] = { tool, text, sourceUuid: message.uuid }
-              if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })) throw new Error('invalid coordinator display answer')
+              rows[id] = { tool, text, sourceUuid: message.sourceUuid ?? message.uuid, messageId: o?.messageId }
+              if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: messageStatus(o) }] })) throw new Error('invalid coordinator display answer')
               yield { kind: 'tool', index, id, name: tool }
               yield { kind: 'input', index: index++, json: JSON.stringify(input) }
               inserted.push({ at: originalTools, name: tool, input })
@@ -3867,14 +4139,15 @@ async function* complete(
     // already fired
   }
   const tail = run.stderrTail.trim().split('\n').slice(-5).join('\n')
-  // a steer the runner never acked (it ended first) runs after this run, as a follow-up
+  // An unacknowledged submission may already have reached Codex. Never replay it.
   if (run.mirror && run.pendingSteers.length) {
     run.queue.push({ kind: 'note', text: '↪ child message outcome unknown; no automatic retry or relaunch' }); run.pendingSteers = []
   }
   if (run.pendingSteers.length > 0) {
-    run.followUps.push(...run.pendingSteers)
+    for (const f of run.pendingSteers) await recordOutcome($, run.agentId, { messageId: f.messageId ?? f.uuid ?? steerFileId(f), sourceUuid: f.uuid,
+      status: 'unknown', receivedAt: Date.now(), reason: 'runner ended before acknowledgment; no retry' })
     run.pendingSteers = []
-    run.queue.push({ kind: 'note', text: steerNote('finished') })
+    run.queue.push({ kind: 'note', text: '↪ message outcome unknown; no automatic retry or relaunch' })
   }
   let reason = failure?.reason
   let detail = failure?.detail ?? ''
@@ -3923,7 +4196,8 @@ async function* complete(
   const rec = records.get(run.agentId)
   if (rec !== undefined) {
     if (run.thread !== undefined) rec.thread = run.thread
-    const queued = [...followUpsOf(rec), ...run.followUps]
+    const queued = [...followUpsOf(rec)]
+    for (const f of run.followUps) if (!queued.some(sameFollowUp(f))) queued.push(f)
     rec.followUps = queued.length > 0 ? queued : undefined
   }
   const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, usagePartial: run.usagePartial, treeUsage: run.treeUsage, steers: run.steers, patches: run.patches, patchRows: run.patchRows }, cfg.footer)

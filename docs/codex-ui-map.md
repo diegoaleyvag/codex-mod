@@ -360,3 +360,40 @@ remains false pending the matrix's NEW Desktop acceptance for task placement
 and native controls; this batch does not promote unverified candidates.
 See the [Batch 7 harness](../tests/fixtures/batch7-harness.md) for host-field,
 provider-boundary and live rendering checks.
+
+## Steer v2 coordinator outcomes (R5 first slice)
+
+CLI 2.1.302 queues native sends until the next child tool round; its inbox
+drain raises `session.receive` before materializing a `queued_command`. A long
+Codex step can block both events. The SendMessage wrapper instead binds the
+persisted parent assistant UUID/tool ID to the successful native result pin,
+then routes immediately for an active owned run. A settled steer-ack pull can
+emit the guarded receipt card without waiting for another Codex action. The
+later native copy is consumed, or its appended child UUID is reconciled to
+the existing operation. Unscoped append-only deliveries retain the 1.1 path.
+Per-target send order and source/tool IDs identify operations; text only
+checks integrity. Parallel tool blocks may share a row UUID. No payload
+marker, transcript rewrite or second native send is used.
+
+The exact owned `coordinator_message` ToolUse ID retains its literal body and
+subscribes to the declared `codex-mod.messageStatus` state family. A later
+outcome publishes state and invalidates `ui.render`. Private cache checkpoints
+restore bodies, UUIDs and outcomes after reload, with bounded metadata in the
+host store; hydration restores presentation, never executable guard answers.
+Plain receipt results, literal text/status and `↪` notes remain export/replay
+fallbacks until NEW Desktop validation passes.
+
+Status distinguishes received/pending, accepted into the matching RPC turn,
+observed correlated input (when emitted), queued after a turn, rejected with
+the actual error, and uncertain. Accepted/observed do not claim obedience or
+that a pending tool stopped. Failed-steer details remain on a queued outcome.
+Unknown submissions never become automatic follow-up launches.
+
+The coordinator learns known outcomes through additive model-only SendMessage
+`context`, preserving the native result. Later outcomes use the registered
+`codex_message_status` read-only contract (`targetAgentId`, `messageId`), which
+also accepts source UUID or sender tool-use ID. A card redraw cannot update
+an earlier model result. Query calls refuse child/synthetic callers and never
+send, append, wake or execute a Codex action. HTTP responses are finite and
+bounded; stdout keeps the existing per-step ownership. See the [steer v2
+harness](../tests/fixtures/steer-v2-harness.md) for host ordering and live gates.

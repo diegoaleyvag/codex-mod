@@ -373,13 +373,14 @@ test('resume path uses thread/resume with the given thread id', async () => {
   r.cleanup()
 })
 
-test('steer mid-turn is forwarded and acked accepted', async () => {
+test('steer mid-turn is forwarded and acked accepted', async t => {
   const r = start('steer')
   await r.waitFor(() => types(r).includes('codexmod.turn'))
   writeFileSync(join(r.control, 'steer-1.json'), JSON.stringify({ text: 'change plan' }))
   const { code } = await r.exit
   assert.equal(code, 0)
-  assert.deepEqual(r.lines().find(l => l.type === 'codexmod.steer'), { type: 'codexmod.steer', id: 1, status: 'accepted' })
+  assert.equal(r.lines().find(l => l.type === 'codexmod.steer').acceptedTurnId, 'turn-1')
+  assert.equal(r.lines().find(l => l.type === 'codexmod.steer').status, 'accepted')
   const st = r.sent().find(m => m.method === 'turn/steer')
   assert.equal(st.params.threadId, 'thr-1')
   assert.equal(st.params.expectedTurnId, 'turn-1')
@@ -388,12 +389,14 @@ test('steer mid-turn is forwarded and acked accepted', async () => {
   r.cleanup()
 })
 
-test('a steer rejected by app-server is acked rejected with the reason', async () => {
+test('a steer rejected by app-server is acked rejected with the reason', async t => {
   const r = start('steer-reject')
+  t.after(() => { r.child.kill(); r.cleanup() })
   await r.waitFor(() => types(r).includes('codexmod.turn'))
   writeFileSync(join(r.control, 'steer-7.json'), JSON.stringify({ text: 'x' }))
   await r.waitFor(() => types(r).includes('codexmod.steer'))
-  assert.deepEqual(r.lines().find(l => l.type === 'codexmod.steer'), { type: 'codexmod.steer', id: 7, status: 'rejected', reason: 'expected turn mismatch' })
+  assert.equal(r.lines().find(l => l.type === 'codexmod.steer').status, 'rejected')
+  assert.deepEqual(r.lines().find(l => l.type === 'codexmod.steer').error, { code: -32600, message: 'expected turn mismatch' })
   writeFileSync(join(r.control, 'interrupt'), '')
   await r.exit
   r.cleanup()
@@ -410,7 +413,8 @@ test('steer file still held when the turn finishes is rejected "turn finished"',
   })
   const { code } = await r.exit
   assert.equal(code, 0)
-  assert.deepEqual(r.lines().find(l => l.type === 'codexmod.steer'), { type: 'codexmod.steer', id: 9, status: 'rejected', reason: 'turn finished' })
+  assert.equal(r.lines().find(l => l.type === 'codexmod.steer').status, 'rejected')
+  assert.match(r.lines().find(l => l.type === 'codexmod.steer').reason, /stale or idle/)
   assert.ok(!r.sent().some(m => m.method === 'turn/steer'))
   assert.ok(!existsSync(join(r.control, 'steer-9.json')))
   r.cleanup()
@@ -425,7 +429,7 @@ test('a steer present before the turn id is known is held, then delivered after 
   })
   const { code } = await r.exit
   assert.equal(code, 0)
-  assert.deepEqual(r.lines().find(l => l.type === 'codexmod.steer'), { type: 'codexmod.steer', id: 3, status: 'accepted' })
+  assert.equal(r.lines().find(l => l.type === 'codexmod.steer').acceptedTurnId, 'turn-1')
   const methods = r.sent().map(m => m.method)
   assert.ok(methods.indexOf('turn/start') >= 0)
   assert.ok(methods.indexOf('turn/start') < methods.indexOf('turn/steer'), `turn/start before turn/steer: ${methods}`)
@@ -817,4 +821,155 @@ test('batch 3 exec harness fixture retains string kinds, move paths, exact text 
   assert.equal(completed.find(l => l.item.id === 'crlf').item.changes[0].diff, '+one\r\n+two\r\n')
   assert.equal(completed.find(l => l.item.id === 'partial-unknown').item.status, 'failed')
   assert.equal(completed.find(l => l.item.id === 'exec-no-diff').item.changes[0].diff, undefined)
+})
+
+// R5 first slice: the same operation engine serves HTTP and file controls.
+const { createSteerControl } = await import('../hooks/steer-control.mjs')
+const { messageStatus } = await import('../hooks/steer-control-text.mjs')
+const { request: httpRequest } = await import('node:http')
+function controlFixture(t, dispatch) {
+  const control = mkdtempSync('/tmp/cm-v2-')
+  const events = []
+  const options = { control, generation: 'g1', destination: () => ({ id: 'thread', turnId: 'turn' }),
+    dispatch, emit: e => events.push(e), interrupt: async () => {} }
+  const bridge = createSteerControl(options)
+  t.after(() => { bridge.close(); rmSync(control, { recursive: true, force: true }) })
+  return { control, events, bridge, options }
+}
+const operation = (messageId, extra = {}) => ({ messageId, text: 'same literal body', expectedTurnId: 'turn', ...extra })
+const socketCall = (descriptor, method, path, body) => new Promise((resolve, reject) => {
+  const req = httpRequest({ socketPath: descriptor.socketPath, path, method,
+    headers: { 'content-type': 'application/json', 'x-codex-generation': descriptor.generation } }, res => {
+    let text = ''
+    res.on('data', d => { text += d })
+    res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(text) }))
+  })
+  req.on('error', reject)
+  req.end(body ? JSON.stringify(body) : undefined)
+})
+
+test('R5 journal: distinct identical texts, duplicate IDs, conflicts, exact precondition and RPC IDs', async t => {
+  const calls = []
+  const f = controlFixture(t, async (params, beforeWrite) => { beforeWrite(101 + calls.length); calls.push(params); return { turnId: 'turn' } })
+  for (const id of ['a', 'b', 'a']) { const e = await f.bridge.submit(operation(id)); await e.done }
+  await assert.rejects(f.bridge.submit(operation('a', { text: 'conflicting' })), /conflicting/)
+  assert.deepEqual(calls.map(c => c.clientUserMessageId), ['a', 'b'])
+  assert.ok(calls.every(c => c.expectedTurnId === 'turn' && c.threadId === 'thread'))
+  assert.equal(f.bridge.get('a').acceptedTurnId, 'turn')
+  assert.equal(f.bridge.get('b').rpcRequestId, 102)
+  assert.equal(f.events.length, 2)
+  const recovered = createSteerControl({ ...f.options, generation: 'g2', dispatch: () => assert.fail('replayed accepted request') })
+  const e = await recovered.submit(operation('a')); await e.done
+  assert.equal(e.outcome.status, 'accepted')
+})
+
+for (const reply of [{}, { turnId: 'wrong' }]) test(`R5 malformed or foreign acknowledgment ${JSON.stringify(reply)} stays unknown`, async t => {
+  const f = controlFixture(t, async () => reply)
+  await (await f.bridge.submit(operation('bad'))).done
+  assert.equal(f.bridge.get('bad').status, 'unknown')
+  assert.equal(f.bridge.get('bad').acceptedTurnId, undefined)
+})
+
+test('R5 rejected steer retains the entire RPC error; stale turn dispatches nothing', async t => {
+  const error = { code: -32600, message: 'review cannot be steered', data: { kind: 'review' } }
+  let calls = 0
+  const f = controlFixture(t, async () => { calls++; throw error })
+  await (await f.bridge.submit(operation('review'))).done
+  assert.deepEqual(f.bridge.get('review').error, error)
+  assert.equal(f.bridge.get('review').status, 'rejected')
+  await (await f.bridge.submit(operation('stale', { expectedTurnId: 'previous' }))).done
+  assert.equal(calls, 1)
+  assert.equal(f.bridge.get('stale').status, 'rejected')
+})
+
+test('R5 echo before/after ack, duplicates, null client IDs and foreign thread/turn are isolated', async t => {
+  let finish
+  const f = controlFixture(t, () => new Promise(resolve => { finish = resolve }))
+  const e = await f.bridge.submit(operation('echo'))
+  f.bridge.observe('other', 'turn', { type: 'userMessage', id: 'wrong', clientId: 'echo' })
+  f.bridge.observe('thread', 'other', { type: 'userMessage', id: 'wrong', clientId: 'echo' })
+  f.bridge.observe('thread', 'turn', { type: 'userMessage', id: 'wrong', clientId: null })
+  assert.equal(e.outcome.echoedItemId, undefined)
+  f.bridge.observe('thread', 'turn', { type: 'userMessage', id: 'item-1', clientId: 'echo' })
+  assert.equal(e.outcome.status, 'pending')
+  finish({ turnId: 'turn' }); await e.done
+  f.bridge.observe('thread', 'turn', { type: 'userMessage', id: 'item-1', clientId: 'echo' })
+  assert.equal(e.outcome.echoedItemId, 'item-1')
+  assert.equal(e.outcome.acceptedTurnId, 'turn')
+})
+
+test('R5 crash after dispatch or acceptance before durable ack recovers uncertain without retry', async t => {
+  let calls = 0
+  const f = controlFixture(t, () => { calls++; return new Promise(() => {}) })
+  await f.bridge.submit(operation('crashed'))
+  const recovered = createSteerControl({ ...f.options, generation: 'new', dispatch: () => assert.fail('unsafe retry') })
+  const e = await recovered.submit(operation('crashed'))
+  assert.equal(e.outcome.status, 'unknown')
+  assert.equal(calls, 1)
+})
+
+test('R5 private Unix HTTP: health negotiation, finite pending response, late ack/query and conflicts', async t => {
+  let finish
+  const f = controlFixture(t, () => new Promise(resolve => { finish = resolve }))
+  const d = await f.bridge.listen()
+  if (d.channel !== 'unix') { t.skip(d.reason); return }
+  assert.equal(statSync(d.socketPath).mode & 0o777, 0o600)
+  assert.equal((await socketCall(d, 'GET', '/health')).body.version, 2)
+  const body = { ...operation('late'), runId: f.control }
+  const initial = await socketCall(d, 'POST', '/messages', body)
+  assert.equal(initial.body.status, 'pending')
+  finish({ turnId: 'turn' })
+  await sleep(10)
+  const final = await socketCall(d, 'GET', '/messages/late')
+  assert.equal(final.body.acceptedTurnId, 'turn')
+  assert.equal((await socketCall(d, 'POST', '/messages', { ...body, text: 'conflict' })).status, 409)
+  assert.equal((await socketCall({ ...d, generation: 'old' }, 'POST', '/messages', body)).status, 409)
+})
+
+test('R5 socket unavailable advertises file fallback and still journals one file operation', async t => {
+  const f = controlFixture(t, async () => ({ turnId: 'turn' }))
+  const longControl = join(f.control, 'x'.repeat(100))
+  mkdirSync(longControl)
+  const bridge = createSteerControl({ ...f.options, control: longControl })
+  t.after(() => bridge.close())
+  const d = await bridge.listen()
+  assert.equal(d.channel, 'file')
+  assert.equal(JSON.parse(readFileSync(join(longControl, 'control.json'), 'utf8')).version, 2)
+  await (await bridge.submit(operation('file'))).done
+  assert.equal(bridge.get('file').status, 'accepted')
+})
+
+test('R5 literal status covers coordinator card, exec FIFO, rejection and unknown without claiming consumption', () => {
+  assert.match(messageStatus(), /Received/)
+  assert.equal(messageStatus({ status: 'accepted', acceptedTurnId: 'X' }), 'Accepted into turn X')
+  assert.equal(messageStatus({ status: 'queued', queuedAfterTurnId: 'X', reason: 'review' }), 'Queued after turn X · review')
+  assert.equal(messageStatus({ status: 'rejected', reason: '<literal>' }), 'Rejected: <literal>')
+  assert.match(messageStatus({ status: 'unknown', messageId: 'm' }), /query m/)
+})
+
+test('R5 raw server -32000 is rejected, while a local connection loss is uncertain', async t => {
+  const f = controlFixture(t, async params => { throw params.clientUserMessageId === 'rpc' ? { code: -32000, message: 'server refusal', data: { raw: true } } : { code: -2, message: 'connection lost', transport: true } })
+  await (await f.bridge.submit(operation('rpc'))).done
+  await (await f.bridge.submit(operation('lost'))).done
+  assert.equal(f.bridge.get('rpc').status, 'rejected')
+  assert.deepEqual(f.bridge.get('rpc').error.data, { raw: true })
+  assert.equal(f.bridge.get('lost').status, 'unknown')
+})
+
+for (const scenario of ['steer-v2-accepted', 'steer-v2-rejected', 'steer-v2-late-ack', 'steer-v2-wrong-ack', 'steer-v2-lost-ack']) test(`live harness ${scenario}: waits without unrelated actions and records one exact message`, async t => {
+  const r = start(scenario)
+  t.after(() => { r.child.kill(); r.cleanup() })
+  await r.waitFor(() => types(r).includes('codexmod.turn'))
+  assert.ok(!r.lines().some(l => l.item || l.source?.item), 'steer harness must not emit generic ls/patch fixture work')
+  writeFileSync(join(r.control, 'steer-harness.json'), JSON.stringify({ text: 'Keep waiting; include MARKER.', messageId: 'harness-source', expectedTurnId: 'turn-1' }))
+  await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.steer' && ['accepted', 'observed', 'rejected', 'unknown'].includes(l.status)))
+  const outcome = r.lines().filter(l => l.type === 'codexmod.steer').at(-1)
+  assert.equal(outcome.messageId, 'harness-source')
+  if (scenario === 'steer-v2-rejected') assert.deepEqual(outcome.error, { code: -32600, message: 'cannot steer a review turn', data: { turnKind: 'review' } })
+  else if (['steer-v2-wrong-ack', 'steer-v2-lost-ack'].includes(scenario)) assert.equal(outcome.status, 'unknown')
+  else assert.equal(outcome.acceptedTurnId, 'turn-1')
+  if (scenario !== 'steer-v2-lost-ack') writeFileSync(join(r.control, 'interrupt'), '')
+  await r.exit
+  assert.equal(r.sent().filter(m => m.method === 'turn/steer').length, 1)
+  assert.ok(!r.lines().some(l => l.item?.type === 'command_execution' || l.item?.type === 'file_change'))
 })
