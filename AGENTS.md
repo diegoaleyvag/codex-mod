@@ -18,15 +18,17 @@ OpenAI Codex CLI, with Codex actions drawn as native rows and never executed by 
 - **Orchestrator (Opus):** plans, writes the task spec, delegates, validates findings,
   and is the only role that integrates, commits and pushes. Push, publish and release
   need the owner's go-ahead.
-- **Implementer:** gpt-6.1-sol through any codex-mod agent (a role this project
-  declares, or `codex-mod:codex` with `codex-model:` / `codex-effort:` lines), or Claude.
-  Normal: Sol medium (or Sonnet medium). High risk or a retry: Sol xhigh (or Opus high).
-  Change Sol's effort, not the model, and raise it only when the task needs it.
+- **Codex first:** implementation, research (including REA, through the `rea` CLI) and
+  review go to Codex through codex-mod agents. Claude subagents are the exception, for work
+  that needs a Claude-only tool (for example an MCP server a Codex launch does not load).
+- **Implementer:** gpt-6.1-sol through any codex-mod agent (a role this project declares,
+  or `codex-mod:codex` with `codex-model:` / `codex-effort:` lines). Normal: Sol medium.
+  High risk or a retry: Sol xhigh. Change Sol's effort, not the model; raise it only when needed.
 - **Orchestrator verification:** the orchestrator checks every phase itself (diff,
   tests, live check); there is no separate per-phase review.
-- **Final reviewer (one per change, from the other model family):** Sol-implemented
-  work gets Fable 5.1 (Opus if unavailable); Claude-implemented work gets `gpt-6-astra`
-  at low or medium effort, read-only. Never both, never per phase or per task.
+- **Final reviewer (one per change):** `gpt-6-astra` at low or medium effort, read-only
+  (`codex-mod:auditor`), once at the end of a whole change; never per phase or per task.
+  A Claude reviewer (Fable, else Opus) only if Astra is unavailable.
 - Two writers never share a checkout; concurrent writers use separate worktrees.
 
 ## Rules for Codex workers
@@ -63,9 +65,8 @@ Passing tests are evidence, not proof of the requirement.
 
 - **Per phase:** the orchestrator verifies (diff, tests, live check) and validates
   its own findings before fixing; no Astra or Fable review per phase.
-- **End of a whole change:** one read-only review by the final reviewer of the other
-  model family (see Roles). The orchestrator validates each finding before fixing; at
-  most 2 fix/review rounds, then escalate to the owner.
+- **End of a whole change:** one read-only Astra review (see Roles). The orchestrator
+  validates each finding before fixing; at most 2 fix/review rounds, then escalate to the owner.
 - **Low risk** (docs, typos, README, comments): no separate review; orchestrator checks the diff.
 - A failed verification is a failed attempt: retry only with new information, at most
   3 attempts, then stop and report.

@@ -31,7 +31,7 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
 - Why: they were silently dropped before 1.1.0; Desktop does not render the coordinator message in the subagent view.
 - Consequences: output contains non-Codex note lines; launch guard still limits launches (one per new message, `maxRunsPerWindow` per 10 minutes).
 
-## D-005 - One cross-model review per change, not per phase
+## D-005 - One cross-model review per change, not per phase (superseded by D-007)
 - Date: 2026-10-18 (1.2.0).
 - Decision: Codex work is implemented with gpt-6.1-sol (medium; xhigh for hard work or a retry).
   The orchestrator verifies each phase itself (diff, tests, live check). One read-only review
@@ -51,3 +51,14 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
 - Consequences: roles load at session start (or registration retry); edits need a new session,
   and cwd changes do not reload them. Existing records retain their profiles; instructions
   come from the loaded snapshot, and invalid project files never block the generic agent.
+
+## D-007 - Codex first, Astra as the one final reviewer
+- Date: 2026-10-18 (1.2.0). Supersedes D-005.
+- Decision: implementation, research (REA through the `rea` CLI) and review go to Codex through
+  codex-mod agents; Sol medium by default, xhigh for hard work or a retry. One read-only
+  gpt-6-astra review (low or medium) covers a whole change at the end. Claude subagents only
+  for Claude-only tools; a Claude reviewer only when Astra is unavailable.
+- Why: the owner prefers to spend Codex capacity over Claude usage; Astra is a different,
+  stronger model than the Sol implementer, which keeps the review independent.
+- Consequences: the final review is no longer cross-family; the orchestrator's own checks
+  (diff, tests, live runs) carry more weight.
