@@ -2,7 +2,8 @@
 // through `--codex <this file>` (a .mjs --codex is run with process.execPath).
 // FAKE_SCENARIO picks the behaviour, FAKE_LOG is a JSONL file where every
 // client message is recorded so tests can assert what the runner sent.
-import { appendFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
@@ -46,6 +47,44 @@ const finishNormally = () => {
   complete('completed')
 }
 
+const batch3Patches = async () => {
+  const items = JSON.parse(readFileSync(new URL('./batch3-app-items.json', import.meta.url), 'utf8'))
+  const images = JSON.parse(readFileSync(new URL('./batch3-images.json', import.meta.url), 'utf8'))
+  // Optional fake-Codex mutations are confined to the explicitly supplied fixture root.
+  // Guards never write these files; without this opt-in the fake only emits evidence.
+  const root = process.env.FAKE_PATCH_ROOT && resolve(process.env.FAKE_PATCH_ROOT)
+  const pathInRoot = path => {
+    const target = resolve(root, path)
+    if (!target.startsWith(root + sep)) throw new Error('fixture path escapes FAKE_PATCH_ROOT')
+    return target
+  }
+  const writeImage = (path, content) => {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, content)
+  }
+  for (const template of items) {
+    if (!turnActive) return
+    const item = { ...template, changes: template.changes.map(c => root ? { ...c, path: pathInRoot(c.path),
+      kind: { ...c.kind, ...(c.kind.move_path ? { move_path: pathInRoot(c.kind.move_path) } : {}) } } : c) }
+    const image = images[item.id] ?? {}
+    if (root && image.before !== undefined) writeImage(item.changes[0].path, image.before)
+    note('item/started', { threadId: THREAD, turnId: TURN, item: { ...item, status: 'inProgress' } })
+    if (root) await new Promise(r => setTimeout(r, Number(process.env.FAKE_PATCH_DELAY_MS ?? 250)))
+    if (!turnActive) return
+    note('item/fileChange/patchUpdated', { threadId: THREAD, turnId: TURN, itemId: item.id, changes: item.changes })
+    if (root) {
+      const c = item.changes[0]
+      if (image.after !== undefined) writeImage(c.kind.move_path ?? c.path, image.after)
+      if (c.kind.type === 'delete' || (c.kind.move_path && image.after !== undefined)) rmSync(c.path, { force: true })
+    }
+    const completed = item.id === 'patch-updated' ? { ...item, changes: [] } : item
+    note('item/completed', { threadId: THREAD, turnId: TURN, item: completed })
+    note('item/completed', { threadId: THREAD, turnId: TURN, item: completed })
+    note('turn/diff/updated', { threadId: THREAD, turnId: TURN, diff: 'aggregate evidence only' })
+  }
+  finishNormally()
+}
+
 createInterface({ input: process.stdin }).on('line', line => {
   const m = JSON.parse(line)
   log(m)
@@ -85,6 +124,10 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch3-patches') {
+        batch3Patches().catch(err => { process.stderr.write(String(err)); process.exit(1) })
+        return
+      }
       if (scenario === 'batch2-exploration') {
         const items = JSON.parse(readFileSync(new URL('./batch2-app-items.json', import.meta.url), 'utf8'))
         for (const item of items) {

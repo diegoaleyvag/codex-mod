@@ -1,0 +1,43 @@
+import type { FileChange } from '../../hooks/codex.ts'
+
+type Case = { id: string; change: FileChange; before?: string; after?: string; status?: string; stable?: boolean; tools: string[] }
+const update = '@@ -1 +1 @@\n-old\n+new\n'
+const gap = 'g'.repeat(100001) + '\n'
+export const batch3Cases: Case[] = [
+  { id: 'raw-add', change: { path: '/work/add', kind: 'add', diff: '+new\n' }, after: 'new\n', tools: ['Write'] },
+  { id: 'header-add', change: { path: '/work/add', kind: { type: 'add' }, diff: '--- /dev/null\n+++ b/add\n@@ -0,0 +1 @@\n+new\n' }, tools: ['Write'] },
+  { id: 'empty-add', change: { path: '/work/empty', kind: { type: 'add' }, diff: '@@ -0,0 +0,0 @@\n' }, after: '', tools: ['Write'] },
+  { id: 'empty-add-image', change: { path: '/work/empty', kind: 'add', diff: '' }, after: '', tools: ['Write'] },
+  { id: 'empty-diff-unknown', change: { path: '/work/add', kind: 'add', diff: '' }, tools: ['Bash'] },
+  { id: 'no-final-newline', change: { path: '/work/add', kind: 'add', diff: '+new\n\\ No newline at end of file\n' }, after: 'new', tools: ['Write'] },
+  { id: 'crlf-add', change: { path: '/work/add', kind: 'add', diff: '+one\r\n+two\r\n' }, after: 'one\r\ntwo\r\n', tools: ['Write'] },
+  { id: 'oversized-add', change: { path: '/work/add', kind: 'add', diff: '+' + 'x'.repeat(100001) + '\n' }, tools: ['Bash'] },
+  { id: 'binary-add', change: { path: '/work/add', kind: 'add', diff: 'Binary files /dev/null and add differ\n' }, after: 'a\0b', tools: ['Bash'] },
+  { id: 'invalid-utf8', change: { path: '/work/add', kind: 'add', diff: '+\ufffd\n' }, after: '\ufffd\n', tools: ['Bash'] },
+  { id: 'racing-add', change: { path: '/work/add', kind: 'add', diff: '+new\n' }, after: 'someone else\n', tools: ['Bash'] },
+  { id: 'update', change: { path: '/work/edit', kind: { type: 'update', move_path: null }, diff: update }, before: 'old\n', after: 'new\n', tools: ['Edit'] },
+  { id: 'exec-string-update', change: { path: '/work/edit', kind: 'update', diff: update }, before: 'old\n', after: 'new\n', tools: ['Edit'] },
+  { id: 'crlf-update', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-old\r\n+new\r\n' }, before: 'old\r\n', after: 'new\r\n', tools: ['Edit'] },
+  { id: 'no-final-newline-update', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n' }, before: 'old', after: 'new', tools: ['Edit'] },
+  { id: 'repeated-old', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-same\n+new\n' }, before: 'same\nsame\n', after: 'new\nsame\n', tools: ['Edit'] },
+  { id: 'pure-insertion', change: { path: '/work/edit', kind: 'update', diff: '@@ -1,0 +2 @@\n+inserted\n' }, before: 'old\ntail\n', after: 'old\ninserted\ntail\n', tools: ['Edit'] },
+  { id: 'insertion-empty-base', change: { path: '/work/edit', kind: 'update', diff: '@@ -0,0 +1 @@\n+new\n' }, before: '', after: 'new\n', tools: ['Bash'] },
+  { id: 'separated-hunks', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-first\n+FIRST\n@@ -3 +3 @@\n-last\n+LAST\n' }, before: 'first\ngap\nlast\n', after: 'FIRST\ngap\nLAST\n', tools: ['Edit'] },
+  { id: 'ordered-hunks', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1,2 @@\n-first\n+FIRST\n+insert\n@@ -3 +4 @@\n-last\n+LAST\n' }, before: 'first\n' + gap + 'last\n', after: 'FIRST\ninsert\n' + gap + 'LAST\n', tools: ['Edit', 'Edit'] },
+  { id: 'unknown-gaps', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-first\n+FIRST\n@@ -30 +30 @@\n-last\n+LAST\n' }, after: 'FIRST\nunknown\nLAST\n', tools: ['Bash'] },
+  { id: 'missing-base', change: { path: '/work/edit', kind: 'update', diff: update }, after: 'new\n', tools: ['Bash'] },
+  { id: 'missing-completed-image', change: { path: '/work/edit', kind: 'update', diff: update }, before: 'old\n', tools: ['Bash'] },
+  { id: 'racing-base', change: { path: '/work/edit', kind: 'update', diff: update }, before: 'new\n', after: 'new\n', tools: ['Bash'] },
+  { id: 'racing-completion', change: { path: '/work/edit', kind: 'update', diff: update }, before: 'old\n', after: 'new\n', stable: false, tools: ['Bash'] },
+  { id: 'no-diff', change: { path: '/work/edit', kind: 'update' }, before: 'old\n', after: 'new\n', tools: ['Bash'] },
+  { id: 'truncated-diff', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-old\n+new' }, before: 'old\n', after: 'new\n', tools: ['Bash'] },
+  { id: 'oversized-update', change: { path: '/work/edit', kind: 'update', diff: '@@ -1 +1 @@\n-' + 'o'.repeat(100001) + '\n+' + 'n'.repeat(100001) + '\n' }, before: 'o'.repeat(100001) + '\n', after: 'n'.repeat(100001) + '\n', tools: ['Bash'] },
+  { id: 'move-edit', change: { path: '/work/old', kind: { type: 'update', move_path: '/work/new' }, diff: update }, before: 'old\n', after: 'new\n', tools: ['Bash'] },
+  { id: 'move-metadata', change: { path: '/work/old', kind: { type: 'update', move_path: '/work/new' }, diff: update }, tools: ['Bash'] },
+  { id: 'exec-move', change: { path: '/work/old', kind: 'update', move_path: '/work/new', diff: update }, before: 'old\n', after: 'new\n', tools: ['Bash'] },
+  { id: 'delete-diff', change: { path: '/work/delete', kind: { type: 'delete' }, diff: '@@ -1 +0,0 @@\n-old\n' }, before: 'old\n', tools: ['Bash'] },
+  { id: 'delete-no-snapshot', change: { path: '/work/delete', kind: 'delete', diff: '-old\n' }, tools: ['Bash'] },
+  { id: 'delete-no-bytes', change: { path: '/work/delete', kind: 'delete' }, tools: ['Bash'] },
+  { id: 'delete-sampled-only', change: { path: '/work/delete', kind: 'delete' }, before: 'possibly racing\n', tools: ['Bash'] },
+  ...['failed', 'declined', 'partial', 'unknown'].map(status => ({ id: status, change: { path: '/work/edit', kind: 'update', diff: update }, before: 'old\n', after: 'new\n', status, tools: ['Bash'] })),
+]

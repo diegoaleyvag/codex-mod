@@ -110,6 +110,7 @@
 // written or deleted by this module.
 
 import { explorationAction, validExploration } from './exploration.ts'
+import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
 import type {
@@ -157,8 +158,6 @@ const MAX_REDELIVER = 6
 const SLOW_AFTER = 60
 const SLOW_MS = 5000
 const MAX_ACTION_STEPS = 300
-// File preview bound; command output is retained verbatim.
-const FILE_MAX = 100000
 const STORE_PREFIX = 'agent:'
 const SESSION_PREFIX = 'session:'
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -433,7 +432,7 @@ export type AgentRecord = Profile & {
  */
 export type FollowUp = { text: string; count: number; uuid?: string }
 
-export type FileChange = { path: string; kind: string; sourceKind?: Record<string, unknown>; diff?: string }
+export type FileChange = { path: string; kind: string | { type: string; move_path?: string | null }; move_path?: string | null; diff?: string; status?: string }
 
 /** Public source evidence, independent of the current choice of display row. */
 export type SourceRecord = {
@@ -524,6 +523,9 @@ export class SourceLedger {
       const previous = this.items.get(key)
       record = { ...previous, ...record, ...(record.item ? { item: { ...previous?.item, ...record.item } } : {}) }
       if (end && record.item?.type === 'fileChange' && !record.item.changes?.length && previous?.item?.changes?.length) record.item.changes = previous.item.changes
+      if (end && record.item?.type === 'fileChange' && previous?.item?.changes) {
+        record.item.changes = record.item.changes?.map((c: any) => ({ ...previous.item!.changes.find((p: any) => p.path === c.path), ...c }))
+      }
       if (record.event === 'item/fileChange/patchUpdated') record.item = { ...previous?.item, type: 'fileChange', id: record.itemId, changes: record.data?.changes }
       this.items.set(key, record)
       if (end) this.completed.add(key)
@@ -565,7 +567,7 @@ export type CodexEvent =
 type ActionResult = Record<string, unknown> | { type: 'text'; text: string }[]
 
 /** One of Codex's actions as a tool call, and the result it is answered with. */
-export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord }
+export type Action = { tool: string; input: Record<string, unknown>; result: ActionResult; error?: string; source?: SourceRecord; patchPath?: string }
 
 type NativeName = typeof NATIVE_TOOLS[number]
 type NativeResult = BuiltinToolResults[Exclude<NativeName, 'Glob' | 'Grep'>] | GlobResult | GrepResult
@@ -608,7 +610,14 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
   if (!isNative(a.tool)) return textBlocks(r)
   if (!object(r)) return false
   switch (a.tool) {
-    case 'Bash': return keysOnly(r, ['stdout', 'stderr', 'interrupted']) && typeof r.stdout === 'string' && typeof r.stderr === 'string' && typeof r.interrupted === 'boolean'
+    case 'Bash': {
+      const d = r.bashEditDiff
+      return keysOnly(r, ['stdout', 'stderr', 'interrupted', 'bashEditDiff']) && typeof r.stdout === 'string' && typeof r.stderr === 'string' && typeof r.interrupted === 'boolean' &&
+        (d === undefined || (object(d) && keysOnly(d, ['files', 'moreFiles', 'changedFiles']) && d.moreFiles === 0 && strings(d.changedFiles) && Array.isArray(d.files) &&
+          d.files.every(f => object(f) && keysOnly(f, ['filePath', 'hunks', 'created', 'deleted']) && typeof f.filePath === 'string' && hunks(f.hunks) &&
+            (f.created === undefined || f.created === true) && (f.deleted === undefined || f.deleted === true) && !(f.created && f.deleted)) &&
+          stableJSON(d.changedFiles) === stableJSON(d.files.map(f => f.filePath))))
+    }
     case 'Edit': return keysOnly(r, ['filePath', 'oldString', 'newString', 'originalFile', 'structuredPatch', 'userModified', 'replaceAll']) && r.filePath === i.file_path && r.oldString === i.old_string && r.newString === i.new_string && (r.originalFile === null || typeof r.originalFile === 'string') && hunks(r.structuredPatch) && r.userModified === false && r.replaceAll === false
     case 'Write': return keysOnly(r, ['type', 'filePath', 'content', 'structuredPatch', 'originalFile']) && ['create', 'update'].includes(r.type) && r.filePath === i.file_path && r.content === i.content && hunks(r.structuredPatch) && (r.originalFile === null || typeof r.originalFile === 'string')
     case 'WebSearch': return keysOnly(r, ['query', 'results', 'durationSeconds']) && r.query === i.query && number(r.durationSeconds) && Array.isArray(r.results) && r.results.every(s => typeof s === 'string' || (object(s) && keysOnly(s, ['tool_use_id', 'content']) && typeof s.tool_use_id === 'string' && s.tool_use_id !== '' && Array.isArray(s.content) && s.content.every(c => object(c) && keysOnly(c, ['title', 'url', 'snippet']) && typeof c.title === 'string' && typeof c.url === 'string' && (c.snippet === undefined || typeof c.snippet === 'string'))))
@@ -630,7 +639,7 @@ const oneLine = (text: string, max = 160): string => {
 
 const changesOf = (item: any): FileChange[] =>
   Array.isArray(item?.changes)
-    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ ...c, kind: typeof c.kind === 'object' ? c.kind?.type : c.kind ?? 'update', ...(object(c.kind) ? { sourceKind: c.kind } : {}) }))
+    ? item.changes.filter((c: any) => typeof c?.path === 'string' && c.path !== '').map((c: any) => ({ ...c }))
     : []
 
 /**
@@ -994,13 +1003,14 @@ export function compact(n: number): string {
  * The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`;
  * an app-server run adds `app-server` (and `N steers`) after the sandbox, a fallback run why it is exec.
  */
-export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number }, mode: FooterMode = 'full'): string {
+export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number }, mode: FooterMode = 'full'): string {
   if (mode === 'off') return ''
   if (mode === 'short') return [p.agent, p.model, p.effort].join(' · ')
   const parts = [p.agent, p.model, p.effort, p.sandbox]
   if (p.transport !== undefined) parts.push(p.transport)
   if (p.steers !== undefined && p.steers > 0) parts.push(`${p.steers} steer${p.steers === 1 ? '' : 's'}`)
   parts.push(`${p.actions} action${p.actions === 1 ? '' : 's'}`)
+  if (p.patches) parts.push(`${p.patches} patch${p.patches === 1 ? '' : 'es'} / ${p.patchRows} file row${p.patchRows === 1 ? '' : 's'}`)
   if (p.usage !== undefined) {
     const fresh = Math.max(0, p.usage.input - p.usage.cached)
     parts.push(`${compact(fresh)} new tokens (${compact(p.usage.cached)} cached, ${compact(p.usage.output)} out)`)
@@ -1119,9 +1129,6 @@ export function describeCommand(command: string): string {
   return DESCRIBE[prog] ?? (prog ? `Run ${prog}` : 'Run a command')
 }
 
-const clipHead = (text: string, max: number): string =>
-  text.length > max ? `${text.slice(0, max)}\n[... ${text.length - max} more characters not shown]` : text
-
 /** A finished command as a `Bash` call answered with Codex's output and exit code. */
 export function commandAction(command: string, output: string, exitCode: number | null, status?: string): Action {
   const inner = unwrapShell(command)
@@ -1139,87 +1146,6 @@ export function commandAction(command: string, output: string, exitCode: number 
   }
 }
 
-type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }
-
-/** The changed region of `before` -> `after` as Edit's old/new strings and one hunk (3 lines of context). */
-export function diffEdit(before: string, after: string): { oldString: string; newString: string; hunk: Hunk } | undefined {
-  if (before === after || before === '') return undefined
-  const a = before.split('\n')
-  const b = after.split('\n')
-  let p = 0
-  while (p < a.length && p < b.length && a[p] === b[p]) p++
-  let s = 0
-  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++
-  // a pure insertion: take one neighbouring line in, so old_string is not empty
-  if (a.length - s - p === 0) {
-    if (p > 0) p--
-    else if (s > 0) s--
-  }
-  const oldMid = a.slice(p, a.length - s)
-  const newMid = b.slice(p, b.length - s)
-  const pre = a.slice(Math.max(0, p - 3), p)
-  const post = a.slice(a.length - s, Math.min(a.length, a.length - s + 3))
-  const start = p - pre.length + 1
-  return {
-    oldString: oldMid.join('\n'),
-    newString: newMid.join('\n'),
-    hunk: {
-      oldStart: start,
-      oldLines: pre.length + oldMid.length + post.length,
-      newStart: start,
-      newLines: pre.length + newMid.length + post.length,
-      lines: [...pre.map(l => ` ${l}`), ...oldMid.map(l => `-${l}`), ...newMid.map(l => `+${l}`), ...post.map(l => ` ${l}`)],
-    },
-  }
-}
-
-const shellQuote = (s: string) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
-
-/**
- * One file change as a call: an added file (or an update whose previous text
- * is unknown) as `Write` with its content now; an update with a known
- * previous text as `Edit`; a deletion, or a file that cannot be read as text,
- * as a `Bash` row whose command is a shell comment.
- */
-export function fileAction(change: FileChange, rel: string, before: string | undefined, after: string | undefined): Action {
-  const path = change.path
-  const note = (what: string, description: string): Action => ({
-    tool: 'Bash',
-    input: { command: `# codex apply_patch: ${what} ${shellQuote(rel)}`, description },
-    result: { stdout: '', stderr: '', interrupted: false },
-  })
-  if (change.kind === 'delete') return note('delete', 'Delete file')
-  if (after === undefined || after.includes('\u0000')) return note(change.kind, change.kind === 'add' ? 'Create file' : 'Edit file')
-  const edit = change.kind === 'add' || before === undefined ? undefined : diffEdit(before, after)
-  if (edit !== undefined && edit.oldString.length <= FILE_MAX && edit.newString.length <= FILE_MAX) {
-    return {
-      tool: 'Edit',
-      input: { file_path: path, old_string: edit.oldString, new_string: edit.newString },
-      result: {
-        filePath: path,
-        oldString: edit.oldString,
-        newString: edit.newString,
-        originalFile: before!.length <= FILE_MAX ? before! : null,
-        structuredPatch: [edit.hunk],
-        userModified: false,
-        replaceAll: false,
-      },
-    }
-  }
-  const content = clipHead(after, FILE_MAX)
-  return {
-    tool: 'Write',
-    input: { file_path: path, content },
-    result: {
-      type: change.kind === 'add' ? 'create' : 'update',
-      filePath: path,
-      content,
-      structuredPatch: [],
-      originalFile: before !== undefined && before.length <= FILE_MAX ? before : null,
-    },
-  }
-}
-
 /** One action as a plain text line (nativeActions off). */
 export function actionLine(a: Action): string {
   if (['Read', 'Glob', 'Grep'].includes(a.tool)) return `$ ${oneLine(String(a.source?.item?.command), 300)} (${a.tool}, cwd ${String(a.source?.cwd)})`
@@ -1232,7 +1158,7 @@ export function actionLine(a: Action): string {
   const result = Array.isArray(a.result) ? {} : a.result
   if (a.tool === 'Write') return `${result.type === 'create' ? 'Created' : 'Wrote'} ${String(a.input.file_path)}`
   const cmd = String(a.input.command)
-  if (cmd.startsWith('# codex apply_patch: ')) return `${String(a.input.description)}: ${cmd.slice('# codex apply_patch: '.length).replace(/^\S+\s+/, '')}`
+  if (cmd.startsWith('# Codex apply_patch: ')) return `${String(a.input.description)}\n${a.error ?? result.stdout}`
   const err = String(result.stderr ?? '')
   const status = a.error ? /exit code \d+/.exec(a.error)?.[0] ?? 'failed or declined' : err.toLowerCase()
   return `$ ${oneLine(cmd, 300)}${status !== '' ? ` (${status})` : ''}`
@@ -1416,6 +1342,8 @@ type Run = {
   // file text as last seen, for Edit's old/new strings
   snapshots: Map<string, string>
   actions: number
+  patches: number
+  patchRows: number
   actionSteps: number
   lastEmit: number
   ended: boolean
@@ -1525,9 +1453,21 @@ export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentI
 function holdAnswer(id: string, sid: string, agentId: string, action: Action): boolean {
   if (!validAction(action)) return false
   const status = action.source?.item?.status
-  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status)) return false
+  const patch = action.source?.item?.type === 'fileChange'
+  const file = patch && action.patchPath !== undefined ? changesOf(action.source!.item).find(c =>
+    absolute(action.source!.cwd ?? '', c.path) === action.patchPath) : undefined
+  const completedFile = file?.status === 'completed'
+  if (['Write', 'Edit'].includes(action.tool)) {
+    const kind = typeof file?.kind === 'string' ? file.kind : file?.kind?.type
+    const move = typeof file?.kind === 'object' ? file.kind?.move_path : file?.move_path
+    if (!file || action.patchPath !== action.input.file_path || move || kind !== (action.tool === 'Write' ? 'add' : 'update')) return false
+  }
+  // Unconfirmed patches still need native error rows. Individual success must
+  // be explicitly reported for this file; a sampled filesystem change cannot grant it.
+  if (patch && !action.error && status !== 'completed' && !completedFile) return false
+  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status) && !completedFile && !(patch && action.error)) return false
   const noMatches = ['Grep', 'Bash'].includes(action.tool) && action.source?.item?.exitCode === 1 && explorationAction(action.source)?.tool === 'Grep'
-  if (['failed', 'declined'].includes(status) && !action.error && !noMatches) return false
+  if (['failed', 'declined'].includes(status) && !action.error && !noMatches && !completedFile) return false
   // Snapshot before handing anything to core; later caller/input mutations must
   // never alter the answer or its source binding.
   const snapshot: Action = JSON.parse(JSON.stringify(action))
@@ -2449,6 +2389,8 @@ async function* startRun(
     queue: [],
     snapshots: new Map(),
     actions: 0,
+    patches: 0,
+    patchRows: 0,
     actionSteps: 0,
     // the first action goes out at once
     lastEmit: -Infinity,
@@ -2619,15 +2561,19 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
   const captured = source ? run.ledger.capture(source) : undefined
   if (captured?.render === false) return
   const ev = parseCodexLine(line, cfg.richRows, todoWriteAvailable)
-  if (ev.kind === 'files' && captured?.record.item) ev.changes = changesOf(captured.record.item)
+  if ((ev.kind === 'files' || ev.kind === 'fileStart') && captured?.record.item) ev.changes = changesOf(captured.record.item)
   await handle($, run, ev, captured?.record)
 }
 
-const absolute = (cwd: string, p: string) => (p.startsWith('/') ? p : `${cwd.replace(/\/$/, '')}/${p}`)
-const relative = (cwd: string, p: string) => {
-  const root = `${cwd.replace(/\/$/, '')}/`
-  return p.startsWith(root) ? p.slice(root.length) : p
+export const absolute = (cwd: string, path: string) => {
+  const parts: string[] = []
+  for (const part of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
+    // Let the filesystem resolve parents; collapsing them could cross a symlink.
+    if (part !== '' && part !== '.') parts.push(part)
+  }
+  return '/' + parts.join('/')
 }
+const snapshotKey = (source: SourceRecord | undefined, path: string) => JSON.stringify([source?.threadId, source?.turnId, source?.itemId, path])
 
 /** A file's text (read only), or undefined when it cannot be read. */
 async function readText($: EngineInterface, path: string): Promise<string | undefined> {
@@ -2640,7 +2586,7 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
 }
 
 const remember = (run: Run, path: string, text: string | undefined) => {
-  if (text !== undefined && text.length <= 4 * FILE_MAX) run.snapshots.set(path, text)
+  if (text !== undefined && text.length <= 4 * PATCH_TEXT_MAX) run.snapshots.set(path, text)
   else run.snapshots.delete(path)
 }
 
@@ -2722,25 +2668,48 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     if (source?.item?.status === 'inProgress') return
     run.queue.push({ kind: 'action', action: explorationAction(source) ?? { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
   } else if (ev.kind === 'fileStart') {
-    // the text before the patch, when it is read in time (best effort)
     for (const c of ev.changes) {
-      const path = absolute(run.cwd, c.path)
-      if (c.kind !== 'add' && !run.snapshots.has(path)) remember(run, path, await readText($, path))
+      const path = absolute(source?.cwd ?? run.cwd, c.path)
+      const kind = (typeof c.kind === 'object' ? c.kind?.type : c.kind) ?? 'unknown'
+      const key = snapshotKey(source, path)
+      if (kind !== 'add' && !run.snapshots.has(key)) remember(run, key, await readText($, path))
     }
   } else if (ev.kind === 'files') {
     if (source?.item?.status === 'inProgress') return
+    // Count source patches independently of files and ordered hunk rows.
+    run.actions++
+    run.patches++
+    if (ev.changes.length > 1) run.queue.push({ kind: 'note', text: `Codex apply_patch ${source?.itemId ?? '(ID unreported)'}: ${ev.changes.length} files in one source patch.` })
+    if (!ev.changes.length) {
+      const status = source?.item?.status
+      const report = `Codex patch ${status ?? 'outcome unconfirmed'}; paths unreported.\n${JSON.stringify(source?.item ?? {})}`
+      run.patchRows++
+      run.queue.push({ kind: 'action', action: { tool: 'Bash', source,
+        input: { command: '# Codex apply_patch: paths unreported', description: `Codex patch ${status ?? 'outcome unconfirmed'}: paths unreported` },
+        result: { stdout: report, stderr: '', interrupted: false }, ...(status === 'completed' ? {} : { error: report }),
+      } })
+    }
     for (const c of ev.changes) {
-      run.actions++
-      const path = absolute(run.cwd, c.path)
-      const before = run.snapshots.get(path)
-      const after = c.kind === 'delete' ? undefined : await readText($, path)
-      const action = fileAction({ ...c, path }, relative(run.cwd, path), before, after)
-      action.source = source
-      if (['failed', 'declined'].includes(source?.item?.status)) {
-        action.error = `Codex patch ${source!.item!.status}: ${JSON.stringify(source!.item)}`
+      const cwd = source?.cwd ?? run.cwd
+      const path = absolute(cwd, c.path)
+      const key = snapshotKey(source, path)
+      const before = run.snapshots.get(key)
+      const kind = (typeof c.kind === 'object' ? c.kind?.type : c.kind) ?? 'unknown'
+      const move = typeof c.kind === 'object' ? c.kind?.move_path : c.move_path
+      const destination = typeof move === 'string' ? absolute(cwd, move) : undefined
+      const after = kind === 'delete' ? undefined : await readText($, destination ?? path)
+      const stable = kind === 'delete' || after === await readText($, destination ?? path)
+      const change = { ...c, path, ...(destination ? { kind: { type: kind, move_path: destination } } : {}) }
+      const report = JSON.stringify(Object.fromEntries(Object.entries(source?.item ?? {}).filter(([key]) => key !== 'changes')))
+      const actions = patchActions(change, before, after, c.status ?? source?.item?.status, report, stable)
+      run.patchRows += actions.length
+      if (actions.length > 1) run.queue.push({ kind: 'note', text: `Codex apply_patch ${source?.itemId ?? '(ID unreported)'}: ${path}, ${actions.length} ordered hunk rows for one file.` })
+      for (const action of actions) {
+        action.source = source
+        action.patchPath = path
+        run.queue.push({ kind: 'action', action })
       }
-      run.queue.push({ kind: 'action', action })
-      remember(run, path, after)
+      run.snapshots.delete(key)
     }
   }
 }
@@ -2960,6 +2929,13 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
       }
       if (!tools.has(q.action.tool)) {
+        if (['Write', 'Edit'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item) {
+          const original = q.action
+          const cwd = original.source!.cwd ?? run.cwd
+          const change = changesOf(original.source!.item).find(c => absolute(cwd, c.path) === original.input.file_path)
+          if (change) q.action = { ...patchActions({ ...change, path: String(original.input.file_path) }, undefined, undefined,
+            change.status ?? original.source!.item!.status, '', true, `${original.tool} unavailable in this agent's tools.`)[0]!, source: original.source, patchPath: original.patchPath }
+        }
         if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item) {
           const original = q.action
           const item = original.source!.item!
@@ -2978,7 +2954,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
           q.action = { tool: displayTools.codex_tool,
             input: { server: 'codex', name: original.tool, arguments: original.input },
             result: [{ type: 'text', text: `${reason}\n${JSON.stringify(original.result)}` }],
-            source: original.source, ...(original.error ? { error: original.error } : {}) }
+            source: original.source, patchPath: original.patchPath, ...(original.error ? { error: original.error } : {}) }
         } else {
           blocks.push({ text: `${reason}; display tool unavailable\n${JSON.stringify(original.input)}\n${original.error ?? JSON.stringify(original.result)}` })
           continue
@@ -3075,7 +3051,7 @@ async function* complete(
     const queued = [...followUpsOf(rec), ...run.followUps]
     rec.followUps = queued.length > 0 ? queued : undefined
   }
-  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, steers: run.steers }, cfg.footer)
+  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, steers: run.steers, patches: run.patches, patchRows: run.patchRows }, cfg.footer)
   const shown = [run.carry, body].filter(Boolean).join('\n\n')
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile

@@ -29,7 +29,7 @@ because the engine refuses any other tool before the guard sees it.
 | Same, single faithful content/files/count search | Search under "Exploring" | Search results | Guarded `Grep`; ripgrep JSON content or NUL-delimited filenames/match counts; documented no-match exit succeeds | 1.2 | Single `search` action, query/path/options, fixed-string escaping, exact delivered output and decoded filenames/counts |
 | Same, every incompatible/ambiguous command; normal exec without actions | "Running" / "Ran" | "Running {command}" / "Ran {command}" | One `Bash` row, including pipelines, multiple actions, redirects/substitutions, unknown slice totals, directory listings and real failures | mapped | Original command, combined output, status/exit; no inferred successful exit |
 | Command output deltas / terminal interactions / completion replay | Running shell activity | Running shell activity | One final C1–C5 row per item, no extra poll/keypress row | 1.2 | Thread/turn/item/process identity, retained deltas/stdin, authoritative completed output |
-| `file_change` / `fileChange` | "Added" / "Edited" / "Deleted" with a diff | "Editing/Edited", "Creating/Created", "Deleting/Deleted" per file, a diff toggle, +/- counts | `Edit` / `Write` rows (deletes as a `Bash` note) | mapped | `changes[].path`, `kind`; app-server adds a per-file `diff` |
+| `file_change` / `fileChange` | "Added" / "Edited" / "Deleted" with a diff | "Editing/Edited", "Creating/Created", "Deleting/Deleted" per file, a diff toggle, +/- counts | Exact additions → `Write`; verified unique replacement spans → `Edit`; bounded exact hunks → ordered `Edit` rows. Other patches → typed `Bash.bashEditDiff` with a display comment; deletions use `deleted:true`, verified moves use old deleted/new created images. Failed/declined/unconfirmed attempts deny. | 1.2 | Original structured/string `kind`, `move_path`, verbatim per-file `diff`, completed status, source cwd and item-scoped before/stable-after evidence; patchUpdated merges, aggregate turn diffs never add rows |
 | `reasoning` / `reasoning` | Status header from the summary; summary in dim text | "Thinking" while it streams, then "Thought for {time}", collapsed by default | `thinking` stream chunk (summary only) | 1.2 | `summary[]` (app-server deltas: `summaryTextDelta`, `summaryPartAdded`); the exec item `text` |
 | `todo_list` (exec) / `turn/plan/updated` notification | "Updated Plan" with a checklist | Progress ring plus current step, "Step n / m" | Display-only `codex_plan` row; guarded `TodoWrite` with `richRows` when admitted | 1.2 | `items[{text, completed}]` (exec); `plan[{step, status}]`, `explanation` |
 | — / `plan` (plan mode) | "Proposed Plan" block | "Plan" card ("Writing plan" while it streams), expandable | Text block headed "Proposed plan:" | 1.2 | `text` |
@@ -88,3 +88,31 @@ Every other row in the table needs the `app-server` transport.
 - Exact Codex wording and layout: Claude Code draws its own rows. A `ui.render` hook can
   relabel a row, but how faithfully Desktop draws custom trees is not verified.
 - Exploration adapters use a bounded literal parser; unsupported forms keep Bash. Native result schemas come from Read's declaration and Glob/Grep's runtime contracts in the research matrix. Grep content decodes matching/context lines and counts delivered lines, retaining raw JSON in the source record. Native grouping/paint, clipping behavior and reopened command visibility still require a NEW Desktop session; unit/schema checks do not establish them.
+
+## Exact patches (Batch 3)
+
+`hooks/patches.ts` parses unified per-file hunks and raw prefixed add/delete
+lines, preserving CRLF and explicit no-newline markers. A complete addition can
+supply Write even when no image is readable; a disagreeing/unstable image refuses
+that translation. Empty ambiguous diffs require an empty completed image.
+Updates require a captured base, strict coordinates/content and matching stable
+completion reads. Exact gaps may join hunks; otherwise each bounded replacement
+must be unique at its intermediate revision or the whole file falls back to Bash.
+A sampled update with no source diff never becomes Write.
+
+Bash uses a comment headed `# Codex apply_patch:` and a typed `bashEditDiff`
+result (`files`, `moreFiles:0`, `changedFiles`), with only known hunks and literal
+true creation/deletion flags. Undecodable diffs remain literal stdout. Moves
+retain both paths and modification diff; old/new image hunks require verification.
+Source failure/decline/unknown status returns `deny` with the actual report and
+attempted diff. Explicit per-file completed evidence can admit that file after
+an overall failure; unproved partial application remains an error. Guards never
+call executors or write patch files. One source patch can produce several native
+rows; adjacent notes, row provenance and footer counts preserve that distinction.
+
+Contracts: research R1 Bash (246–266), Edit (394–414), Write (1902–1922), and
+R2 apply_patch plus generated `FileUpdateChange`, `PatchChangeKind` and
+`FileChangePatchUpdatedNotification` types. See `tests/fixtures/batch3-harness.md`
+for headless mapper checks and NEW Desktop session acceptance. Typed Bash patch
+admission, native paint/counts/grouping and working-tree/Git effects are still
+unverified live; no custom-card fallback is selected without observed paint evidence.

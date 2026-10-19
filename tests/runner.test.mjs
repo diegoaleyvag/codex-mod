@@ -451,3 +451,56 @@ test('batch 2 exploration: action evidence and exact output survive start/delta/
     assert.ok(!lines.some(l => l.type === 'codexmod.protocol'))
   } finally { r.cleanup() }
 })
+
+test('batch 3 patches: exact per-file kinds/diffs, patchUpdated, failures and aggregate evidence survive once', async () => {
+  const r = start('batch3-patches')
+  try {
+    const { code } = await r.exit
+    assert.equal(code, 0, r.stderr())
+    const fixtures = JSON.parse(readFileSync(join(here, 'fixtures/batch3-app-items.json'), 'utf8'))
+    const completed = r.lines().filter(l => l.source?.event === 'item/completed' && l.source.item.type === 'fileChange')
+    assert.equal(completed.length, fixtures.length)
+    for (const item of fixtures) {
+      const line = completed.find(l => l.source.item.id === item.id)
+      assert.deepEqual(line.source.item, item.id === 'patch-updated' ? { ...item, changes: [] } : item)
+      assert.equal(line.item.status, item.status)
+      const patch = r.lines().find(l => l.source?.event === 'item/fileChange/patchUpdated' && l.source.data.itemId === item.id)
+      assert.deepEqual(patch.source.data.changes, item.changes)
+    }
+    assert.equal(r.lines().filter(l => l.source?.event === 'turn/diff/updated').length, fixtures.length)
+    assert.ok(!r.lines().some(l => l.type === 'codexmod.protocol'))
+    assert.ok(completed.find(l => l.source.item.id === 'crlf').item.changes[0].diff.includes('\r\n'))
+    assert.ok(completed.find(l => l.source.item.id === 'no-final-newline').item.changes[0].diff.includes('\\ No newline at end of file'))
+  } finally { r.cleanup() }
+})
+
+test('batch 3 optional fake-Codex images stay in the supplied disposable root', async () => {
+  const env = { FAKE_PATCH_DELAY_MS: '5' }
+  const r = start('batch3-patches', { env, setup: control => { env.FAKE_PATCH_ROOT = join(control, '..', 'images') } })
+  try {
+    const { code } = await r.exit
+    assert.equal(code, 0, r.stderr())
+    const root = env.FAKE_PATCH_ROOT
+    assert.equal(readFileSync(join(root, 'batch3/empty.txt'), 'utf8'), '')
+    assert.equal(readFileSync(join(root, 'batch3/no-final-newline.txt'), 'utf8'), 'new')
+    assert.equal(readFileSync(join(root, 'batch3/crlf.txt'), 'utf8'), 'one\r\ntwo\r\n')
+    assert.equal(readFileSync(join(root, 'batch3/edit.txt'), 'utf8'), 'new\n')
+    assert.equal(readFileSync(join(root, 'batch3/moved.txt'), 'utf8'), 'new\n')
+    assert.equal(existsSync(join(root, 'batch3/move-edit.txt')), false)
+    assert.equal(existsSync(join(root, 'batch3/delete-diff.txt')), false)
+    assert.equal(readFileSync(join(root, 'batch3/partial-unknown.txt'), 'utf8'), 'new\n')
+    const move = r.lines().find(l => l.source?.item?.id === 'move-edit' && l.type === 'item.completed')
+    assert.equal(move.item.changes[0].kind.move_path, join(root, 'batch3/moved.txt'))
+  } finally { r.cleanup() }
+})
+
+test('batch 3 exec harness fixture retains string kinds, move paths, exact text and outcomes', () => {
+  const lines = readFileSync(join(here, 'fixtures/batch3-exec.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  const completed = lines.filter(l => l.item?.type === 'file_change')
+  assert.equal(completed.length, 22)
+  assert.ok(completed.every(l => l.item.changes.every(c => typeof c.kind === 'string')))
+  assert.equal(completed.find(l => l.item.id === 'move-edit').item.changes[0].move_path, 'batch3/moved.txt')
+  assert.equal(completed.find(l => l.item.id === 'crlf').item.changes[0].diff, '+one\r\n+two\r\n')
+  assert.equal(completed.find(l => l.item.id === 'partial-unknown').item.status, 'failed')
+  assert.equal(completed.find(l => l.item.id === 'exec-no-diff').item.changes[0].diff, undefined)
+})

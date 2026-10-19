@@ -2,7 +2,10 @@ import { test, expect } from 'claude-code/testing'
 import type { BuiltinToolResults, On } from 'claude-code'
 import { explorationAction, literalWords } from '../hooks/exploration.ts'
 import { batch2Cases } from './fixtures/batch2-cases.ts'
-import { compact, diffEdit, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, fileAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
+import { batch3Cases } from './fixtures/batch3-cases.ts'
+import { patchActions, parsePatch } from '../hooks/patches.ts'
+import { absolute } from '../hooks/codex.ts'
+import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -132,6 +135,7 @@ type WorldOpts = {
   store?: Map<string, unknown>
   /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
+  readFile?: (path: string, text: string | undefined) => string | undefined
   /** False: the agent's conversation lacks the host's SubagentHandback reminder. */
   handback?: boolean
   /** `$.session.messages({ as: "api" })` is denied (rows only). */
@@ -205,7 +209,7 @@ function world(on: On, opts: WorldOpts = {}) {
     // The host resolves relative reads before dispatching this mock hook.
     const path = e.path.endsWith('/.claude/codex-mod.json') ? '.claude/codex-mod.json' : e.path
     reads.push(path)
-    const text = files.get(path)
+    const text = opts.readFile ? opts.readFile(path, files.get(path)) : files.get(path)
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
@@ -323,8 +327,8 @@ const out = (line: string): Piece => ({ stream: 'stdout', text: `${line}\n` })
 const cmdDone = (command: string, output = '', exit: number | null = 0) =>
   out(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command, aggregated_output: output, exit_code: exit, status: exit === 0 ? 'completed' : 'failed' } }))
 const cmdStart = (command: string) => out(JSON.stringify({ type: 'item.started', item: { type: 'command_execution', command, aggregated_output: '', exit_code: null } }))
-const fileEv = (type: 'item.started' | 'item.completed', path: string, kind: string) =>
-  out(JSON.stringify({ type, item: { type: 'file_change', changes: [{ path, kind }] } }))
+const fileEv = (type: 'item.started' | 'item.completed', path: string, kind: string, diff?: string, id?: string) =>
+  out(JSON.stringify({ type, item: { type: 'file_change', id, status: type === 'item.completed' ? 'completed' : 'in_progress', changes: [{ path, kind, diff }] } }))
 const THREAD = (id: string) => out(JSON.stringify({ type: 'thread.started', thread_id: id }))
 const MESSAGE = (text: string) => out(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }))
 const USAGE = out('{"type":"turn.completed","usage":{"input_tokens":21269,"cached_input_tokens":20992,"output_tokens":46}}')
@@ -642,7 +646,7 @@ test('a failed command keeps its output and says its exit code', async ($, on) =
   expect(r.deny).toBe('Codex command failed (exit code 1):\nls: nope: No such file or directory\n')
 })
 
-test('file changes: add is Write (content from disk), update is Edit (old/new), delete is a comment-only Bash row', async ($, on) => {
+test('file changes: exact add/update use Write/Edit; deletion uses a display comment', async ($, on) => {
   const P = '/tmp/project/notes.txt'
   const files = new Map<string, string>()
   const w = world(on, {
@@ -650,9 +654,10 @@ test('file changes: add is Write (content from disk), update is Edit (old/new), 
     pieces: [
       THREAD('t-3'),
       fileEv('item.started', P, 'add'),
-      fileEv('item.completed', P, 'add'),
+      fileEv('item.completed', P, 'add', '+alpha\n+beta\n'),
       fileEv('item.started', P, 'update'),
-      fileEv('item.completed', P, 'update'),
+      () => { files.set(P, 'alpha\ngamma\n'); return true },
+      fileEv('item.completed', P, 'update', '@@ -2 +2 @@\n-beta\n+gamma\n'),
       fileEv('item.completed', P, 'delete'),
       MESSAGE('edited'),
     ],
@@ -662,23 +667,22 @@ test('file changes: add is Write (content from disk), update is Edit (old/new), 
   const s1 = await step($, 'agent-files', 0)
   expect(callsOf(s1.chunks).map(c => [c.name, c.input])).toEqual([['Write', { file_path: P, content: 'alpha\nbeta\n' }]])
   const [w1] = await runCalls($, s1.chunks, 'agent-files')
-  expect(w1.result).toEqual({ type: 'create', filePath: P, content: 'alpha\nbeta\n', structuredPatch: [], originalFile: null })
-  files.set(P, 'alpha\ngamma\n')
+  expect(w1.result).toEqual({ type: 'create', filePath: P, content: 'alpha\nbeta\n', structuredPatch: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 2, lines: ['+alpha', '+beta'] }], originalFile: null })
   const s2 = await step($, 'agent-files', 1)
-  expect(callsOf(s2.chunks).map(c => [c.name, c.input])).toEqual([['Edit', { file_path: P, old_string: 'beta', new_string: 'gamma' }]])
+  expect(callsOf(s2.chunks).map(c => [c.name, c.input])).toEqual([['Edit', { file_path: P, old_string: 'beta\n', new_string: 'gamma\n', replace_all: false }]])
   const [e2] = await runCalls($, s2.chunks, 'agent-files')
   expect(e2.result).toEqual({
-    filePath: P, oldString: 'beta', newString: 'gamma', originalFile: 'alpha\nbeta\n', userModified: false, replaceAll: false,
-    structuredPatch: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' alpha', '-beta', '+gamma', ' '] }],
+    filePath: P, oldString: 'beta\n', newString: 'gamma\n', originalFile: 'alpha\nbeta\n', userModified: false, replaceAll: false,
+    structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ['-beta', '+gamma'] }],
   })
   files.delete(P)
   w.clock.now += 5000
   const s3 = await step($, 'agent-files', 2)
-  expect(callsOf(s3.chunks).map(c => [c.name, c.input])).toEqual([['Bash', { command: '# codex apply_patch: delete notes.txt', description: 'Delete file' }]])
+  expect(callsOf(s3.chunks).map(c => [c.name, c.input])).toEqual([['Bash', { command: "# Codex apply_patch: delete '/tmp/project/notes.txt'", description: "Codex patch: delete '/tmp/project/notes.txt'" }]])
   await runCalls($, s3.chunks, 'agent-files')
   expect(w.core).toEqual([])
   const s4 = await step($, 'agent-files', 3)
-  expect(lastLine(handback(s4.result))).toContain(' · 3 actions · thread t-3')
+  expect(lastLine(handback(s4.result))).toContain(' · 3 actions · 3 patches / 3 file rows · thread t-3')
 })
 
 test('throttling: actions done within a second go out in one step, one call each; at most 10 per step', async ($, on) => {
@@ -932,8 +936,6 @@ test('helpers: shell unwrapping, descriptions, footer numbers, MCP names, diffs'
   expect(footer({ agent: 'codex', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', actions: 3, usage: { input: 192000, cached: 154000, output: 631 }, thread: '01a14f50-c51c' }))
     .toBe('codex · gpt-6-luna · low · workspace-write · 3 actions · 38K new tokens (154K cached, 631 out) · thread 01a14f50')
   expect(mcpServerNames(CONFIG_TOML)).toEqual(['node_repl', 'computer-use', 'quoted_ok'])
-  expect(diffEdit('a\nb\nc\n', 'a\nb\nX\nc\n')).toMatchObject({ oldString: 'b', newString: 'b\nX' })
-  expect(diffEdit('same', 'same')).toBe(undefined)
 })
 
 // ---- session.start ---------------------------------------------------------
@@ -3384,7 +3386,7 @@ test('foundation schema boundary: every baseline success, malformed Agent/search
   const web: any = parseCodexLine(itemLine(webItem))
   web.action.result.results[0].tool_use_id = 'real-display-id'
   const plan: any = parseCodexLine(itemLine(planItem), true, true)
-  const actions = [commandAction('printf ok', 'ok\n', null), fileAction({ path: '/a', kind: 'add' }, 'a', undefined, 'new\n'), fileAction({ path: '/a', kind: 'update' }, 'a', 'old\n', 'new\n'), web.action, spawn.action, plan.action,
+  const actions = [commandAction('printf ok', 'ok\n', null), patchActions({ path: '/a', kind: 'add', diff: '+new\n' }, undefined, 'new\n', 'completed')[0]!, patchActions({ path: '/a', kind: 'update', diff: '@@ -1 +1 @@\n-old\n+new\n' }, 'old\n', 'new\n', 'completed')[0]!, web.action, spawn.action, plan.action,
     { tool: 'codex_tool', input: { server: 'docs', name: 'inspect', arguments: {} }, result: [{ type: 'text', text: 'ok' }] }]
   for (const a of actions) expect(validAction(a)).toBe(true)
   for (const a of [
@@ -3526,13 +3528,13 @@ test('foundation all baseline answer inputs bind exactly, including nested argum
   const files = new Map([[editPath, 'before\n'], ['/tmp/project/add.txt', 'added\n']])
   const items = [
     { type: 'command_execution', id: 'cmd', command: 'printf ok', status: 'completed', aggregated_output: 'ok\n', exit_code: 0 },
-    { type: 'file_change', id: 'write', status: 'completed', changes: [{ path: 'add.txt', kind: 'add' }] },
-    { type: 'file_change', id: 'edit', status: 'completed', changes: [{ path: editPath, kind: 'update' }] },
+    { type: 'file_change', id: 'write', status: 'completed', changes: [{ path: 'add.txt', kind: 'add', diff: '+added\n' }] },
+    { type: 'file_change', id: 'edit', status: 'completed', changes: [{ path: editPath, kind: 'update', diff: '@@ -1 +1 @@\n-before\n+after\n' }] },
     { ...webItem, id: 'web' }, { ...spawnItem, id: 'spawn' }, { ...planItem, id: 'plan' },
     { ...mcpItem, id: 'mcp', arguments: { nested: { token: 'original' } } },
   ]
   let sid = 'sess-1'
-  const w = world(on, { sessionId: () => sid, files, pieces: [fileEv('item.started', editPath, 'update'), () => { files.set(editPath, 'after\n'); return true }, out(items.map(i => itemLine(i)).join('\n')), MESSAGE('Done')] })
+  const w = world(on, { sessionId: () => sid, files, pieces: [fileEv('item.started', editPath, 'update', undefined, 'edit'), () => { files.set(editPath, 'after\n'); return true }, out(items.map(i => itemLine(i)).join('\n')), MESSAGE('Done')] })
   const s = await step($, 'agent-progress')
   const calls = callsOf(s.chunks)
   expect(calls.map(c => c.name)).toEqual(['Bash', 'Write', 'Edit', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool'])
@@ -3830,3 +3832,214 @@ test('batch 2 exploration tools are admitted in each registered Codex agent inde
   await startSession($)
   for (const spec of specs) for (const tool of ['Read', 'Glob', 'Grep']) expect(spec.tools.includes(tool)).toBe(true)
 })
+
+for (const c of batch3Cases) {
+  test(`batch 3 exact patch: ${c.id}`, () => {
+    const rows = patchActions(c.change, c.before, c.after, c.status ?? 'completed', 'Actual source report', c.stable)
+    expect(rows.map(r => r.tool)).toEqual(c.tools)
+    let revision = c.before
+    for (const row of rows) {
+      expect(validAction(row)).toBe(true)
+      expect(JSON.stringify(row.input)).not.toContain('more characters not shown')
+      if (row.tool === 'Write') {
+        expect(row.input.content).toBe(c.after ?? 'new\n')
+        expect(row.result).toMatchObject({ type: 'create', originalFile: null, content: row.input.content })
+      } else if (row.tool === 'Edit') {
+        const old = String(row.input.old_string)
+        expect(old).not.toBe('')
+        expect(revision!.indexOf(old)).toBe(revision!.lastIndexOf(old))
+        expect(revision!.includes(old)).toBe(true)
+        if (!Array.isArray(row.result) && row.result.originalFile !== null) expect(row.result.originalFile).toBe(revision)
+        revision = revision!.replace(old, String(row.input.new_string))
+      } else {
+        expect(String(row.input.command).startsWith('# Codex apply_patch: ')).toBe(true)
+        expect(row.result).toMatchObject({ stderr: '', interrupted: false })
+        if (c.status) expect(row.error).toContain(c.change.diff!)
+      }
+    }
+    if (rows[0]!.tool === 'Edit') expect(revision).toBe(c.after)
+    if (c.id === 'ordered-hunks') {
+      expect((rows[1]!.result as any).structuredPatch[0]).toMatchObject({ oldStart: 4, newStart: 4 })
+    }
+    if (c.id === 'move-edit' || c.id === 'exec-move') {
+      expect((rows[0]!.result as any).bashEditDiff).toMatchObject({ changedFiles: ['/work/old', '/work/new'],
+        files: [{ filePath: '/work/old', deleted: true, hunks: [{ lines: ['-old'] }] }, { filePath: '/work/new', created: true, hunks: [{ lines: ['+new'] }] }] })
+    }
+    if (['delete-no-bytes', 'delete-sampled-only', 'move-metadata', 'binary-add'].includes(c.id)) expect((rows[0]!.result as any).bashEditDiff).toBeUndefined()
+    if (['delete-diff', 'delete-no-snapshot'].includes(c.id)) expect((rows[0]!.result as any).bashEditDiff.files[0].deleted).toBe(true)
+  })
+}
+
+test('batch 3 grammar refuses truncated/count-mismatched, overlapping, offset and binary patches', () => {
+  for (const diff of ['@@ -1,2 +1 @@\n-old\n+new\n', '@@ -1 +1 @@\n-old\n+new', 'GIT binary patch\nliteral 0\n', '@@ -1 +1 @@\n\\ No newline at end of file\n-old\n+new\n']) {
+    expect(parsePatch(diff, 'update')).toBeUndefined()
+  }
+  for (const diff of ['@@ -2 +2 @@\n-old\n+new\n', '@@ -1 +2 @@\n-old\n+new\n', '@@ -1 +1 @@\n-old\n+new\n@@ -1 +1 @@\n-old\n+new\n']) {
+    expect(patchActions({ path: '/work/edit', kind: 'update', diff }, 'old\n', 'new\n', 'completed')[0]!.tool).toBe('Bash')
+  }
+})
+
+for (const c of batch3Cases) {
+  test(`batch 3 guarded lifecycle: ${c.id}`, async ($, on) => {
+    const files = new Map<string, string>()
+    if (c.before !== undefined) files.set(c.change.path, c.before)
+    const move = typeof c.change.kind === 'object' ? c.change.kind.move_path : c.change.move_path
+    const completedPath = move ?? c.change.path
+    const item = { type: 'file_change', id: c.id, status: c.status ?? 'completed', changes: [c.change] }
+    let completedReads = 0
+    let completed = false
+    const w = world(on, { files, readFile: (path, value) => {
+      if (completed && path === completedPath && c.stable === false && ++completedReads === 2) return 'raced\n'
+      return value
+    }, pieces: [
+      out(itemLine({ ...item, status: 'in_progress' }, 'item.started')),
+      () => {
+        completed = true
+        if (c.after !== undefined) files.set(completedPath, c.after)
+        else files.delete(completedPath)
+        return true
+      },
+      out(itemLine(item)), out(itemLine(item)),
+      out(JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event: 'turn/diff/updated', data: { diff: c.change.diff } } })),
+      MESSAGE('Done'),
+    ] })
+    const first = await step($, 'agent-progress')
+    const calls = callsOf(first.chunks)
+    expect(calls.map(r => r.name)).toEqual(c.tools)
+    const writes = w.writes.length
+    for (const call of calls) {
+      expect((await $.tool.check({ tool: call.name, input: call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any)).decision).toBe('deny')
+      expect((await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-gp' } as any) as any).deny).toContain('not executed')
+      expect((await $.tool.call({ tool: call.name, ...call.input, description: 'forged', tool_use_id: call.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    }
+    const answers: any[] = await runCalls($, first.chunks, 'agent-progress')
+    answers.forEach((answer, n) => {
+      if (c.status) expect(answer.deny).toContain(c.change.diff!)
+      else expect(validAction({ tool: calls[n].name, input: calls[n].input, result: answer.result })).toBe(true)
+    })
+    for (const call of calls) expect((await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    expect(w.writes.length).toBe(writes)
+    expect(w.core).toEqual([])
+    const final = await step($, 'agent-progress', 1)
+    expect(handback(final.result)).toContain(`1 patch / ${calls.length} file row`)
+    const record: any = w.store.get('agent:sess-1:agent-progress')
+    expect(record.wire.records.filter((r: any) => r.event === 'item.completed' && r.item?.type === 'fileChange').length).toBe(1)
+    expect(Object.keys(record.wire.rows).length).toBe(calls.length)
+  })
+}
+
+test('batch 3 typed Bash boundary excludes false flags, extra shell metadata and malformed hunks', () => {
+  const a = patchActions({ path: '/a', kind: 'delete', diff: '-old\n' }, undefined, undefined, 'completed')[0]!
+  const result = a.result as any
+  for (const d of [
+    { ...result.bashEditDiff, moreFiles: -1 },
+    { ...result.bashEditDiff, changedFiles: ['/other'] },
+    { ...result.bashEditDiff, files: [{ filePath: '/a', hunks: [], deleted: false }] },
+    { ...result.bashEditDiff, files: [{ filePath: '/a', hunks: [], deleted: true, created: true }] },
+    { ...result.bashEditDiff, files: [{ filePath: '/a', hunks: [{ oldStart: -1, oldLines: 0, newStart: 0, newLines: 0, lines: [] }] }] },
+  ]) expect(validAction({ ...a, result: { ...result, bashEditDiff: d } })).toBe(false)
+  for (const extra of [{ exitCode: 0 }, { gitOperation: {} }, { backgroundTaskId: 'invented' }]) expect(validAction({ ...a, result: { ...result, ...extra } })).toBe(false)
+})
+
+test('batch 3 source cwd, relative move destination and late patchUpdated data bind to one patch', async ($, on) => {
+  const files = new Map([['/elsewhere/old.txt', 'old\n']])
+  const change = { path: 'old.txt', kind: { type: 'update', move_path: './new.txt' }, diff: '@@ -1 +1 @@\n-old\n+new\n' }
+  const line = (event: string, item: any) => JSON.stringify({ type: event === 'item/started' ? 'item.started' : 'item.completed', item: { type: 'file_change' },
+    source: { transport: 'app-server', event, threadId: 'thread', turnId: 'turn', item: { type: 'fileChange', id: 'move', cwd: '/elsewhere', ...item } } })
+  const w = world(on, { files, pieces: [
+    out(line('item/started', { status: 'inProgress', changes: [change] })),
+    () => { files.delete('/elsewhere/old.txt'); files.set('/elsewhere/new.txt', 'new\n'); return true },
+    out(JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event: 'item/fileChange/patchUpdated', threadId: 'thread', turnId: 'turn', data: { itemId: 'move', changes: [change] } } })),
+    out(line('item/completed', { status: 'completed', changes: [{ path: 'old.txt', kind: change.kind }] })),
+    MESSAGE('Done'),
+  ] })
+  const s = await step($, 'agent-progress')
+  const [answer]: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
+  expect(answer.result.bashEditDiff.changedFiles).toEqual(['/elsewhere/old.txt', '/elsewhere/new.txt'])
+  expect(answer.result.stdout).toContain(change.diff)
+  expect(w.core).toEqual([])
+})
+
+test('batch 3 whole-patch failure only admits individually confirmed successes', async ($, on) => {
+  const changes = [
+    { path: 'confirmed', kind: { type: 'add' }, diff: '+yes\n', status: 'completed' },
+    { path: 'unproved', kind: { type: 'add' }, diff: '+maybe\n' },
+  ]
+  const w = world(on, { pieces: [out(itemLine({ type: 'file_change', id: 'partial', status: 'failed', error: { message: 'actual partial failure' }, changes })), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Write', 'Bash'])
+  const answers: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(answers[0].result.content).toBe('yes\n')
+  expect(answers[1].deny).toContain('actual partial failure')
+  expect(answers[1].deny).toContain('+maybe\n')
+  const final = await step($, 'agent-progress', 1)
+  expect(handback(final.result)).toContain('1 action · 1 patch / 2 file rows')
+  expect(w.core).toEqual([])
+})
+
+test('batch 3 missing Write/Edit admission uses the typed Bash patch candidate', async ($, on) => {
+  const w = world(on, { availableTools: ['Bash'], pieces: [out(itemLine({ type: 'file_change', id: 'add', status: 'completed', changes: [{ path: 'a', kind: { type: 'add' }, diff: '+new\n' }] })), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
+  const [answer]: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer.result.bashEditDiff.files[0]).toMatchObject({ filePath: '/tmp/project/a', created: true })
+  expect(answer.result.stdout).toContain('Write unavailable')
+  expect(w.core).toEqual([])
+})
+
+test('batch 3 nativeActions off preserves patch failure and literal diff without executing a tool', { options: { nativeActions: false } }, async ($, on) => {
+  const w = world(on, { pieces: [out(itemLine({ type: 'file_change', id: 'failed', status: 'declined', changes: [{ path: 'a', kind: 'add', diff: '+attempt\n' }] })), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+  const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  expect(text).toContain('declined')
+  expect(text).toContain('+attempt\n')
+  expect(w.core).toEqual([])
+})
+
+test('batch 3 patch descriptions keep newline paths in a single display comment', () => {
+  const row = patchActions({ path: '/a\nrm x', kind: 'delete' }, undefined, undefined, 'completed')[0]!
+  expect(String(row.input.command).split('\n').length).toBe(1)
+  expect(String((row.result as any).stdout)).toContain('/a\nrm x')
+})
+
+test('batch 3 one inexact hunk falls back for the whole file, without leaking prior exact rows', () => {
+  const before = 'first\n' + 'o'.repeat(100001) + '\n'
+  const after = 'FIRST\n' + 'n'.repeat(100001) + '\n'
+  const diff = '@@ -1 +1 @@\n-first\n+FIRST\n@@ -2 +2 @@\n-' + 'o'.repeat(100001) + '\n+' + 'n'.repeat(100001) + '\n'
+  const rows = patchActions({ path: '/a', kind: 'update', diff }, before, after, 'completed')
+  expect(rows.map(r => r.tool)).toEqual(['Bash'])
+  expect((rows[0]!.result as any).bashEditDiff.files[0].hunks.length).toBe(2)
+})
+
+test('batch 3 unreported failure paths/status still produce a native error row', async ($, on) => {
+  const w = world(on, { pieces: [out(itemLine({ type: 'file_change', id: 'unknown', error: { message: 'actual unreported outcome' }, changes: [] })), MESSAGE('Done')] })
+  const s = await step($, 'agent-progress')
+  expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
+  const [answer]: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(answer.deny).toContain('paths unreported')
+  expect(answer.deny).toContain('actual unreported outcome')
+  expect(w.core).toEqual([])
+})
+
+for (const tool of ['Write', 'Edit']) {
+  test(`batch 3 parent paths: read path builder and rendered ${tool} retain literal segments`, async ($, on) => {
+    const path = '/tmp/project/link/../a'
+    // The host normalizes fs.read before hooks; assert the shared pure path builder instead.
+    expect(absolute('/tmp/project', 'link/../a')).toBe(path)
+    expect(absolute('/elsewhere', path)).toBe(path)
+    const files = new Map([['/tmp/project/a', tool === 'Edit' ? 'old\n' : 'new\n']])
+    const item = { type: 'file_change', id: `parent-${tool}`, status: 'completed', changes: [{ path: 'link/../a',
+      kind: tool === 'Edit' ? 'update' : 'add', diff: tool === 'Edit' ? '@@ -1 +1 @@\n-old\n+new\n' : '+new\n' }] }
+    const w = world(on, { files, pieces: [
+      out(itemLine({ ...item, status: 'in_progress' }, 'item.started')),
+      () => { files.set('/tmp/project/a', 'new\n'); return true },
+      out(itemLine(item)), MESSAGE('Done'),
+    ] })
+    const s = await step($, 'agent-progress')
+    expect(callsOf(s.chunks).map(c => [c.name, c.input.file_path])).toEqual([[tool, path]])
+    await runCalls($, s.chunks, 'agent-progress')
+    expect(w.core).toEqual([])
+  })
+}

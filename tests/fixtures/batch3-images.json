@@ -1,0 +1,54 @@
+{
+  "add": {
+    "after": "new\n"
+  },
+  "empty": {
+    "after": ""
+  },
+  "no-final-newline": {
+    "after": "new"
+  },
+  "crlf": {
+    "after": "one\r\ntwo\r\n"
+  },
+  "edit": {
+    "before": "old\n",
+    "after": "new\n"
+  },
+  "repeated": {
+    "before": "same\nsame\n",
+    "after": "new\nsame\n"
+  },
+  "insertion": {
+    "before": "old\ntail\n",
+    "after": "old\ninsert\ntail\n"
+  },
+  "unknown-gaps": {},
+  "binary": {},
+  "oversized": {},
+  "missing-snapshot": {},
+  "racing-snapshot": {
+    "before": "already changed\n",
+    "after": "new\n"
+  },
+  "move-edit": {
+    "before": "old\n",
+    "after": "new\n"
+  },
+  "move-metadata": {},
+  "delete-diff": {
+    "before": "old\n"
+  },
+  "delete-no-bytes": {},
+  "patch-updated": {
+    "after": "retained\n"
+  },
+  "failed": {
+    "before": "old\n"
+  },
+  "declined": {},
+  "partial-unknown": {
+    "before": "old\n",
+    "after": "new\n"
+  }
+}
