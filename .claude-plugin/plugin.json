@@ -107,7 +107,7 @@
     "richRows": {
       "type": "boolean",
       "title": "Rich rows (experimental)",
-      "description": "Draw Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows, answered by the plugin and never run.",
+      "description": "Draw Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows when available (otherwise codex_plan), answered by the plugin and never run.",
       "default": false
     },
     "progressIntervalMs": {

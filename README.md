@@ -35,7 +35,7 @@ Codex events --> native Bash / Edit / Write rows (answered by a tool.call hook,
 
 Commands and file changes appear as Bash/Edit/Write rows; finished searches appear as WebSearch rows. MCP and dynamic tool results use the display-only `codex_tool`, and plan updates use `codex_plan`. These rows show work Codex already did and never execute a Claude tool or change Claude's task list.
 
-Experimental `richRows: true` draws Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows, answered by the plugin without launching Claude agents or changing Claude's task list.
+Experimental `richRows: true` draws Codex sub-agent spawns as completed Agent rows and plan updates as TodoWrite rows when the session offers that tool (otherwise `codex_plan`), answered by the plugin without launching Claude agents or changing Claude's task list.
 
 Reasoning summaries appear as best-effort live thinking (not saved in the transcript). App-server commentary and proposed plans appear between rows, with short notes for agent activity, compaction, review, sleep and image generation. The final answer still arrives through the handback. Image viewing is deferred. `nativeActions: false` shows plain text lines instead. See the [Codex UI map](docs/codex-ui-map.md) for transport coverage and rendering limits.
 
@@ -151,7 +151,7 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `handbackMode` | `auto` | `auto`: `SubagentHandback`, plain text only if the tool is not active for the agent. `tool` or `text` force one. |
 | `footer` | `full` | `full`, `short` (agent, model, effort) or `off`. |
 | `nativeActions` | `true` | Off: actions are plain text lines in one step instead of Bash/Edit/Write rows. |
-| `richRows` | `false` | Experimental: draw Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows, answered by the plugin and never run; `nativeActions: false` shows text. |
+| `richRows` | `false` | Experimental: draw Codex sub-agent spawns as completed Agent rows and plan updates as TodoWrite rows when available (otherwise `codex_plan`), answered by the plugin and never run; `nativeActions: false` shows text. |
 | `progressIntervalMs` | `1000` | At most one action step per interval (0 to 60000). |
 | `maxActionsPerStep` | `10` | Most actions shown in one step (1 to 50). |
 | `timeoutMinutes` | `0` | Stop a run after this many minutes and report `codex failed: timeout`. `0`: no limit. |
