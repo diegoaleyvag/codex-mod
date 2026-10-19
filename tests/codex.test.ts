@@ -4,6 +4,8 @@ import { explorationAction, literalWords } from '../hooks/exploration.ts'
 import { batch2Cases } from './fixtures/batch2-cases.ts'
 import { batch3Cases } from './fixtures/batch3-cases.ts'
 import { patchActions, parsePatch } from '../hooks/patches.ts'
+import batch4Items from './fixtures/batch4-items.mjs'
+import { webAction, toolFallback, publicToolText } from '../hooks/web-tools.ts'
 import { absolute } from '../hooks/codex.ts'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
@@ -2658,8 +2660,9 @@ test('phase 3 parser: real-shaped exec lines, repeated id keys, completed search
     [{ type: 'findInPage', pattern: 'flags', url: 'https://example.test' }, 'flags in https://example.test'],
   ] as const) {
     const ev: any = parseCodexLine(itemLine({ type: 'web_search', action, query: '', results: { unexpected: true } }))
-    expect(ev.action.input).toEqual({ query, mode: 'standard' })
-    expect(ev.action.result.results).toEqual(['Searched by Codex', 'Duration unreported (0-second display sentinel)'])
+    expect(ev.display).toBe('codex_tool')
+    expect(ev.action.input).toEqual({ server: 'web', name: action.type, arguments: { query: '', action } })
+    expect(ev.action.result[0].text).toContain('unexpected')
   }
   const encoded: any = parseCodexLine(itemLine({ ...webItem, results: JSON.stringify(webItem.results) }))
   expect(encoded.action.result.results[0].content[0].title).toBe('Example docs')
@@ -2675,9 +2678,17 @@ test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, p
   expect(parseCodexLine(itemLine({ type: 'reasoning', summary: ['Public summary'], content: ['PRIVATE'] }))).toEqual({ kind: 'thinking', text: 'Public summary' })
   expect(parseCodexLine(itemLine({ type: 'reasoning', content: ['PRIVATE'] }))).toEqual({ kind: 'other' })
   expect(parseCodexLine(itemLine({ type: 'reasoning', summary: [], text: 'PRIVATE' }))).toEqual({ kind: 'other' })
-  expect(parseCodexLine(itemLine(mcpItem))).toMatchObject({ kind: 'action', display: 'codex_tool', action: { input: { server: 'docs', name: 'lookup', arguments: { topic: 'options' } }, result: [{ type: 'text', text: 'Found options.' }] } })
-  expect(parseCodexLine(itemLine({ ...mcpItem, status: 'failed', result: null, error: { message: 'Unavailable' } }))).toMatchObject({ action: { error: 'Codex tool call failed: Unavailable', result: [{ type: 'text', text: 'Unavailable' }] } })
-  expect(parseCodexLine(itemLine({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: [1], success: false, content_items: [{ type: 'inputText', text: 'Failed' }, { type: 'inputImage', imageUrl: 'PRIVATE_IMAGE' }] }))).toMatchObject({ display: 'codex_tool', action: { input: { server: 'local', name: 'inspect', arguments: [1] }, error: 'Codex tool call failed: Failed', result: [{ type: 'text', text: 'Failed' }] } })
+  const mcp: any = parseCodexLine(itemLine(mcpItem))
+  expect(mcp).toMatchObject({ kind: 'action', display: 'codex_tool', action: { input: { server: 'docs', name: 'lookup', arguments: { topic: 'options' } } } })
+  expect(mcp.action.result[0].text).toContain('Found options.')
+  const failed: any = parseCodexLine(itemLine({ ...mcpItem, status: 'failed', result: null, error: { message: 'Unavailable' } }))
+  expect(failed.action.error).toContain('Unavailable')
+  const dynamic: any = parseCodexLine(itemLine({ type: 'dynamic_tool_call', namespace: 'local', tool: 'inspect', arguments: [1], success: false, content_items: [{ type: 'inputText', text: 'Failed' }, { type: 'inputImage', imageUrl: 'PRIVATE_IMAGE' }] }))
+  expect(dynamic).toMatchObject({ display: 'codex_tool', action: { input: { server: 'local', name: 'inspect', arguments: [1] } } })
+  expect(dynamic.action.error).toContain('Failed')
+  expect(dynamic.action.result[0].text).toContain('inputImage')
+  expect(dynamic.action.result[0].text).toContain('omitted')
+  expect(dynamic.action.result[0].text.includes('PRIVATE_IMAGE')).toBe(false)
   for (const type of ['item.started', 'item.updated', 'item.completed']) {
     expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type))).toMatchObject({ display: 'codex_plan', action: { result: [{ type: 'text', text: 'Plan updated by Codex' }], input: { steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'pending' }] } } })
   }
@@ -2728,9 +2739,9 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   expect(callsOf(first.chunks)[3].input).toEqual({ server: 'local', name: 'inspect', arguments: {} })
   const results: any[] = await runCalls($, first.chunks, 'agent-progress')
   expect(results[0].result.results[0].content[0].url).toBe('https://example.test/docs')
-  expect(results[1].result).toEqual([{ type: 'text', text: 'Found options.' }])
+  expect(results[1].result[0].text).toContain('Found options.')
   expect(results[2]).toEqual({ result: [{ type: 'text', text: 'Plan updated by Codex' }] })
-  expect(results[3]).toEqual({ deny: 'Codex tool call failed: Inspection failed.' })
+  expect(results[3].deny).toContain('Inspection failed.')
   const second = await step($, 'agent-progress', 1)
   const texts = second.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
   expect(texts).toContain('Proposed plan:\n1. Verify')
@@ -2865,7 +2876,7 @@ test('phase 3 display inputs keep nested arguments out of the host envelope and 
   expect(envelope.tool_use_id).toBe(call.id)
   expect(envelope.agentId).toBe('agent-progress')
   const [result] = await runCalls($, s.chunks, 'agent-progress')
-  expect(result.result).toEqual([{ type: 'text', text: 'Found options.' }])
+  expect(result.result[0].text).toContain('Found options.')
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
 })
@@ -4043,3 +4054,192 @@ for (const tool of ['Write', 'Edit']) {
     expect(w.core).toEqual([])
   })
 }
+
+// Batch 4: source fixtures are shared with the fake app-server, not invented host schemas.
+const batch4Tool = (item: any) => item.type === 'webSearch' && item.id.startsWith('search-') && item.id !== 'search-no-query'
+  ? 'WebSearch' : ['open-full', 'find-full', 'open-http-failure'].includes(item.id) ? 'WebFetch' : 'mcp__codex-mod__codex_tool'
+const batch4Line = (item: any, transport: 'exec' | 'app-server' = 'app-server', event = 'completed') => {
+  const raw = execItem(item)
+  return JSON.stringify({ type: `item.${event}`, item: raw, ...(transport === 'app-server' ? { source: {
+    transport, event: `item/${event}`, threadId: 'batch4-thread', turnId: 'batch4-turn', item,
+  } } : {}) })
+}
+
+for (const item of batch4Items) for (const transport of ['exec', 'app-server'] as const) {
+  test(`batch 4 ${transport} guarded source fidelity: ${item.id}`, async ($, on) => {
+    const w = world(on, { availableTools: [...NATIVE_TOOLS, 'mcp__parity_fixture__lookup'], stdout:
+      batch4Line({ ...item, ...('status' in item ? { status: 'inProgress' } : {}) }, transport, 'started') + '\n' +
+      batch4Line(item, transport) + '\n' + batch4Line(item, transport) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) + '\n' })
+    const first = await step($, 'agent-progress')
+    const [call] = callsOf(first.chunks)
+    expect(callsOf(first.chunks).length).toBe(1)
+    expect(call.name).toBe(batch4Tool(item))
+    expect((await $.tool.check({ tool: call.name, input: call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any)).decision).toBe('deny')
+    for (const change of [{ agentId: 'agent-gp' }, { tool: 'mcp__parity_fixture__lookup' }, { extra: 'forged' }]) {
+      expect((await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress', ...change } as any) as any).deny).toContain('not executed')
+    }
+    const answer: any = await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any)
+    const failed = item.status === 'failed' || ('success' in item && item.success === false) || ('result' in item && (item.result as any)?.isError === true)
+    if (failed && item.id !== 'open-http-failure') expect(answer.deny).toContain('Codex')
+    else {
+      expect(answer.deny).toBe(undefined)
+      expect(validAction({ tool: call.name, input: call.input, result: answer.result })).toBe(true)
+      if (call.name === 'WebSearch') {
+        for (const result of answer.result.results) if (typeof result === 'object') expect(result.tool_use_id).toBe(call.id)
+      }
+      if (item.id === 'open-http-failure') expect(answer.result.code).toBe(404)
+    }
+    expect((await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    expect(w.core).toEqual([])
+    expect(w.checks).toEqual([])
+    expect(w.writes).toEqual([])
+    const final = await step($, 'agent-progress', 1)
+    expect(callsOf(final.chunks).map(c => c.name)).toEqual(['SubagentHandback'])
+    const record: any = w.store.get('agent:sess-1:agent-progress')
+    const sources = record.wire.records.filter((s: any) => s.event.endsWith('completed') && s.item?.id === item.id)
+    expect(sources.length).toBe(1)
+    expect(sources[0].item.results ?? sources[0].item.result ?? sources[0].item.contentItems).toEqual(
+      (item as any).results ?? (item as any).result ?? (item as any).contentItems)
+    expect(Object.keys(record.wire.rows).length).toBe(1)
+  })
+}
+
+test('batch 4 search exact empty/text/opaque/mixed results, query order, mode and timing', () => {
+  const get = (id: string): any => webAction(batch4Items.find(i => i.id === id))
+  expect(get('search-empty').result.results).toEqual([])
+  expect(get('search-unparsed').result.results).toEqual(['not JSON: exact output'])
+  expect(get('search-text').result.results).toEqual(['Exact reported text\nsecond line'])
+  expect(get('search-opaque').result.results).toEqual(['{"opaque":{"answer":42}}', { tool_use_id: '', content: [{ title: 'Docs', url: 'https://example.test' }] }, 'tail text'])
+  expect(get('search-null-results').result.results).toEqual(['null'])
+  expect(get('search-queries').input.query).toBe('first actual query\nsecond actual query')
+  expect(get('search-extended').input.mode).toBe('extended')
+  const item = batch4Items.find(i => i.id === 'search-empty')!
+  expect(webAction(item, { transport: 'exec', event: 'item.completed', item }).result.durationSeconds).toBe(0.015)
+  expect(webAction({ ...item, results: JSON.stringify(item.results) }).result.results).toEqual([])
+  expect(webAction(item, { transport: 'exec', event: 'item.completed', startedAtMs: 100, completedAtMs: 250 }).result.durationSeconds).toBe(0.15)
+})
+
+test('batch 4 WebFetch requires every reported response fact; rejects fabricated/invalid metadata', () => {
+  const item: any = batch4Items.find(i => i.id === 'find-full')!
+  const action = webAction(item)
+  expect(action.input.prompt).toBe('Find "actual \\"pattern\\"" in the page reported by Codex')
+  expect(action.result).toEqual(item.results[0])
+  expect(webAction({ ...item, results: [{ ...item.results[0], headers: { actual: 'reported' } }] }).result).toEqual(item.results[0])
+  for (const status of ['declined', 'failed']) expect(webAction({ ...item, status }).error).toContain(status)
+  const untimed = { ...item.results[0] }
+  delete untimed.durationMs
+  expect(webAction({ ...item, results: [untimed] }, { transport: 'app-server', event: 'item/completed', startedAtMs: 10, completedAtMs: 32 }).result).toEqual({ ...item.results[0], durationMs: 22 })
+  expect(webAction({ ...item, durationMs: 7, results: [untimed] }).result).toEqual({ ...item.results[0], durationMs: 7 })
+  for (const key of ['url', 'bytes', 'code', 'codeText', 'result', 'durationMs']) {
+    const r = { ...item.results[0] }
+    delete r[key]
+    expect(webAction({ ...item, results: [r] }).tool).toBe('codex_tool')
+  }
+  for (const invalid of [{ code: 0 }, { code: 600 }, { bytes: -1 }, { bytes: 1.5 }, { durationMs: -1 }, { url: 'https://unrelated.test' }]) {
+    expect(webAction({ ...item, results: [{ ...item.results[0], ...invalid }] }).tool).toBe('codex_tool')
+  }
+  expect(validAction({ ...action, result: { ...item.results[0], invented: true } })).toBe(false)
+  expect(validAction({ ...action, input: { ...action.input, agentId: 'forged' } })).toBe(false)
+})
+
+for (const available of [true, false]) test(`batch 4 WebFetch own allowlist and availability (${available})`, async ($, on) => {
+  const w = world(on, { availableTools: available ? ['WebFetch'] : [], stdout: batch4Line(batch4Items.find(i => i.id === 'open-full')) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const specs: any[] = []
+  on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
+  await startSession($)
+  expect(specs[0].tools.includes('WebFetch')).toBe(available)
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks)[0].name).toBe(available ? 'WebFetch' : 'mcp__codex-mod__codex_tool')
+  const [answer]: any[] = await runCalls($, first.chunks, 'agent-progress')
+  if (!available) {
+    expect(answer.result[0].text).toContain('WebFetch unavailable')
+    expect(answer.result[0].text).toContain('Actual page text')
+    expect(callsOf(first.chunks)[0].input.server).toBe('web')
+    expect(callsOf(first.chunks)[0].input.name).toBe('openPage')
+  }
+  expect(w.core).toEqual([])
+})
+
+test('batch 4 tool fallback preserves structured/meta/media and reserved arguments without flattening', () => {
+  for (const item of batch4Items.filter(i => ['mcpToolCall', 'dynamicToolCall'].includes(i.type))) {
+    const action = toolFallback(item, 'Unknown host contract')
+    expect(action.input.arguments).toEqual(item.arguments)
+    expect(action.result[0].text).toContain('Unknown host contract')
+    expect(JSON.stringify(action.result).includes('IMAGE_BYTES')).toBe(false)
+    expect(JSON.stringify(action.result).includes('AUDIO_BYTES')).toBe(false)
+    expect(JSON.stringify(action.result).includes('RESOURCE_BYTES')).toBe(false)
+    expect(JSON.stringify(action.result).includes('DYNAMIC_IMAGE')).toBe(false)
+    expect(JSON.stringify(action.result).includes('DYNAMIC_AUDIO')).toBe(false)
+  }
+  const structured: any = toolFallback(batch4Items.find(i => i.id === 'mcp-structured'), 'Unknown contract')
+  expect(structured.result[0].text).toContain('"answer":42')
+  expect(structured.result[0].text).toContain('"data":"literal data field"')
+  expect(structured.result[0].text).toContain('"trace":"kept"')
+  expect(publicToolText({ type: 'image', mimeType: 'image/png', data: 'SECRET' })).toContain('image/png')
+})
+
+for (const richRows of [false, true]) for (const nativeActions of [false, true]) {
+  test(`batch 4 ordinary WebFetch and real MCP calls execute normally (${richRows}/${nativeActions})`, { options: { richRows, nativeActions } }, async ($, on) => {
+    const w = world(on, { availableTools: ['WebFetch', 'mcp__parity_fixture__lookup'] })
+    await startSession($)
+    for (const tool of ['WebFetch', 'mcp__parity_fixture__lookup']) for (const agentId of [undefined, 'agent-gp']) {
+      expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId, topic: 'options' } as any) as any).result.stdout).toBe('REALLY RAN')
+      expect((await $.tool.check({ tool, tool_use_id: 'ordinary', agentId, input: { topic: 'options' } } as any)).decision).toBe('allow')
+    }
+    expect(w.core.length).toBe(4)
+    for (const tool of ['WebFetch', 'mcp__parity_fixture__lookup']) {
+      expect((await $.tool.call({ tool, tool_use_id: `${ID_PREFIX}missing`, agentId: 'agent-progress' } as any) as any).deny).toContain('not executed')
+    }
+    expect(w.core.length).toBe(4)
+  })
+}
+
+test('batch 4 fallback ToolUse labels exact source identity and keeps the native row after consumption', async ($, on) => {
+  world(on, { stdout: batch4Line(batch4Items.find(i => i.id === 'open-missing')) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  const first = await step($, 'agent-progress')
+  const [call] = callsOf(first.chunks)
+  await runCalls($, first.chunks, 'agent-progress')
+  const render = (tool: string, id: string) => $.ui.render({ component: 'ToolUse', surface: 'desktop', requestId: id,
+    props: { tool, tool_use_id: id, input: { server: 'forged', name: 'forged' }, isRunning: false, isErrored: false, isInterrupted: false } } as any)
+  const card: any = await render(call.name, call.id)
+  expect(card.type).toBe('Box')
+  expect(card.children[0].children).toEqual(['Codex web.openPage'])
+  expect(card.children[1].children).toEqual(['HOST'])
+  for (const [tool, id] of [['Bash', call.id], [call.name, 'foreign'], [call.name, `${ID_PREFIX}missing`]]) {
+    expect((await render(tool, id) as any).children).toEqual(['HOST'])
+  }
+})
+
+test('batch 4 text mode keeps actual web and structured/media tool results without extra calls', { options: { nativeActions: false } }, async ($, on) => {
+  const items = ['search-opaque', 'open-full', 'find-missing', 'mcp-structured', 'dynamic-image'].map(id => batch4Items.find(i => i.id === id)!)
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: items.map(i => batch4Line(i)).join('\n') + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const result = await step($, 'agent-progress')
+  const output = result.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  expect(output).toContain('opaque')
+  expect(output).toContain('Actual page text')
+  expect(output).toContain('web.findInPage')
+  expect(output).toContain('Only matches')
+  expect(output).toContain('answer')
+  expect(output).toContain('inputImage')
+  expect(output.includes('DYNAMIC_IMAGE')).toBe(false)
+  expect(w.core).toEqual([])
+})
+
+test('batch 4 open uses matched source timing before choosing its native row', async ($, on) => {
+  const template: any = batch4Items.find(i => i.id === 'open-full')!
+  const response = { ...template.results[0] }
+  delete response.durationMs
+  const item = { ...template, results: [response] }
+  const line = (event: string, value: any, timing: any) => JSON.stringify({ type: `item.${event}`, item: execItem(value), source: {
+    transport: 'app-server', event: `item/${event}`, threadId: 't', turnId: 'u', item: value, ...timing,
+  } })
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout:
+    line('started', { ...item, results: null }, { startedAtMs: 100 }) + '\n' +
+    line('completed', item, { completedAtMs: 120 }) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['WebFetch'])
+  const [answer]: any[] = await runCalls($, first.chunks, 'agent-progress')
+  expect(answer.result.durationMs).toBe(20)
+  expect(w.core).toEqual([])
+})

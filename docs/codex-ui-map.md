@@ -33,9 +33,9 @@ because the engine refuses any other tool before the guard sees it.
 | `reasoning` / `reasoning` | Status header from the summary; summary in dim text | "Thinking" while it streams, then "Thought for {time}", collapsed by default | `thinking` stream chunk (summary only) | 1.2 | `summary[]` (app-server deltas: `summaryTextDelta`, `summaryPartAdded`); the exec item `text` |
 | `todo_list` (exec) / `turn/plan/updated` notification | "Updated Plan" with a checklist | Progress ring plus current step, "Step n / m" | Display-only `codex_plan` row; guarded `TodoWrite` with `richRows` when admitted | 1.2 | `items[{text, completed}]` (exec); `plan[{step, status}]`, `explanation` |
 | — / `plan` (plan mode) | "Proposed Plan" block | "Plan" card ("Writing plan" while it streams), expandable | Text block headed "Proposed plan:" | 1.2 | `text` |
-| `web_search` / `webSearch` | "Searching the web" / "Searched the web"; opening and finding in pages | "Searching the web" -> "Searched the web for {query}" | `WebSearch` row answered by the guard | 1.2 | `query`, `action` (search, openPage, findInPage), `results` |
-| `mcp_tool_call` / `mcpToolCall` | "Calling" / "Called" plus tool and result | Connector-specific verb or generic tool row; result blocks; raw `server.tool` output | Display-only `codex_tool` row | 1.2 | `server`, `tool`, `arguments`, `result.content`, `error.message`, `status` |
-| — / `dynamicToolCall` | Tool call cell | "{toolName}" row | Display-only `codex_tool` row | 1.2 | `namespace`, `tool`, `arguments`, `contentItems`, `success` |
+| `web_search` / `webSearch` | "Searching the web" / "Searched the web"; opening and finding in pages | "Searching the web" -> "Searched the web for {query}" | Guarded `WebSearch` for search, `WebFetch` for open/find with complete HTTP metadata; action-labelled `codex_tool` otherwise | 1.2 | `query`, ordered queries, exact `action`, `results`, source timing |
+| `mcp_tool_call` / `mcpToolCall` | "Calling" / "Called" plus tool and result | Connector-specific verb or generic tool row; result blocks; raw `server.tool` output | Display-only `codex_tool` row | 1.2 | `server`, `tool`, nested `arguments`, full `result.content`/`structuredContent`/`_meta`, errors/status/timing |
+| — / `dynamicToolCall` | Tool call cell | "{toolName}" row | Display-only `codex_tool` row | 1.2 | Original `namespace`, `tool`, nested `arguments`, text/image/audio `contentItems`, success/status/timing |
 | `collab_tool_call` / `collabAgentToolCall` | "Spawned", "Sent input to", "Waiting for agents", agent states | "Created {agent} with the instructions…", "Messaged", "Closed"; wait calls hidden; Subagents panel | Note line; guarded completed `Agent` for spawns with `richRows` when admitted; wait calls skipped | 1.2 | `tool`, `prompt`, `receiver_thread_ids`, `agents_states`, `status`, `model` |
 | — / `subAgentActivity` | (agent status lines) | "{name} finished", "Sent message to {agent}" | Note line | 1.2 | `kind`, `agentPath`, `model` |
 | — / `imageView` | "Viewed image" | "Viewed an image" with preview | Nothing; source retained, guarded image adapter deferred | deferred | `path` |
@@ -55,16 +55,10 @@ Every other row in the table needs the `app-server` transport.
 - **Reasoning summary -> `thinking` chunks.** Only the summary text, never raw reasoning, and only
   within the existing step pacing. Claude Code shows hook-made thinking live but does not record it,
   so it is missing from the saved transcript. Many runs send no summary at all.
-- **Web search -> `WebSearch` row.** Input `{ query, mode: 'standard' }` (for `openPage` the URL, for `findInPage`
-  `<pattern> in <url>`), from the completed item only (the started exec item has an empty query).
-  The guard answers with Codex's results when they parse, else "Searched by Codex". `WebSearch` is
-  included only when available in the Codex agent's tools and is covered by both guards like Bash/Edit/Write: a codex-mod
-  agent's search row never reaches a real search, and a guard failure denies.
-- **MCP and dynamic tool calls -> display-only `codex_tool`.** Registered by the plugin (full name
-  `mcp__codex-mod__codex_tool`), input `{ server, name, arguments }`, answered only by the guard
-  with a content-block array of Codex's result text (failures use `deny`). Real `mcp__<server>__<tool>` names are
-  never emitted. Any call without the plugin's id, including one from the main model, is refused and
-  does nothing. Input keys avoid the hook envelope's reserved keys (`tool`, `tool_use_id`).
+- **Web search -> `WebSearch` row.** Completed actual searches use `{ query, mode }`, including every ordered query in one multi-query row. Results retain source title/URL/snippet envelopes bound to the emitted host tool-use ID, text and opaque JSON; an actual empty array stays empty. A missing duration is disclosed beside the row as a zero sentinel.
+- **Open/find -> `WebFetch` when response facts exist.** Input `{url,prompt}` names the actual action; find describes the actual pattern and returns its matching excerpt. The result is exactly `{bytes,code,codeText,result,durationMs,url}` from reported response metadata. Actual HTTP failures keep their code. Missing metadata/URL/pattern, mismatched URL and other/opaque actions use `codex_tool`, with an owned `Codex web.<action>` label and full reported results. No invented `200 OK`, bytes or elapsed time.
+- **MCP and dynamic calls -> display-only `codex_tool`.** Input `{server,name,arguments}` keeps arbitrary keys nested outside the dispatch envelope. Results are text content-block arrays, with structured-only results, `_meta`, resources and media descriptions; encoded payloads remain in the source record. Dynamic inputText/inputImage/inputAudio are interpreted separately from MCP blocks. Failures use `deny` with the actual report. Only owned IDs are decorated, preserving the host row underneath. Normal Claude MCP calls pass unchanged.
+- **Faithful external identities are blocked on the current host.** Claude Code 2.1.302's `ToolInfo` and runtime `$.tool.list` return only `{name,description,mcp}`. `tool.describe` supplies description/deferral/provider, without schemas. There is no supported input-schema plus original-server-identity discovery path here. MCP results are typed `unknown`; the registered display content-array contract does not prove every external tool's contract. T1/T3 therefore use T2/T4 for a concrete missing-schema/binding reason; no canonical-name registry or guessed identity is enabled. Recognized account-memory success replacement remains excluded along with all other unverified contracts. This is an API limitation, not a Desktop paint finding.
 - **Plan updates -> display-only `codex_plan`.** Input `{ explanation?, steps: [{ step, status }] }`.
   `richRows` selects guarded `TodoWrite` when admitted, without executing its mutation. `TaskCreate`/`TaskUpdate` adapters remain deferred.
 - **Proposed plan** (`plan` item) -> a text block headed "Proposed plan:".
@@ -116,3 +110,26 @@ R2 apply_patch plus generated `FileUpdateChange`, `PatchChangeKind` and
 for headless mapper checks and NEW Desktop session acceptance. Typed Bash patch
 admission, native paint/counts/grouping and working-tree/Git effects are still
 unverified live; no custom-card fallback is selected without observed paint evidence.
+
+## Web and arbitrary tools (Batch 4)
+
+The web constructors and safe result text live in `hooks/web-tools.ts`; the
+existing source ledger retains complete unmodified public item results and
+provenance. Only the display text omits encoded media bytes. WebFetch joins
+both guards, refusing catches and each capability-filtered Codex tool list.
+Its normal main/verified Claude calls keep the real executor. External names
+are never blanket-matched as plugin display tools; reserved-prefix calls
+remain refused regardless of name. Plain text mode retains arbitrary tool
+results and reported web metadata.
+
+Schema sources: R1 WebSearch (1852-1872), WebFetch (1826-1846), the actual
+`BuiltinToolInputs`/`BuiltinToolResults` declarations, and the confirmed
+registered-display text-array contract. Raw app-server results are arbitrary
+JSON: only a complete explicit RFetch-shaped response is admitted, without
+assuming undocumented aliases. Metadata extension fixtures are capability
+examples, not evidence that normal Codex web output provides these facts.
+
+See `tests/fixtures/batch4-harness.md` for settings, the shared 45-item scenario,
+the offline MCP server and API evidence. No success claim for T1/T3 or native
+MCP output mappers follows from fallback/runner tests. Headless real WebFetch
+mapper acceptance and a NEW Desktop session still need to be observed.

@@ -452,6 +452,56 @@ test('batch 2 exploration: action evidence and exact output survive start/delta/
   } finally { r.cleanup() }
 })
 
+test('batch 4 web/tools: all search/open/find/MCP/dynamic evidence survives once without callbacks', async () => {
+  const r = start('batch4-web-tools')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const { default: fixtures } = await import('./fixtures/batch4-items.mjs')
+    const completed = r.lines().filter(l => l.type === 'item.completed' && l.source?.item?.type !== 'agentMessage')
+    assert.equal(completed.length, fixtures.length)
+    for (const item of fixtures) {
+      const done = completed.find(l => l.source.item.id === item.id)
+      assert.deepEqual(done.source.item, item)
+      assert.equal(r.lines().filter(l => l.type === 'item.started' && l.source?.item?.id === item.id).length, 1)
+    }
+    assert.deepEqual(r.sent().map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
+    assert.ok(!r.lines().some(l => l.type === 'codexmod.protocol'))
+  } finally { r.cleanup() }
+})
+
+test('batch 4 offline MCP fixture exposes real schemas and logs only explicit executor calls', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'batch4-mcp-'))
+  const logFile = join(dir, 'calls.jsonl')
+  try {
+    const child = spawn(process.execPath, [join(here, 'fixtures/batch4-mcp-server.mjs')], {
+      env: { ...process.env, FAKE_MCP_LOG: logFile }, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let output = ''
+    let stderr = ''
+    child.stdout.on('data', d => { output += d })
+    child.stderr.on('data', d => { stderr += d })
+    const closed = new Promise(r => child.on('close', r))
+    const requests = [
+      { id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' } } },
+      { method: 'notifications/initialized' },
+      { id: 2, method: 'tools/list' },
+      ...['lookup', 'structured', 'media', 'fail'].map((name, i) => ({ id: 3 + i, method: 'tools/call', params: { name, arguments: { topic: 'fixture' } } })),
+    ].map(m => ({ jsonrpc: '2.0', ...m }))
+    child.stdin.end(requests.map(m => JSON.stringify(m)).join('\n') + '\n')
+    assert.equal(await closed, 0, stderr)
+    const replies = output.trim().split('\n').map(l => JSON.parse(l))
+    const tools = replies.find(m => m.id === 2).result.tools
+    assert.deepEqual(tools.map(t => t.name), ['lookup', 'structured', 'media', 'fail'])
+    assert.equal(tools[0].inputSchema.additionalProperties, false)
+    assert.deepEqual(tools[0].inputSchema.required, ['topic'])
+    assert.deepEqual(tools[1].outputSchema.required, ['answer'])
+    assert.deepEqual(replies.find(m => m.id === 4).result, { content: [], structuredContent: { answer: 42 } })
+    assert.deepEqual(replies.find(m => m.id === 5).result.content.map(b => b.type), ['image', 'audio'])
+    assert.equal(replies.find(m => m.id === 6).result.isError, true)
+    assert.deepEqual(readFileSync(logFile, 'utf8').trim().split('\n').map(l => JSON.parse(l)), requests)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('batch 3 patches: exact per-file kinds/diffs, patchUpdated, failures and aggregate evidence survive once', async () => {
   const r = start('batch3-patches')
   try {

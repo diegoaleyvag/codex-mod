@@ -111,6 +111,7 @@
 
 import { explorationAction, validExploration } from './exploration.ts'
 import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
+import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult } from './web-tools.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
 import type {
@@ -168,7 +169,7 @@ const HANDBACK_TOOL = 'SubagentHandback'
 export const ID_PREFIX = 'toolu_codexmod_'
 export const HANDBACK_ID_PREFIX = 'toolu_codexhandback_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
+export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'WebFetch', 'Agent', 'TodoWrite'] as const
 const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite'])
 type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message'
 const displayTools: Partial<Record<DisplayTool, string>> = {}
@@ -599,6 +600,7 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
   else if (a.tool === 'Edit') inputOK = keysOnly(i, ['file_path', 'old_string', 'new_string', 'replace_all']) && ['file_path', 'old_string', 'new_string'].every(k => typeof i[k] === 'string') && (i.replace_all === undefined || i.replace_all === false)
   else if (a.tool === 'Write') inputOK = keysOnly(i, ['file_path', 'content']) && typeof i.file_path === 'string' && typeof i.content === 'string'
   else if (a.tool === 'WebSearch') inputOK = keysOnly(i, ['query', 'mode']) && typeof i.query === 'string' && i.query !== '' && ['standard', 'extended'].includes(i.mode)
+  else if (a.tool === 'WebFetch') inputOK = keysOnly(i, ['url', 'prompt']) && typeof i.url === 'string' && i.url !== '' && typeof i.prompt === 'string'
   else if (a.tool === 'Agent') inputOK = keysOnly(i, ['description', 'prompt', 'subagent_type']) && typeof i.description === 'string' && typeof i.prompt === 'string' && i.subagent_type === 'codex-mod:codex'
   else if (a.tool === 'TodoWrite') inputOK = keysOnly(i, ['todos']) && todos(i.todos)
   else if (isDisplay(a.tool) || a.tool === 'codex_tool') inputOK = keysOnly(i, ['server', 'name', 'arguments']) && typeof i.server === 'string' && typeof i.name === 'string' && 'arguments' in i
@@ -621,6 +623,7 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
     case 'Edit': return keysOnly(r, ['filePath', 'oldString', 'newString', 'originalFile', 'structuredPatch', 'userModified', 'replaceAll']) && r.filePath === i.file_path && r.oldString === i.old_string && r.newString === i.new_string && (r.originalFile === null || typeof r.originalFile === 'string') && hunks(r.structuredPatch) && r.userModified === false && r.replaceAll === false
     case 'Write': return keysOnly(r, ['type', 'filePath', 'content', 'structuredPatch', 'originalFile']) && ['create', 'update'].includes(r.type) && r.filePath === i.file_path && r.content === i.content && hunks(r.structuredPatch) && (r.originalFile === null || typeof r.originalFile === 'string')
     case 'WebSearch': return keysOnly(r, ['query', 'results', 'durationSeconds']) && r.query === i.query && number(r.durationSeconds) && Array.isArray(r.results) && r.results.every(s => typeof s === 'string' || (object(s) && keysOnly(s, ['tool_use_id', 'content']) && typeof s.tool_use_id === 'string' && s.tool_use_id !== '' && Array.isArray(s.content) && s.content.every(c => object(c) && keysOnly(c, ['title', 'url', 'snippet']) && typeof c.title === 'string' && typeof c.url === 'string' && (c.snippet === undefined || typeof c.snippet === 'string'))))
+    case 'WebFetch': return validFetchResult(r, i.url)
     case 'TodoWrite': return keysOnly(r, ['oldTodos', 'newTodos']) && todos(r.oldTodos) && todos(r.newTodos) && stableJSON(r.newTodos) === stableJSON(i.todos)
     case 'Agent': {
       const u = r.usage
@@ -705,16 +708,12 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
       const text = Array.isArray(item.summary) ? item.summary.filter((s: unknown) => typeof s === 'string').join('\n\n') : typeof item.text === 'string' ? item.text : ''
       return text.trim() ? { kind: 'thinking', text } : { kind: 'other' }
     }
-    if (item?.type === 'web_search') return { kind: 'action', action: webAction(item) }
+    if (item?.type === 'web_search') {
+      const action = webAction(ev.source?.item ?? item)
+      return { kind: 'action', action, ...(action.tool === 'codex_tool' ? { display: 'codex_tool' as const } : {}) }
+    }
     if (item?.type === 'mcp_tool_call' || item?.type === 'dynamic_tool_call') {
-      const failed = item.error != null || item.status === 'failed' || item.success === false || item.result?.is_error === true || item.result?.isError === true
-      const text = typeof item.error?.message === 'string' ? item.error.message : resultText(item.result?.content ?? item.content_items) || (failed ? 'Codex tool call failed (no text output)' : 'Called by Codex (no text output)')
-      return {
-        kind: 'action', display: 'codex_tool', action: {
-          tool: 'codex_tool', input: { server: String(item.server ?? item.namespace ?? 'dynamic'), name: String(item.tool ?? ''), arguments: item.arguments ?? {} },
-          result: [{ type: 'text', text }], ...(failed ? { error: `Codex tool call failed: ${text}` } : {}),
-        },
-      }
+      return { kind: 'action', display: 'codex_tool', action: toolFallback(ev.source?.item ?? item, 'Host input schema and verified server binding unavailable; replacement contract unknown.') }
     }
     if (item?.type === 'proposed_plan' && typeof item.text === 'string') return { kind: 'interim', text: `Proposed plan:\n${item.text}` }
     if (item?.type === 'note' && typeof item.text === 'string') return { kind: 'note', text: `↪ ${oneLine(item.text, 300)}`, ...(item.dim === true ? { dim: true as const } : {}) }
@@ -782,30 +781,6 @@ function spawnAction(item: any, receivers: unknown): Action {
     input: { description: oneLine(prompt.split(/\r?\n/)[0]!, 60) || 'Codex sub-agent', prompt, subagent_type: 'codex-mod:codex' },
     result,
     ...(['failed', 'declined'].includes(item.status) ? { error: `Codex spawn ${item.status}: ${JSON.stringify(item)}` } : {}),
-  }
-}
-
-/** Text content only: image/audio payloads and raw reasoning are never displayed. */
-function resultText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content.map(c => typeof c?.text === 'string' && ['text', 'inputText'].includes(c.type) ? c.text : '').filter(Boolean).join('\n')
-}
-
-function webAction(item: any): Action {
-  const a = item.action
-  const query = a?.type === 'openPage' ? String(a.url ?? '')
-    : a?.type === 'findInPage' ? `${String(a.pattern ?? '')} in ${String(a.url ?? '')}`
-    : String(item.query || a?.query || (Array.isArray(a?.queries) ? a.queries.join(', ') : ''))
-  let results = item.results
-  if (typeof results === 'string') {
-    try { results = JSON.parse(results) } catch { results = [] }
-  }
-  const sources = (Array.isArray(results) ? results : []).filter(r => typeof r?.title === 'string' && typeof r?.url === 'string')
-    .map(r => ({ title: r.title, url: r.url, ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}) }))
-  return {
-    tool: 'WebSearch', input: { query, mode: 'standard' } satisfies BuiltinToolInputs['WebSearch'],
-    result: { query, results: [...(sources.length ? [{ tool_use_id: '', content: sources }] : ['Searched by Codex']), 'Duration unreported (0-second display sentinel)'], durationSeconds: 0 },
   }
 }
 
@@ -1152,8 +1127,9 @@ export function actionLine(a: Action): string {
   if (a.tool === 'Edit') return `Edited ${String(a.input.file_path)}`
   if (a.tool === 'Agent') return `Codex spawned an agent: ${oneLine(String(a.input.prompt), 300)}`
   if (a.tool === 'TodoWrite') return `Codex updated plan: ${(a.input.todos as { content: string; status: string }[]).map(t => `[${t.status}] ${oneLine(t.content)}`).join('; ')}`
-  if (a.tool === 'WebSearch') return `Searched by Codex: ${oneLine(String(a.input.query), 300)}`
-  if ('server' in a.input) return `Codex called ${oneLine(String(a.input.server))}.${oneLine(String(a.input.name))}`
+  if (a.tool === 'WebFetch') return `Codex ${a.source?.item?.action?.type ?? 'openPage'}: ${String(a.input.url)}\n${a.error ?? JSON.stringify(a.result)}`
+  if (a.tool === 'WebSearch') return `Searched by Codex: ${String(a.input.query)}\n${a.error ?? JSON.stringify(a.result)}${sourceDuration(a.source) === undefined ? '\nDuration unreported (0-second display sentinel).' : ''}`
+  if ('server' in a.input) return `Codex called ${oneLine(String(a.input.server))}.${oneLine(String(a.input.name))}\n${a.error ?? (Array.isArray(a.result) ? a.result.map(b => b.text).join('\n') : JSON.stringify(a.result))}`
   if ('steps' in a.input) return `Codex updated plan: ${(a.input.steps as { step: string; status: string }[]).map(s => `[${s.status}] ${oneLine(s.step)}`).join('; ')}`
   const result = Array.isArray(a.result) ? {} : a.result
   if (a.tool === 'Write') return `${result.type === 'create' ? 'Created' : 'Wrote'} ${String(a.input.file_path)}`
@@ -1396,7 +1372,7 @@ const MAX_DELIVERIES = 20
 type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
 const answers = new Map<string, HeldAnswer>()
 // Retained after consumption: provenance belongs to the row, not its executor guard.
-const sourceRows = new Map<string, { sessionId: string; agentId: string; source?: SourceRecord }>()
+const sourceRows = new Map<string, { sessionId: string; agentId: string; tool: string; source?: SourceRecord }>()
 let seq = 0
 // Set by session.start when Codex is missing or logged out.
 let preflight: string | undefined
@@ -1452,6 +1428,7 @@ export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentI
 
 function holdAnswer(id: string, sid: string, agentId: string, action: Action): boolean {
   if (!validAction(action)) return false
+  if (action.tool === 'WebSearch' && !Array.isArray(action.result) && (action.result.results as any[]).some(r => object(r) && r.tool_use_id !== id)) return false
   const status = action.source?.item?.status
   const patch = action.source?.item?.type === 'fileChange'
   const file = patch && action.patchPath !== undefined ? changesOf(action.source!.item).find(c =>
@@ -1467,12 +1444,12 @@ function holdAnswer(id: string, sid: string, agentId: string, action: Action): b
   if (patch && !action.error && status !== 'completed' && !completedFile) return false
   if (status !== undefined && !['completed', 'failed', 'declined'].includes(status) && !completedFile && !(patch && action.error)) return false
   const noMatches = ['Grep', 'Bash'].includes(action.tool) && action.source?.item?.exitCode === 1 && explorationAction(action.source)?.tool === 'Grep'
-  if (['failed', 'declined'].includes(status) && !action.error && !noMatches && !completedFile) return false
+  if (['failed', 'declined'].includes(status) && !action.error && !noMatches && !completedFile && !(status === 'failed' && action.tool === 'WebFetch' && !Array.isArray(action.result) && Number(action.result.code) >= 400)) return false
   // Snapshot before handing anything to core; later caller/input mutations must
   // never alter the answer or its source binding.
   const snapshot: Action = JSON.parse(JSON.stringify(action))
   const source = snapshot.source
-  sourceRows.set(id, { sessionId: sid, agentId, source })
+  sourceRows.set(id, { sessionId: sid, agentId, tool: snapshot.tool, source })
   answers.set(id, { sessionId: sid, agentId, action: snapshot, inputDigest: stableJSON(snapshot.input), sourceDigest: stableJSON(source ?? null) })
   return true
 }
@@ -1556,6 +1533,15 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'ToolUse' }, ($, e, next) => {
     const row = hasPrefix(e.props.tool_use_id) ? coordinatorRows.get(e.props.tool_use_id) : undefined
+    const owned = hasPrefix(e.props.tool_use_id) ? sourceRows.get(e.props.tool_use_id) : undefined
+    const item = owned?.source?.item
+    if (owned?.tool === displayTools.codex_tool && e.props.tool === owned.tool && item && ['webSearch', 'mcpToolCall', 'dynamicToolCall'].includes(item.type)) {
+      const label = item.type === 'webSearch' ? `Codex web.${item.action?.type ?? 'other'}`
+        : `Codex ${item.server ?? item.namespace ?? 'dynamic'}.${item.tool}`
+      // Keep the host's expansion, errors and controls under an owned identity label.
+      const { Box, Text } = $.ui.resolve(e)
+      return next(e).then(child => Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: label }), child] }))
+    }
     if (row === undefined || e.props.tool !== displayTools.coordinator_message || e.props.tool !== row.tool) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     return Box({ flexDirection: 'column', children: [
@@ -2606,16 +2592,14 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     if (ev.kind === 'note' && ev.dim) dimNotes.add(ev.text)
   } else if (ev.kind === 'action') {
     run.actions++
+    if (source?.item?.type === 'webSearch') {
+      ev.action = webAction(source.item, source)
+      ev.display = ev.action.tool === 'codex_tool' ? 'codex_tool' : undefined
+    }
     ev.action.source = source
     if (source?.item?.status === 'inProgress') return
-    if (['failed', 'declined'].includes(source?.item?.status) && !ev.action.error) ev.action.error = `Codex ${source!.item!.type} ${source!.item!.status}: ${JSON.stringify(source!.item)}`
-    if (ev.action.tool === 'WebSearch' && object(ev.action.result)) {
-      const duration = source?.item?.durationMs ?? (source?.startedAtMs !== undefined && source.completedAtMs !== undefined ? source.completedAtMs - source.startedAtMs : undefined)
-      if (number(duration)) {
-        ev.action.result.durationSeconds = duration / 1000
-        ev.action.result.results = (ev.action.result.results as unknown[]).filter(r => r !== 'Duration unreported (0-second display sentinel)')
-      }
-    }
+    if (['failed', 'declined'].includes(source?.item?.status) && !ev.action.error && !(source?.item?.status === 'failed' && ev.action.tool === 'WebFetch' && !Array.isArray(ev.action.result) && Number(ev.action.result.code) >= 400)) ev.action.error = `Codex ${source!.item!.type} ${source!.item!.status}: ${JSON.stringify(source!.item)}`
+    if (ev.action.tool === 'WebSearch' && object(ev.action.result)) ev.action.result.durationSeconds = (sourceDuration(source) ?? 0) / 1000
     if (ev.display) {
       await registerDisplayTools($).catch(err => $.ui.log(`codex-mod: display tools not registered: ${errText(err)}`, { to: 'debug' }))
       const tool = displayTools[ev.display]
@@ -2925,6 +2909,11 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         const durationUnknown = q.action.tool === 'Glob' && item.durationMs == null && (source.startedAtMs === undefined || source.completedAtMs === undefined)
         blocks.push({ text: `Codex command (cwd ${JSON.stringify(source.cwd)}):\n${item.command}${durationUnknown ? '\nDuration unreported (0 ms display sentinel).' : ''}` })
       }
+      if (['WebSearch', 'WebFetch'].includes(q.action.tool) && !tools.has(q.action.tool) && q.action.source?.item && displayTools.codex_tool && tools.has(displayTools.codex_tool)) {
+        const original = q.action
+        q.action = { ...webFallback(original.source!.item, `${original.tool} unavailable in this agent's tools.`), tool: displayTools.codex_tool, source: original.source }
+      }
+      if (q.action.tool === 'WebSearch' && sourceDuration(q.action.source) === undefined) blocks.push({ text: 'Web search duration unreported (0-second display sentinel).' })
       if (q.action.tool === 'WebSearch' && !Array.isArray(q.action.result) && Array.isArray(q.action.result.results)) {
         for (const r of q.action.result.results) if (r && typeof r === 'object') r.tool_use_id = id
       }

@@ -5,6 +5,7 @@
 import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
+import batch4Items from './batch4-items.mjs'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
 // and the whole turn in ONE stdout write), steer / steer-reject / hang / deaf
@@ -124,6 +125,14 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch4-web-tools') {
+        for (const item of batch4Items) {
+          note('item/started', { threadId: THREAD, turnId: TURN, item: { ...item, ...('status' in item ? { status: 'inProgress' } : {}), results: null, result: null, contentItems: null } })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+        }
+        return setTimeout(finishNormally, 50)
+      }
       if (scenario === 'batch3-patches') {
         batch3Patches().catch(err => { process.stderr.write(String(err)); process.exit(1) })
         return
