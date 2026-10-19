@@ -57,7 +57,8 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
 - Decision: implementation, research (REA through the `rea` CLI) and review go to Codex through
   codex-mod agents; Sol medium by default, xhigh for hard work or a retry. One read-only
   gpt-6-astra review (low or medium) covers a whole change at the end. Claude subagents only
-  for Claude-only tools; a Claude reviewer only when Astra is unavailable.
+  for Claude-only tools; a Claude reviewer only when Astra is unavailable, plus an occasional
+  short Opus review of a risky change for variety (Claude use kept minimal).
 - Why: the owner prefers to spend Codex capacity over Claude usage; Astra is a different,
   stronger model than the Sol implementer, which keeps the review independent.
 - Consequences: the final review is no longer cross-family; the orchestrator's own checks
