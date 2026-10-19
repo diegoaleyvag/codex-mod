@@ -164,7 +164,8 @@ const HANDBACK_TOOL = 'SubagentHandback'
 /** Every tool_use id this module mints starts with it. */
 export const ID_PREFIX = 'toolu_codexmod_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch'] as const
+export const NATIVE_TOOLS = ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite'] as const
+const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite'])
 type DisplayTool = 'codex_tool' | 'codex_plan'
 const displayTools: Partial<Record<DisplayTool, string>> = {}
 const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan'])
@@ -296,6 +297,7 @@ export type Config = {
   /** Launch guard: the most Codex launches per agent in WINDOW_MS. */
   maxRunsPerWindow: number
   nativeActions: boolean
+  richRows: boolean
   ttlMs: number
   /** What a run is launched with; `app-server` falls back to exec when its checks fail. */
   transport: Transport
@@ -374,6 +376,7 @@ export function parseConfig(raw: unknown): Config {
     timeoutMs: int('timeoutMinutes', 0, 0, 1440) * 60000,
     maxRunsPerWindow: int('maxRunsPerWindow', 3, 1, 100),
     nativeActions: bool('nativeActions', true),
+    richRows: bool('richRows', false),
     ttlMs: int('pruneDays', 2, 1, 365) * DAY_MS,
     transport: oneOf<Transport>('transport', 'exec', ['exec', 'app-server']),
     nodeOverride: nodePath === '' ? undefined : nodePath,
@@ -460,7 +463,7 @@ const changesOf = (item: any): FileChange[] =>
  * Maps one JSONL line of `codex exec --json` (verified on codex-cli 0.163), or
  * a `codexmod.*` line of the app-server runner.
  */
-export function parseCodexLine(line: string): CodexEvent {
+export function parseCodexLine(line: string, richRows = false): CodexEvent {
   let ev: any
   try {
     ev = JSON.parse(line)
@@ -502,6 +505,11 @@ export function parseCodexLine(line: string): CodexEvent {
         ? (Array.isArray(item.items) ? item.items : []).map((s: any) => ({ step: String(s?.text ?? ''), status: s?.completed ? 'completed' : 'pending' }))
         : (Array.isArray(item.steps) ? item.steps : []).map((s: any) => ({ step: String(s?.step ?? ''), status: s?.status === 'inProgress' ? 'in_progress' : ['pending', 'in_progress', 'completed'].includes(s?.status) ? s.status : 'pending' }))
       const input = { ...(typeof item.explanation === 'string' ? { explanation: item.explanation } : {}), steps }
+      if (richRows) {
+        // BuiltinToolInputs['TodoWrite'] requires activeForm on every entry.
+        const todos = steps.map(({ step, status }: { step: string; status: string }) => ({ content: step, status, activeForm: step }))
+        return { kind: 'action', action: { tool: 'TodoWrite', input: { todos }, result: { content: [{ type: 'text', text: 'Codex plan update recorded.' }] } } }
+      }
       return { kind: 'action', display: 'codex_plan', action: { tool: 'codex_plan', input, result: { content: [{ type: 'text', text: 'Plan updated by Codex' }] } } }
     }
   }
@@ -525,10 +533,12 @@ export function parseCodexLine(line: string): CodexEvent {
     }
     if (item?.type === 'proposed_plan' && typeof item.text === 'string') return { kind: 'interim', text: `Proposed plan:\n${item.text}` }
     if (item?.type === 'note' && typeof item.text === 'string') return { kind: 'note', text: `↪ ${oneLine(item.text, 300)}`, ...(item.dim === true ? { dim: true as const } : {}) }
-    if (item?.type === 'collab_tool_call') {
+    if (item?.type === 'collab_tool_call' || item?.type === 'collabAgentToolCall') {
       const tool = String(item.tool ?? '').replace(/_/g, '').toLowerCase()
       if (tool === 'wait' || tool === 'waitagent') return { kind: 'other' }
-      const agents = Array.isArray(item.receiver_thread_ids) ? item.receiver_thread_ids.join(', ') : 'agent'
+      const receivers = item.receiver_thread_ids ?? item.receiverThreadIds
+      if (richRows && tool === 'spawnagent') return { kind: 'action', action: spawnAction(item, receivers) }
+      const agents = Array.isArray(receivers) ? receivers.join(', ') : 'agent'
       const text = tool === 'spawnagent' ? `Codex spawned an agent: ${oneLine(String(item.prompt ?? ''))}`
         : ['sendinput', 'sendmessage', 'followuptask'].includes(tool) ? `Codex messaged ${agents}`
         : tool === 'closeagent' ? `Codex closed agent ${agents}`
@@ -548,6 +558,28 @@ export function parseCodexLine(line: string): CodexEvent {
   if (ev?.type === 'turn.failed') return { kind: 'error', text: String(ev.error?.message ?? 'turn failed') }
   if (ev?.type === 'error') return { kind: 'error', text: String(ev.message ?? 'error') }
   return { kind: 'other' }
+}
+
+function spawnAction(item: any, receivers: unknown): Action {
+  const prompt = typeof item.prompt === 'string' ? item.prompt : ''
+  const states = item.agents_states ?? item.agentsStates ?? {}
+  const ids = [...new Set<string>([
+    ...(Array.isArray(receivers) ? receivers.filter((id): id is string => typeof id === 'string') : []),
+    ...Object.keys(states),
+  ])]
+  const reports = (ids.length ? ids : ['agent']).map(id => {
+    const state = states[id]
+    const name = state?.name ?? item.name
+    const status = typeof state?.status === 'string' ? state.status : String(item.status ?? 'unknown')
+    const model = state?.model ?? item.model
+    return `${id}${typeof name === 'string' ? ` (${oneLine(name)})` : ''}: ${oneLine(status)}${typeof model === 'string' ? `, model ${oneLine(model)}` : ''}`
+  })
+  return {
+    tool: 'Agent',
+    // Use only BuiltinToolInputs['Agent'] fields; Codex model names are not Claude models.
+    input: { description: oneLine(prompt.split(/\r?\n/)[0]!, 60) || 'Codex sub-agent', prompt, subagent_type: 'codex-mod:codex' },
+    result: { content: [{ type: 'text', text: `Codex reported ${reports.join('; ')}` }] },
+  }
 }
 
 /** Text content only: image/audio payloads and raw reasoning are never displayed. */
@@ -989,6 +1021,8 @@ export function fileAction(change: FileChange, rel: string, before: string | und
 /** One action as a plain text line (nativeActions off). */
 export function actionLine(a: Action): string {
   if (a.tool === 'Edit') return `Edited ${String(a.input.file_path)}`
+  if (a.tool === 'Agent') return `Codex spawned an agent: ${oneLine(String(a.input.prompt), 300)}`
+  if (a.tool === 'TodoWrite') return `Codex updated plan: ${(a.input.todos as { content: string; status: string }[]).map(t => `[${t.status}] ${oneLine(t.content)}`).join('; ')}`
   if (a.tool === 'WebSearch') return `Searched by Codex: ${oneLine(String(a.input.query), 300)}`
   if ('server' in a.input) return `Codex called ${oneLine(String(a.input.server))}.${oneLine(String(a.input.name))}`
   if ('steps' in a.input) return `Codex updated plan: ${(a.input.steps as { step: string; status: string }[]).map(s => `[${s.status}] ${oneLine(s.step)}`).join('; ')}`
@@ -1248,6 +1282,7 @@ const budgets = new WeakMap<AbortSignal, () => number>()
 /** True when the loop is an agent this module answers (known from its first step). */
 const isCodexAgent = (agentId: unknown): boolean => typeof agentId === 'string' && known.get(agentId) !== undefined
 const hasPrefix = (id: unknown): boolean => typeof id === 'string' && id.startsWith(ID_PREFIX)
+// Guard rich tools even when disabled, including stale calls after a worker restart.
 const isNative = (tool: unknown): boolean => (NATIVE_TOOLS as readonly unknown[]).includes(tool)
 const isDisplay = (tool: unknown): boolean => typeof tool === 'string' && displayNames.has(tool)
 /** A display call this module must answer or refuse: never one the engine may run. */
@@ -1628,7 +1663,7 @@ async function registerAgents($: EngineInterface, config: Config): Promise<boole
         prompt: PLACEHOLDER_PROMPT,
         // the tools Codex's actions are drawn as must be the agent's own, or
         // the engine refuses them before the tool.call guard answers them
-        tools: ['Read', ...NATIVE_TOOLS, ...Object.values(displayTools)],
+        tools: ['Read', ...NATIVE_TOOLS.filter(tool => config.richRows || !RICH_TOOLS.has(tool)), ...Object.values(displayTools)],
         model: 'haiku',
         effort: 'low',
         maxTurns: 400,
@@ -2276,7 +2311,7 @@ async function feed($: EngineInterface, run: Run, piece: ProcessSpawnChunk): Pro
   while ((nl = run.buffered.indexOf('\n')) >= 0) {
     const line = run.buffered.slice(0, nl).trim()
     run.buffered = run.buffered.slice(nl + 1)
-    if (line !== '') await handle($, run, parseCodexLine(line))
+    if (line !== '') await handle($, run, parseCodexLine(line, cfg.richRows))
   }
 }
 
@@ -2457,7 +2492,7 @@ async function* pump($: EngineInterface, e: TurnStepInput, signal: AbortSignal, 
       if (run.killed) throw new Error('killed')
       if (r.done) {
         run.ended = true
-        if (run.buffered.trim() !== '') await handle($, run, parseCodexLine(run.buffered.trim()))
+        if (run.buffered.trim() !== '') await handle($, run, parseCodexLine(run.buffered.trim(), cfg.richRows))
         run.buffered = ''
         continue
       }

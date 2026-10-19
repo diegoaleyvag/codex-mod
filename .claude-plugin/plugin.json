@@ -104,6 +104,12 @@
       "description": "Show Codex's commands and file changes as Bash/Edit/Write rows (never executed). Off: plain text lines in one step.",
       "default": true
     },
+    "richRows": {
+      "type": "boolean",
+      "title": "Rich rows (experimental)",
+      "description": "Draw Codex sub-agent spawns as Agent rows and plan updates as TodoWrite rows, answered by the plugin and never run.",
+      "default": false
+    },
     "progressIntervalMs": {
       "type": "number",
       "title": "Progress interval (ms)",

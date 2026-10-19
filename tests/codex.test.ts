@@ -2456,7 +2456,7 @@ test('phase 3 safety: every guard exception denies, including main-model registe
     return { catch: (handler: any) => { entry.catcher = handler } }
   }) as any, {})
   const $ = { agent: { list: async () => { throw new Error('Cannot resolve agent') } } }
-  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan']) {
+  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan']) {
     for (const name of ['tool.call', 'tool.check']) {
       const guard = guards.get(name)!
       const e = { tool, agentId: 'unresolved-phase3-agent', tool_use_id: 'foreign' }
@@ -2492,6 +2492,175 @@ test('phase 3 display inputs keep nested arguments out of the host envelope and 
   expect(envelope.agentId).toBe('agent-progress')
   const [result] = await runCalls($, s.chunks, 'agent-progress')
   expect(result.result.content).toEqual([{ type: 'text', text: 'Found options.' }])
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+})
+
+// ---- Experimental rich rows ----------------------------------------------
+
+const spawnItem = {
+  type: 'collab_tool_call', tool: 'spawn_agent', prompt: 'Inspect the tests.\nReport findings.',
+  receiver_thread_ids: ['child-1'], agents_states: { 'child-1': { name: 'reviewer', status: 'running' } },
+  status: 'completed', model: 'gpt-6.1-sol',
+}
+
+test('richRows is opt-in and rejects non-boolean options', () => {
+  expect(parseConfig({}).richRows).toBe(false)
+  expect(parseConfig({ richRows: true })).toMatchObject({ richRows: true, warnings: [] })
+  expect(parseConfig({ richRows: 'true' })).toMatchObject({ richRows: false, warnings: ['richRows: not a boolean; default used'] })
+})
+
+test('rich parser: completed spawns use Agent input fields and a Codex text result', () => {
+  const expected = {
+    kind: 'action', action: {
+      tool: 'Agent',
+      input: { description: 'Inspect the tests.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' },
+      result: { content: [{ type: 'text', text: 'Codex reported child-1 (reviewer): running, model gpt-6.1-sol' }] },
+    },
+  }
+  expect(parseCodexLine(itemLine(spawnItem), true)).toEqual(expected)
+  expect(parseCodexLine(itemLine({
+    type: 'collabAgentToolCall', tool: 'spawnAgent', prompt: spawnItem.prompt, status: 'completed', model: spawnItem.model,
+    receiverThreadIds: spawnItem.receiver_thread_ids, agentsStates: spawnItem.agents_states,
+  }), true)).toEqual(expected)
+  for (const type of ['item.started', 'item.updated']) expect(parseCodexLine(itemLine(spawnItem, type), true)).toEqual({ kind: 'other' })
+  const long: any = parseCodexLine(itemLine({ ...spawnItem, prompt: `${'A'.repeat(80)}\nSecond line` }), true)
+  expect(long.action.input.description).toBe(`${'A'.repeat(57)}...`)
+  expect(long.action.input.prompt).toBe(`${'A'.repeat(80)}\nSecond line`)
+  const unnamed: any = parseCodexLine(itemLine({ type: 'collab_tool_call', tool: 'spawn_agent', status: 'failed' }), true)
+  expect(unnamed.action.input).toEqual({ description: 'Codex sub-agent', prompt: '', subagent_type: 'codex-mod:codex' })
+  expect(unnamed.action.result.content[0].text).toBe('Codex reported agent: failed')
+  for (const tool of ['send_input', 'close_agent', 'wait', 'wait_agent']) {
+    expect(parseCodexLine(itemLine({ ...spawnItem, tool }), true)).toEqual(parseCodexLine(itemLine({ ...spawnItem, tool })))
+  }
+  const activity = itemLine({ type: 'note', text: 'Codex agent /root/reviewer finished' })
+  expect(parseCodexLine(activity, true)).toEqual({ kind: 'note', text: '↪ Codex agent /root/reviewer finished' })
+})
+
+test('rich parser: exec todos and normalized app-server plan updates use required TodoWrite fields', () => {
+  for (const type of ['item.started', 'item.updated', 'item.completed']) {
+    expect(parseCodexLine(itemLine({ type: 'todo_list', items: [{ text: 'Inspect', completed: true }, { text: 'Test', completed: false }] }, type), true)).toEqual({
+      kind: 'action', action: {
+        tool: 'TodoWrite', input: { todos: [
+          { content: 'Inspect', status: 'completed', activeForm: 'Inspect' },
+          { content: 'Test', status: 'pending', activeForm: 'Test' },
+        ] }, result: { content: [{ type: 'text', text: 'Codex plan update recorded.' }] },
+      },
+    })
+  }
+  const app: any = parseCodexLine(itemLine({ ...planItem, steps: [...planItem.steps, { step: 'Other', status: 'unknown' }, { step: 'Working', status: 'in_progress' }] }, 'item.updated'), true)
+  expect(app.action.input).toEqual({ todos: [
+    { content: 'Inspect', status: 'completed', activeForm: 'Inspect' },
+    { content: 'Test', status: 'in_progress', activeForm: 'Test' },
+    { content: 'Report', status: 'pending', activeForm: 'Report' },
+    { content: 'Other', status: 'pending', activeForm: 'Other' },
+    { content: 'Working', status: 'in_progress', activeForm: 'Working' },
+  ] })
+})
+
+for (const richRows of [false, true]) {
+  test(`richRows ${richRows}: only opted-in generic and project agents register rich tools`, { options: { richRows } }, async ($, on) => {
+    world(on, { files: new Map([['.claude/codex-mod.json', PROJECT_ROLES]]) })
+    const specs: any[] = []
+    on('agent.register', (_$, e: any) => {
+      specs.push(e)
+      return { value: { agent: `codex-mod:${e.name}` } }
+    })
+    await startSession($)
+    expect(specs.map(s => s.name)).toEqual(['codex', 'implementer', 'implementer-high', 'auditor'])
+    for (const s of specs) {
+      expect(s.tools.includes('Agent')).toBe(richRows)
+      expect(s.tools.includes('TodoWrite')).toBe(richRows)
+    }
+  })
+}
+
+test('rich rows are guarded, counted and refuse foreign ids, owners, tools and replays', { options: { richRows: true } }, async ($, on) => {
+  // No final newline exercises the EOF parser as well as ordinary line ingestion.
+  const w = world(on, { stdout: [itemLine(spawnItem), itemLine({ type: 'agent_message', text: 'Done.' }), itemLine(planItem, 'item.updated')].join('\n') })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks).map(c => c.name)).toEqual(['Agent'])
+  const results: any[] = []
+  for (let index = 0; index < 2; index++) {
+    // The unterminated plan line is parsed when the next step observes EOF.
+    const s = index === 0 ? first : await step($, 'agent-progress', index)
+    const [c] = callsOf(s.chunks)
+    expect(c.name).toBe(index === 0 ? 'Agent' : 'TodoWrite')
+    expect(c.input).toEqual(index === 0
+      ? { description: 'Inspect the tests.', prompt: spawnItem.prompt, subagent_type: 'codex-mod:codex' }
+      : { todos: [
+        { content: 'Inspect', status: 'completed', activeForm: 'Inspect' },
+        { content: 'Test', status: 'in_progress', activeForm: 'Test' },
+        { content: 'Report', status: 'pending', activeForm: 'Report' },
+      ] })
+    for (const id of ['foreign', 'toolu_codexmod_missing']) {
+      const refused: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: id, agentId: 'agent-progress' } as any)
+      expect(refused.deny).toContain('not executed')
+    }
+    for (const agentId of [undefined, 'agent-gp', 'agent-progress']) {
+      const check: any = await $.tool.check({ tool: c.name, input: c.input, tool_use_id: c.id, agentId } as any)
+      expect(check.decision).toBe('deny')
+    }
+    for (const agentId of [undefined, 'agent-gp', 'agent-normal']) {
+      const stolen: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId } as any)
+      expect(stolen.deny).toContain('not executed')
+    }
+    const swapped: any = await $.tool.call({ tool: c.name === 'Agent' ? 'TodoWrite' : 'Agent', tool_use_id: c.id, agentId: 'agent-progress' } as any)
+    expect(swapped.deny).toContain('not executed')
+    results.push(...await runCalls($, s.chunks, 'agent-progress'))
+    const replay: any = await $.tool.call({ tool: c.name, ...c.input, tool_use_id: c.id, agentId: 'agent-progress' } as any)
+    expect(replay.deny).toContain('not executed')
+  }
+  expect(results.map(r => r.result.content[0].text)).toEqual(['Codex reported child-1 (reviewer): running, model gpt-6.1-sol', 'Codex plan update recorded.'])
+  const final = await step($, 'agent-progress', 2)
+  expect(handback(final.result)).toContain('2 actions')
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+})
+
+for (const richRows of [false, true]) {
+  test(`richRows ${richRows}: main-thread and non-Codex Agent/TodoWrite calls pass through; Codex calls are refused`, { options: { richRows } }, async ($, on) => {
+    const w = world(on)
+    for (const tool of ['Agent', 'TodoWrite']) {
+      const input = tool === 'Agent' ? { description: 'Real task', prompt: 'Inspect', subagent_type: 'general-purpose' } : { todos: [] }
+      for (const agentId of [undefined, 'agent-gp']) {
+        const call: any = await $.tool.call({ tool, ...input, tool_use_id: 'host-id', agentId } as any)
+        expect(call.result.stdout).toBe('REALLY RAN')
+        const check: any = await $.tool.check({ tool, input, tool_use_id: 'host-id', agentId } as any)
+        expect(check.decision).toBe('allow')
+      }
+      // Resolve a Codex type before its first step (also the worker restart path).
+      const refused: any = await $.tool.call({ tool, ...input, tool_use_id: 'host-id', agentId: 'agent-deny' } as any)
+      expect(refused.deny).toContain('not executed')
+      const backstop: any = await $.tool.check({ tool, input, tool_use_id: 'host-id', agentId: 'agent-codex' } as any)
+      expect(backstop.decision).toBe('deny')
+    }
+    expect(w.core.map(c => [c.tool, c.agentId])).toEqual([['Agent', undefined], ['Agent', 'agent-gp'], ['TodoWrite', undefined], ['TodoWrite', 'agent-gp']])
+    expect(w.checks.map(c => [c.tool, c.agentId])).toEqual([['Agent', undefined], ['Agent', 'agent-gp'], ['TodoWrite', undefined], ['TodoWrite', 'agent-gp']])
+  })
+}
+
+test('richRows false preserves the spawn note and display-only plan row', { options: { richRows: false } }, async ($, on) => {
+  const w = world(on, { pieces: [itemPiece(spawnItem), itemPiece(planItem), MESSAGE('Done.')] })
+  const first = await step($, 'agent-progress')
+  expect(first.chunks[0]).toEqual({ kind: 'text', index: 0, text: '↪ Codex spawned an agent: Inspect the tests. Report findings.' })
+  expect(callsOf(first.chunks).map(c => [c.name, c.input])).toEqual([['mcp__codex-mod__codex_plan', {
+    explanation: 'Verify', steps: [{ step: 'Inspect', status: 'completed' }, { step: 'Test', status: 'in_progress' }, { step: 'Report', status: 'pending' }],
+  }]])
+  const [result] = await runCalls($, first.chunks, 'agent-progress')
+  expect(result.result.content).toEqual([{ type: 'text', text: 'Plan updated by Codex' }])
+  const final = await step($, 'agent-progress', 1)
+  expect(handback(final.result)).toContain('1 action')
+  expect(w.core).toEqual([])
+})
+
+test('rich rows with nativeActions false degrade to text and retain action counts', { options: { richRows: true, nativeActions: false, handbackMode: 'text' } }, async ($, on) => {
+  const w = world(on, { pieces: [itemPiece(spawnItem), itemPiece(planItem), MESSAGE('Done.')] })
+  const s = await step($, 'agent-plain')
+  expect(callsOf(s.chunks)).toEqual([])
+  expect(s.result.answer).toContain('Codex spawned an agent: Inspect the tests. Report findings.')
+  expect(s.result.answer).toContain('Codex updated plan: [completed] Inspect; [in_progress] Test; [pending] Report')
+  expect(s.result.answer).toContain('2 actions')
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
 })

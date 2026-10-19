@@ -8,6 +8,7 @@
 
 ### Added
 
+- Experimental `richRows` (default `false`): draw Codex sub-agent spawns as guarded Agent rows and plan updates as guarded TodoWrite rows. Both are answered by the plugin, never executed, counted in the footer and shown as text with `nativeActions: false`.
 - Codex reasoning summaries as best-effort live thinking, completed web searches as guarded WebSearch rows, and MCP/dynamic tool results and plan updates as display-only `codex_tool`/`codex_plan` rows. All new rows are counted in the footer and degrade to text with `nativeActions: false`.
 - App-server commentary between rows, proposed plan text, and notes for Codex agent activity, context compaction, review mode, sleep and image generation. Raw reasoning is never shown; the final answer still uses the handback.
 
