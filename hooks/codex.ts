@@ -120,6 +120,11 @@ import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuesti
 import { controlRequest, queryOutcome, publishOutcome, messageStatus } from './steer.ts'
 import type { MessageOutcome } from './steer.ts'
 import { compactStoreState, flushStoreMigrations, readStoreState, writeStoreState } from './store-state.ts'
+import { fingerprint, matchesIdentity } from './fingerprint.ts'
+import type { Fingerprint } from './fingerprint.ts'
+import { journalLine, journalRead } from './child-journal.mjs'
+import { RowCache, saveRow, loadRow } from './row-cache.ts'
+import type { RowPresentation } from './row-cache.ts'
 import { boundedNames, validCapabilities, resolvePolicy, policyTask, configHash, capacityFallback } from './run-policy.ts'
 import type { RolePolicy, EffectiveConfig } from './run-policy.ts'
 import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
@@ -187,10 +192,10 @@ type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message' | 'codex_
 const displayTools: Partial<Record<DisplayTool, string>> = {}
 const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
 // Kept after the guard consumes its answer, so resolved rows still render.
-const coordinatorRows = new Map<string, { tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
-const planCards = new Map<string, PlanInput>()
+const coordinatorRows = new RowCache<{ tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
+const planCards = new RowCache<PlanInput>()
 type Question = { token: string; requestId: string | number; method: string; params: any; status: string; result?: any; error?: any }
-const questionRows = new Map<string, { session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
+const questionRows = new RowCache<{ session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
 const COORDINATOR_PART_MAX = 90000
 const dimNotes = new Set<string>()
 export const NOT_EXECUTED = 'codex-mod: not executed'
@@ -442,6 +447,11 @@ export type AgentRecord = Profile & {
   effectiveFingerprint?: string
   fallbackModels?: string[]
   capacityRetryKey?: string
+  lastTaskFingerprint?: Fingerprint
+  launchKeyFingerprint?: Fingerprint
+  capacityRetryKeyFingerprint?: Fingerprint
+  guardTripKeyFingerprint?: Fingerprint
+  recoveryUnavailable?: boolean
   // A missing total after interruption invalidates the next exec baseline.
   threadUsage?: { thread: string; total: Usage; valid: boolean }
   lastTask?: string
@@ -461,7 +471,7 @@ export type AgentRecord = Profile & {
   launches?: number[]
   launchKey?: string
   launchesSinceNew?: number
-  guardTrip?: { key: string; reason: string }
+  guardTrip?: { key?: string; reason: string }
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
   // Receipt IDs are bounded in the store; bodies recover from private cache files.
@@ -472,7 +482,7 @@ export type AgentRecord = Profile & {
   wire?: { records: SourceRecord[]; rows: Record<string, SourceRecord | null> }
   display?: DisplayState
   mirror?: ChildMirror
-  playback?: { cursor: number; prefix: string; texts: string[]; queue: Queued[]; actions: number; usage?: Usage; usageCanonical?: boolean; usagePartial?: boolean; turnId?: string }
+  playback?: { segment?: number; cursor: number; prefix: string; texts: string[]; queue: Queued[]; actions: number; usage?: Usage; usageCanonical?: boolean; usagePartial?: boolean; turnId?: string }
   updatedAt: number
 }
 
@@ -1459,8 +1469,9 @@ const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
 type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
 const answers = new Map<string, HeldAnswer>()
-// Retained after consumption: provenance belongs to the row, not its executor guard.
-const sourceRows = new Map<string, { sessionId: string; agentId: string; tool: string; source?: SourceRecord }>()
+// Only pending guard bindings stay resident. History presentation is loaded
+// lazily from fixed-size private disk slots, never as executor capabilities.
+const sourceRows = new RowCache<RowPresentation>()
 let seq = 0
 // Set by session.start when Codex is missing or logged out.
 let preflight: string | undefined
@@ -1513,10 +1524,12 @@ export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentI
   const row = sourceRows.get(id)
   const input = Object.fromEntries(Object.entries(e).filter(([key]) => !['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'].includes(key)))
   if (held === undefined || held.sessionId !== sid || held.agentId !== e.agentId || held.action.tool !== e.tool || !isCodexAgent(e.agentId) ||
-    row?.sessionId !== sid || row.agentId !== e.agentId || stableJSON(input) !== held.inputDigest || stableJSON(row.source ?? null) !== held.sourceDigest || !validAction(held.action)) {
+    row?.sessionId !== sid || row.agentId !== e.agentId || row.tool !== e.tool || stableJSON(input) !== held.inputDigest || row.sourceDigest !== held.sourceDigest || !validAction(held.action)) {
     return { deny: `${NOT_EXECUTED} (${String(e.tool)} is display-only for Codex agents; only a stored Codex result can answer this call)` }
   }
   answers.delete(id)
+  sourceRows.delete(id)
+  planCards.delete(id)
   return held.action.error !== undefined ? { deny: held.action.error } : { result: held.action.result }
 }
 
@@ -1544,8 +1557,16 @@ function holdAnswer(id: string, sid: string, agentId: string, action: Action): b
   // never alter the answer or its source binding.
   const snapshot: Action = JSON.parse(JSON.stringify(action))
   const source = snapshot.source
-  sourceRows.set(id, { sessionId: sid, agentId, tool: snapshot.tool, source })
-  answers.set(id, { sessionId: sid, agentId, action: snapshot, inputDigest: stableJSON(snapshot.input), sourceDigest: stableJSON(source ?? null) })
+  const sourceDigest = fingerprint(stableJSON(source ?? null)).sha256
+  const item = source?.item
+  const receivers = item?.receiverThreadIds ?? item?.receiver_thread_ids
+  const states = item?.agentsStates ?? item?.agents_states
+  const short = (v: unknown) => typeof v === 'string' ? v.slice(0, 256) : undefined
+  const label = item?.type === 'webSearch' ? `Codex web.${item.action?.type ?? 'other'}`
+    : item && ['mcpToolCall', 'dynamicToolCall'].includes(item.type) ? `Codex ${item.server ?? item.namespace ?? 'dynamic'}.${item.tool}` : undefined
+  sourceRows.set(id, { sessionId: sid, agentId, tool: snapshot.tool, sourceDigest, label: short(label), childThread: short(source?.data?.thread_id),
+    model: short(item?.model ?? states?.[receivers?.[0]]?.model), effort: short(item?.reasoningEffort ?? item?.reasoning_effort) })
+  answers.set(id, { sessionId: sid, agentId, action: snapshot, inputDigest: stableJSON(snapshot.input), sourceDigest })
   return true
 }
 
@@ -1616,17 +1637,11 @@ async function agentRowProfile($: EngineInterface, id: string): Promise<{ model:
     const rec = await loadRecord($, host)
     if (rec) return { ...rec, note: rec.selection?.note }
   }
-  const owned = sourceRows.get(id)
+  const owned = sourceRows.get(id) ?? (await loadRow($, id, sid))?.row
   if (!owned || owned.sessionId !== sid || owned.tool !== 'Agent') return
-  const source = owned.source
-  const data = source?.data
-  const mirror = data?.thread_id ? mirrors.get(mirrorKey(sid, data.thread_id)) : undefined
+  const mirror = owned.childThread ? mirrors.get(mirrorKey(sid, owned.childThread)) : undefined
   if (mirror) return { model: mirror.model, effort: mirror.effort }
-  const item = source?.item
-  const receivers = item?.receiverThreadIds ?? item?.receiver_thread_ids
-  const states = item?.agentsStates ?? item?.agents_states
-  const model = item?.model ?? states?.[receivers?.[0]]?.model
-  if (typeof model === 'string') return { model, effort: item.reasoningEffort ?? item.reasoning_effort ?? 'unreported effort' }
+  if (owned.model) return { model: owned.model, effort: owned.effort ?? 'unreported effort' }
 }
 
 /** Shared by launches and live steers; instructions never enter task records or rendered notes. */
@@ -1886,6 +1901,7 @@ async function stopMirrorDescendants($: EngineInterface, parentHost: string): Pr
  * a worker reload resumes its cursor or reports a source gap, never executes. */
 function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessSpawnChunk, ProcessSpawnResult> {
   const m = rec.mirror!
+  let segment = rec.playback?.segment ?? 0
   let cursor = rec.playback?.cursor ?? 0
   let prefix = rec.playback?.prefix ?? ''
   let ended = false
@@ -1899,15 +1915,15 @@ function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessS
     [Symbol.asyncIterator]() { return this },
     async next() {
       if (ended) return done()
+      let drained = false
       for (;;) {
-        const text = await $.fs.read(`${m.control}/events-${m.thread}.jsonl`).catch(() => '')
-        if (typeof text !== 'string' || text.length < cursor || cursor && text.slice(Math.max(0, cursor - 160), cursor) !== prefix) throw new Error('child journal truncated or replaced; no relaunch')
-        const nl = text.indexOf('\n', cursor)
-        if (nl >= 0) {
+        const entry = await journalLine($, m.control, m.thread, { segment, cursor, prefix })
+        if (entry) {
           quiet = 0
-          const line = text.slice(cursor, nl)
-          cursor = nl + 1
-          prefix = text.slice(Math.max(0, cursor - 160), cursor)
+          const { line } = entry
+          segment = entry.segment
+          cursor = entry.cursor
+          prefix = entry.prefix
           const ev = JSON.parse(line)
           if (ev.type === 'codexmod.child' ? ev.parent_thread_id !== m.thread : ev.thread_id !== m.thread) throw new Error('foreign child journal identity')
           if (ev.type === 'turn.failed') code = 1
@@ -1923,10 +1939,16 @@ function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessS
             if (message && message.status === 'submitted') message.status = ev.status === 'accepted' ? 'accepted' : ev.status === 'rejected' ? 'rejected' : 'unknown'
             $.ui.log(`codex-mod: mirror steer acknowledgement: host=${m.host}; thread=${m.thread}; id=${ev.id}; status=${message?.status ?? 'unmatched'}`, { to: 'debug' })
           }
-          rec.playback = { cursor, prefix, texts: run?.texts ?? [], queue: run?.queue ?? [], actions: run?.actions ?? 0, usage: run?.usage, usageCanonical: run?.usageCanonical, usagePartial: run?.usagePartial, turnId: ev.turn_id ?? run?.turnId }
+          rec.playback = { segment, cursor, prefix, texts: run?.texts ?? [], queue: run?.queue ?? [], actions: run?.actions ?? 0, usage: run?.usage, usageCanonical: run?.usageCanonical, usagePartial: run?.usagePartial, turnId: ev.turn_id ?? run?.turnId }
           return { done: false as const, value: { stream: 'stdout' as const, text: line + '\n' } }
         }
-        const owner = JSON.parse(String(await $.fs.read(`${m.control}/owner.json`).catch(() => '{}')))
+        const owner = JSON.parse(await journalRead($, `${m.control}/owner.json`))
+        // The owner can finish between our index read and this read. Drain
+        // once more against its final index before deciding the journal ended.
+        if (owner.ended && !drained) {
+          drained = true
+          continue
+        }
         if (owner.generation !== m.generation || owner.ended || !Number.isFinite(owner.updatedAt) || Date.now() - owner.updatedAt > 15000) {
           if (!['completed', 'failed', 'aborted'].includes(m.state)) throw new Error('child source owner unavailable; partial transcript, no relaunch')
           return done()
@@ -1937,7 +1959,7 @@ function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessS
         await mirrorMessages($, rec, run)
         // A bounded read-only wait in the host keeps polling out of the
         // dispatch's CPU/sleep budget. It starts no Codex or provider work.
-        await $.process.run([m.node, m.reader, 'observe', '--control', m.control, '--thread', m.thread, '--cursor', String(cursor), '--generation', m.generation], { timeoutMs: 3000 })
+        await $.process.run([m.node, m.reader, 'observe', '--control', m.control, '--thread', m.thread, '--segment', String(segment), '--cursor', String(cursor), '--generation', m.generation], { timeoutMs: 3000 })
       }
     },
     async return() { return done() },
@@ -2009,6 +2031,7 @@ async function checkpointMirror($: EngineInterface, run: Run): Promise<void> {
 }
 
 async function* answerMirror($: EngineInterface, e: TurnStepInput, signal: AbortSignal, rec: AgentRecord): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  if (rec.recoveryUnavailable) return yield* handBack($, e, 'codex failed: recovery state unavailable', '', false)
   const m = rec.mirror!
   if (!isMirror(m) || m.host !== e.agentId) return yield* failStep(e, 'codex-child', 'codex failed: unowned mirror; no run launched', false)
   mirrors.set(mirrorKey(m.session, m.thread), m)
@@ -2076,6 +2099,11 @@ export const register: Register = (on, options) => {
   // Pruning only: a running child dies with the module (process exit) or with
   // its agent's turn (turn.complete below); a /clear also ends the session.
   on('session.end', async ($, e, next) => {
+    answers.clear()
+    sourceRows.clear()
+    planCards.clear()
+    questionRows.clear()
+    coordinatorRows.clear()
     await pruneRecords($, config.ttlMs)
     await pruneRuns($, config.ttlMs)
     return next(e)
@@ -2197,6 +2225,8 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     const id = e.props.tool_use_id
+    const saved = hasPrefix(id) && !sourceRows.has(id) ? await loadRow($, id, await sessionId($)) : undefined
+    const owned = hasPrefix(id) ? sourceRows.get(id) ?? saved?.row : undefined
     if (e.props.tool === 'Agent') {
       const profile = await agentRowProfile($, id)
       if (profile) {
@@ -2228,7 +2258,7 @@ export const register: Register = (on, options) => {
       }
     }
     const questionRow = questionRows.get(id)
-    if (questionRow && e.props.tool === displayTools.codex_question && sourceRows.get(id)?.tool === e.props.tool && questionRow.session === await sessionId($)) {
+    if (questionRow && e.props.tool === displayTools.codex_question && owned?.tool === e.props.tool && questionRow.session === await sessionId($)) {
       const { Box, Text, Button } = $.ui.resolve(e)
       const q = questionRow.question
       const send = async (cancel = false) => {
@@ -2262,9 +2292,7 @@ export const register: Register = (on, options) => {
         ...(q.error ? [Text({ children: JSON.stringify(q.error) })] : []),
       ] })
     }
-    const owned = hasPrefix(e.props.tool_use_id) ? sourceRows.get(e.props.tool_use_id) : undefined
-    const item = owned?.source?.item
-    const plan = planCards.get(e.props.tool_use_id)
+    const plan = planCards.get(e.props.tool_use_id) ?? saved?.plan
     if (plan && owned?.tool === displayTools.codex_plan && e.props.tool === owned.tool) {
       const { Box, Text } = $.ui.resolve(e)
       return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: 'Codex plan (display only)' }),
@@ -2273,9 +2301,8 @@ export const register: Register = (on, options) => {
         ...(plan.steps.length ? [] : [Text({ children: '(empty checklist)' })]),
       ] })
     }
-    if (owned?.tool === displayTools.codex_tool && e.props.tool === owned.tool && item && ['webSearch', 'mcpToolCall', 'dynamicToolCall'].includes(item.type)) {
-      const label = item.type === 'webSearch' ? `Codex web.${item.action?.type ?? 'other'}`
-        : `Codex ${item.server ?? item.namespace ?? 'dynamic'}.${item.tool}`
+    if (owned?.tool === displayTools.codex_tool && e.props.tool === owned.tool && owned.label) {
+      const label = owned.label
       // Keep the host's expansion, errors and controls under an owned identity label.
       const { Box, Text } = $.ui.resolve(e)
       return next(e).then(child => Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: label }), child] }))
@@ -2466,6 +2493,7 @@ export const register: Register = (on, options) => {
       $.ui.log(`codex-mod: agent ${run.agentId} turn ended (${e.reason}) while Codex ran; killing it`, { to: 'debug' })
       await stopRun($, run)
     }
+    if (e.agentId) dropAnswers(e.agentId)
     // deliveries to an agent that is not ours are nobody's
     if (e.agentId !== undefined && known.has(e.agentId) && known.get(e.agentId) === undefined) deliveries.delete(e.agentId)
     return next(e)
@@ -3037,6 +3065,11 @@ async function pruneRecords($: EngineInterface, ttlMs: number): Promise<void> {
       const v = await $.store.get(key)
       const valid = key.startsWith(STORE_PREFIX) ? isRecord(v) : key.startsWith('mirror:') ? isMirror(v) : isHandbackMemo(v)
       if (!valid || !(now - (v as AgentRecord | HandbackMemo).updatedAt < ttlMs)) {
+        if (key.startsWith(STORE_PREFIX)) {
+          const agent = key.slice(key.lastIndexOf(':') + 1)
+          dropAnswers(agent)
+          if (!runs.has(agent)) records.delete(agent)
+        }
         await $.store.delete(key).catch(err => $.ui.log(`codex-mod: store prune failed for ${key}: ${errText(err)}`, { to: 'debug' }))
       } else if (!v.cachedState && JSON.stringify(v) !== JSON.stringify(compactStoreState(v))) {
         await writeStoreState($, key, v, JSON.stringify(v).length)
@@ -3076,6 +3109,9 @@ async function* answerWithCodex(
   const conv = await conversation($, agentId)
   const rd = readConversation(conv.items)
   const rec = await loadRecord($, agentId)
+  if (rec?.recoveryUnavailable) {
+    return yield* handBack($, e, 'codex failed: recovery state unavailable', '', handbackFor(agentId, rd.signal, conv.source))
+  }
   if (rec !== undefined) {
     rec.followUps = followUpsOf(rec)
     // a coordinator delivery that came after the run ended runs as a follow-up
@@ -3137,7 +3173,7 @@ async function* answerWithCodex(
 
   // 3. Only a genuinely new user/coordinator message launches Codex. Engine
   // nudges and reminders are never tasks (cleanText leaves them empty).
-  const isNew = latest !== undefined && !(latest.coordinator && rec?.coordinator?.authoritative) && (rec?.lastTask === undefined || latest.text !== rec.lastTask || (rec.userCount !== undefined && latest.count > rec.userCount))
+  const isNew = latest !== undefined && !(latest.coordinator && rec?.coordinator?.authoritative) && (!rec || !matchesIdentity(rec, 'lastTask', latest.text) || (rec.userCount !== undefined && latest.count > rec.userCount))
   if (isNew) {
     const base = fallback()
     // a queued follow-up that is this very message runs now, not again later
@@ -3294,6 +3330,7 @@ async function* startRun(
   retry?: { profile: Profile; key: string; note: string },
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const agentId = e.agentId!
+  if (base.recoveryUnavailable) return yield* handBack($, e, 'codex failed: recovery state unavailable', '', handback)
   await loadCatalog($)
   const resolved = retry ? { profile: retry.profile, rest: parseOverrides(rawTask).rest, invalid: checkProfile(catalog ?? undefined, retry.profile.model, retry.profile.effort) }
     : resolveProfile(base, rawTask, catalog ?? undefined)
@@ -3328,9 +3365,9 @@ async function* startRun(
   const key = `${count}:${delivery !== undefined ? `${delivery}:` : ''}${rawTask}`
   const recent = (base.launches ?? []).filter(t => now - t < WINDOW_MS)
   const trip =
-    base.guardTrip?.key === key ? base.guardTrip.reason
-    : retry && (retry.key !== key || base.capacityRetryKey === key) ? 'capacity retry already used or message changed'
-    : !retry && base.launchKey === key && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
+    base.guardTrip && (base.guardTrip.key === key || matchesIdentity({ guardTripKeyFingerprint: base.guardTripKeyFingerprint }, 'guardTripKey', key)) ? base.guardTrip.reason
+    : retry && (retry.key !== key || matchesIdentity(base, 'capacityRetryKey', key)) ? 'capacity retry already used or message changed'
+    : !retry && matchesIdentity(base, 'launchKey', key) && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
     : recent.length >= config.maxRunsPerWindow ? `${recent.length} launches in the last ${WINDOW_MS / 60000} min (maxRunsPerWindow ${config.maxRunsPerWindow})`
     : undefined
   if (trip !== undefined) {
@@ -3342,7 +3379,7 @@ async function* startRun(
     return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: rec.thread }, config.footer), handback)
   }
   rec.launches = [...recent, now]
-  rec.launchesSinceNew = base.launchKey === key ? (base.launchesSinceNew ?? 0) + 1 : 1
+  rec.launchesSinceNew = matchesIdentity(base, 'launchKey', key) ? (base.launchesSinceNew ?? 0) + 1 : 1
   rec.launchKey = key
   rec.guardTrip = undefined
   if (retry) rec.capacityRetryKey = key
@@ -3470,6 +3507,15 @@ async function* startRun(
 /** Forgets the answers of an agent's calls that were never made. */
 function dropAnswers(agentId: string): void {
   for (const [id, a] of answers) if (a.agentId === agentId) answers.delete(id)
+  const ids = new Set([...Object.keys(records.get(agentId)?.wire?.rows ?? {}), ...Object.keys(records.get(agentId)?.coordinator?.rows ?? {})])
+  for (const [id, row] of sourceRows) if (row.agentId === agentId) ids.add(id)
+  for (const [id, row] of questionRows) if (row.agent === agentId) ids.add(id)
+  for (const id of ids) {
+    sourceRows.delete(id)
+    planCards.delete(id)
+    questionRows.delete(id)
+    coordinatorRows.delete(id)
+  }
 }
 
 /** Kills a run's child (idempotent) and forgets it. */
@@ -4110,6 +4156,7 @@ async function* withCoordinatorMessages(
               const rows = coordinator.rows ??= {}
               rows[id] = { tool, text, sourceUuid: message.sourceUuid ?? message.uuid, messageId: o?.messageId }
               if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: messageStatus(o) }] })) throw new Error('invalid coordinator display answer')
+              await saveRow($, id, sourceRows.get(id)!)
               yield { kind: 'tool', index, id, name: tool }
               yield { kind: 'input', index: index++, json: JSON.stringify(input) }
               inserted.push({ at: originalTools, name: tool, input })
@@ -4215,6 +4262,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         continue
       }
       if (q.action.tool === displayTools.codex_plan) planCards.set(id, JSON.parse(JSON.stringify(q.action.input)) as PlanInput)
+      await saveRow($, id, sourceRows.get(id)!, planCards.get(id))
       if (q.action.tool === displayTools.codex_question && run.control) {
         const data: any = q.action.source?.data
         if (data?.status === 'pending') questionRows.set(id, { session: run.sessionId, agent: run.agentId, control: run.control, question: data, selected: {} })
@@ -4310,8 +4358,8 @@ async function* complete(
     const next = capacityFallback(catalog ?? undefined, record.fallbackModels ?? cfg.capacityFallback, run.prof)
     if (next) {
       const note = `${run.prof.model} at capacity; continued on ${next.model}`
-      const previous = run.usage || run.usagePartial ? footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage,
-        thread: run.thread, usagePartial: run.usagePartial, treeUsage: run.treeUsage, configNote: [run.configNote, 'capacity attempt usage'].filter(Boolean).join('; ') }, cfg.footer) : undefined
+      const previous = cfg.footer === 'off' ? undefined : run.usagePartial ? '↪ capacity attempt usage: partial/unknown'
+        : run.usage ? `↪ capacity attempt usage: ${run.usage.input} input (${run.usage.cached} cached), ${run.usage.output} output tokens` : undefined
       for (const f of run.followUps) if (!followUpsOf(record).some(sameFollowUp(f))) (record.followUps ??= []).push(f)
       const carry = [run.carry, previous].filter(Boolean).join('\n\n')
       const resumed = startRun($, e, signal, cfg, run.name, record, run.rawTask, run.handback, run.messageCount!, carry || undefined, run.delivery,

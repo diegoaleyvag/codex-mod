@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { JOURNAL_BYTES, journalPath, journalIndex, journalLine } from '../hooks/child-journal.mjs'
 import { TreeUsage } from '../hooks/tree-usage.mjs'
 import { PARENT, CHILD, PARENT_TURN, CHILD_TURN, nestedUsage } from './fixtures/nested-items.mjs'
 import batch5Items from './fixtures/batch5-items.mjs'
@@ -32,6 +33,7 @@ function start(scenario, { extra = [], prompt = 'do it', env = {}, control: cont
   })
   let stdout = ''
   let stderr = ''
+  child.stdout.setEncoding('utf8')
   child.stdout.on('data', d => (stdout += d))
   child.stderr.on('data', d => (stderr += d))
   child.stdin.end(prompt)
@@ -50,6 +52,40 @@ function start(scenario, { extra = [], prompt = 'do it', env = {}, control: cont
   return { child, control, exit, lines, sent, waitFor, cleanup, stderr: () => stderr }
 }
 const types = r => r.lines().map(l => l.type)
+
+test('child journal rotates below the host fs limit, including an event spanning segments; reload resumes its cursor', async () => {
+  const r = start('nested-large-journal', { env: { FAKE_CHILD_DELAY_MS: '600' } })
+  try {
+    assert.equal((await r.exit).code, 0, r.stderr())
+    const last = JSON.parse(readFileSync(journalIndex(r.control, CHILD), 'utf8')).segment
+    assert.ok(last >= 4)
+    let total = 0
+    for (let segment = 0; segment <= last; segment++) {
+      const bytes = statSync(journalPath(r.control, CHILD, segment)).size
+      assert.ok(bytes <= JOURNAL_BYTES)
+      total += bytes
+    }
+    assert.ok(total > 4 * 1024 * 1024)
+    const $ = { fs: { exists: async path => existsSync(path), read: async path => {
+      assert.ok(statSync(path).size <= 4 * 1024 * 1024)
+      return readFileSync(path, 'utf8')
+    } }, clock: { sleep: async () => {} } }
+    let cursor = { segment: 0, cursor: 0, prefix: '' }
+    const events = []
+    for (;;) {
+      const next = await journalLine($, r.control, CHILD, structuredClone(cursor))
+      if (!next) break
+      events.push(JSON.parse(next.line))
+      cursor = { segment: next.segment, cursor: next.cursor, prefix: next.prefix }
+    }
+    const expected = r.lines().filter(e => e.type === 'codexmod.childEvent').map(e => e.event)
+    // Compare exact lossless events without dumping megabytes on a failure.
+    assert.equal(events.length, expected.length)
+    for (let i = 0; i < events.length; i++) assert.equal(JSON.stringify(events[i]) === JSON.stringify(expected[i]), true, `event ${i}`)
+    assert.equal(events.filter(e => e.item?.text?.startsWith('á😀')).length, 6)
+    assert.ok(events.some(e => e.type === 'turn.completed'))
+  } finally { r.cleanup() }
+})
 
 for (const scenario of ['nested-one-child', 'nested-early', 'nested-both', 'nested-collab-only', 'nested-failure', 'nested-response-only']) test(`${scenario}: one child, independent public stream, attachment replay and direct/tree usage`, async () => {
   const r = start(scenario)

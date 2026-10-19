@@ -37,6 +37,7 @@ import { randomUUID } from 'node:crypto'
 import { createSteerControl } from '../hooks/steer-control.mjs'
 import { TreeUsage } from '../hooks/tree-usage.mjs'
 import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
+import { JOURNAL_BYTES, journalPath, journalIndex } from '../hooks/child-journal.mjs'
 
 const PROTOCOL_VERSION = 1
 const PLUGIN_VERSION = '1'
@@ -218,7 +219,10 @@ async function main() {
     for (;;) {
       const owner = JSON.parse(readFileSync(join(a.control, 'owner.json'), 'utf8'))
       let text = ''
-      try { text = readFileSync(join(a.control, `events-${a.thread}.jsonl`), 'utf8') } catch {}
+      let latest = 0
+      try { latest = JSON.parse(readFileSync(journalIndex(a.control, a.thread), 'utf8')).segment } catch (err) { if (err.code !== 'ENOENT') throw err }
+      if (latest > Number(a.segment ?? 0)) return
+      try { text = readFileSync(journalPath(a.control, a.thread, Number(a.segment ?? 0)), 'utf8') } catch (err) { if (err.code !== 'ENOENT') throw err }
       if (text.length > Number(a.cursor) || owner.ended || owner.generation !== a.generation || Date.now() >= until) return
       await new Promise(resolve => setTimeout(resolve, 100))
     }
@@ -269,7 +273,25 @@ async function main() {
   let drainTimer
   let rootCode = 0
   let parentStopping = false
-  const journal = id => join(args.control, `events-${id}.jsonl`)
+  const journals = new Map()
+  const appendJournal = (id, text) => {
+    const state = journals.get(id) ?? { segment: 0, bytes: 0 }
+    let rest = Buffer.from(text)
+    while (rest.length) {
+      let take = Math.min(rest.length, JOURNAL_BYTES - state.bytes)
+      // Keep UTF-8 code points intact for the host's text-only filesystem API.
+      while (take < rest.length && take > 0 && (rest[take] & 0xc0) === 0x80) take--
+      if (!take) { state.segment++; state.bytes = 0; continue }
+      appendFileSync(journalPath(args.control, id, state.segment), rest.subarray(0, take), { mode: 0o600 })
+      state.bytes += take
+      rest = rest.subarray(take)
+      // Publish only segments whose bytes already exist on disk.
+      const index = journalIndex(args.control, id)
+      writeFileSync(index + '.tmp', JSON.stringify({ version: 1, segment: state.segment }), { mode: 0o600 })
+      renameSync(index + '.tmp', index)
+    }
+    journals.set(id, state)
+  }
   const ownerState = () => {
     const path = join(args.control, 'owner.json')
     writeFileSync(path + '.tmp', JSON.stringify({ generation, updatedAt: Date.now(), ended: finished }))
@@ -278,7 +300,7 @@ async function main() {
   const childEmit = (state, event) => {
     const tagged = event.type === 'codexmod.child' ? { ...event, owner_thread_id: state.id, owner_turn_id: state.turnId }
       : { ...event, thread_id: state.id, turn_id: state.turnId }
-    appendFileSync(journal(state.id), JSON.stringify(tagged) + '\n', { mode: 0o600 })
+    appendJournal(state.id, JSON.stringify(tagged) + '\n')
     emit({ type: 'codexmod.childEvent', thread_id: state.id, turn_id: state.turnId, event: tagged })
   }
   const usageSnapshot = (final = false) => {
@@ -909,6 +931,7 @@ async function main() {
     stderrTail = (stderrTail + d).slice(-2000)
   })
   let out = ''
+  child.stdout.setEncoding('utf8')
   child.stdout.on('data', d => {
     out += d
     let n

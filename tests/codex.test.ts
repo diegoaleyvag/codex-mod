@@ -14,7 +14,8 @@ import batch6Images from './fixtures/batch6-images.mjs'
 import { imageFile, captureImage, generationAction, findingsAction, literalReceipt, IMAGE_MAX } from '../hooks/images-modes.ts'
 import batch7Models from './fixtures/batch7-models.mjs'
 import { resolvePolicy, canonicalOverrides, configHash, policyTask, capacityFallback } from '../hooks/run-policy.ts'
-import { RECORD_BUDGET } from '../hooks/store-state.ts'
+import { RECORD_BUDGET, compactStoreState, writeStoreState } from '../hooks/store-state.ts'
+import { fingerprint } from '../hooks/fingerprint.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
 import { PARENT as N_PARENT, CHILD as N_CHILD, PARENT_TURN as N_PT, CHILD_TURN as N_CT, nestedCommand, nestedFile, nestedActivity } from './fixtures/nested-items.mjs'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, resolveProfile, modelTitle, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
@@ -27,6 +28,17 @@ const cacheDirectories = {
     on('process.run', ($, e, next) => {
       if (e.argv[0] === 'mkdir' && String(e.argv.at(-1)).includes('/codex-mod/runs/state-')) return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return next(e)
+    })
+    // Keep the optional journal-index probe separate from each world's own
+    // filesystem fixture: the host permits one handler per event per module.
+    on('fs.exists', async ($, e: any, next) => {
+      if (!e.path.endsWith('.index.json')) return next(e)
+      try {
+        await $.fs.read(e.path)
+        return { value: true }
+      } catch {
+        return { value: false }
+      }
     })
   }) as any,
 }
@@ -164,6 +176,7 @@ type WorldOpts = {
   /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
   binary?: Map<string, string>
+  writeFile?: (path: string, text: string) => void
   readFile?: (path: string, text: string | undefined) => string | undefined
   /** False: the agent's conversation lacks the host's SubagentHandback reminder. */
   handback?: boolean
@@ -214,7 +227,8 @@ function world(on: On, opts: WorldOpts = {}) {
     return { value: { tool: `mcp__${opts.toolNamespace ?? 'codex-mod'}__${e.name}` } }
   })
   on('fs.write', (_$, e: any) => {
-    if (/\/runs\/state-[^/]+\/record\.json$/.test(e.path)) {
+    opts.writeFile?.(e.path, e.text)
+    if (/\/runs\/state-[^/]+\/(?:record\.json(?:\.\d+)?|row-\d+\.json)$/.test(e.path)) {
       stateWrites.push({ path: e.path, text: e.text })
       files.set(e.path, e.text)
     } else writes.push({ path: e.path, text: e.text })
@@ -328,7 +342,10 @@ function world(on: On, opts: WorldOpts = {}) {
 // Source evidence and display payloads now recover from private cache files.
 function savedState(w: ReturnType<typeof world>, key: string): any {
   const metadata: any = w.store.get(key)
-  return metadata?.cachedState ? JSON.parse(w.files.get(`/home/t/.cache/codex-mod/runs/state-${encodeURIComponent(key)}/record.json`)!) : metadata
+  if (!metadata?.cachedState) return metadata
+  const path = `/home/t/.cache/codex-mod/runs/state-${encodeURIComponent(key)}/record.json`
+  const saved = JSON.parse(w.files.get(path)!)
+  return saved.chunked === 1 ? JSON.parse(Array.from({ length: saved.chunks }, (_, i) => JSON.parse(w.files.get(`${path}.${i}`)!)).join('')) : saved
 }
 
 test('store load migrates a 900 KB wire and unknown oversized fields without losing resume identity', async ($, on) => {
@@ -357,7 +374,7 @@ test('store prune recovers when an already oversized store rejects shrinking rep
     expect((value as any).wire).toBe(undefined)
     expect(JSON.stringify(value).length <= RECORD_BUDGET).toBe(true)
   }
-  expect(w.stateWrites.length).toBe(3)
+  expect(w.stateWrites.filter(w => w.path.endsWith('/record.json')).length).toBe(3)
 })
 
 test('store rejection cannot fail an action step, its guard, or the handback', async ($, on) => {
@@ -565,6 +582,56 @@ test('nested recovery: persisted mirror cursor resumes public events with no sta
   const rec: any = w.store.get(`agent:sess-1:${m.host}`)
   expect(rec.playback.cursor).toBe(nestedJournal.length)
   expect(rec.mirror.host).toBe(m.host)
+})
+
+test('nested rotated journal reloads a later segment through the host fs limit without losing its child', async ($, on) => {
+  const m = savedMirror()
+  const files = new Map<string, string>()
+  const padding = Array.from({ length: 5 }, () => JSON.stringify({ type: 'unknown-child-event', thread_id: N_CHILD, data: 'x'.repeat(900000) }) + '\n').join('')
+  const text = padding + nestedJournal
+  const chunk = 256 * 1024
+  const segments = Math.ceil(text.length / chunk)
+  for (let i = 0; i < segments; i++) files.set(`${m.control}/events-${N_CHILD}${i ? `-${i}` : ''}.jsonl`, text.slice(i * chunk, (i + 1) * chunk))
+  files.set(`${m.control}/events-${N_CHILD}.index.json`, JSON.stringify({ segment: segments - 1 }))
+  files.set(`${m.control}/owner.json`, JSON.stringify({ generation: m.generation, ended: true }))
+  // Simulate a worker reload after the large earlier portion was consumed.
+  const segment = Math.floor(padding.length / chunk)
+  const cursor = padding.length % chunk
+  const part = text.slice(segment * chunk, (segment + 1) * chunk)
+  const w = world(on, { task: m.token, files, store: mirrorStore(m, { playback: { segment, cursor, prefix: part.slice(Math.max(0, cursor - 160), cursor), texts: [], queue: [], actions: 0 } }),
+    readFile: (_path, value) => { if (value !== undefined && value.length > 4 * 1024 * 1024) throw new Error('host fs limit'); return value } })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const s = await step($, m.host, i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+    await runCalls($, s.chunks, m.host)
+  }
+  expect(final).toContain('child checked the fixture')
+  expect(w.spawned.length).toBe(0)
+  expect(savedState(w, `agent:sess-1:${m.host}`).playback.segment).toBe(segments - 1)
+})
+
+for (const persistent of [false, true]) test(`nested journal read error ${persistent ? 'persistent' : 'transient'}: retry without inventing truncation`, async ($, on) => {
+  const m = savedMirror()
+  let failures = 0
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => {
+    if (path.endsWith(`/events-${N_CHILD}.jsonl`)) {
+      if (persistent || failures++ < 2) throw new Error('journal I/O unavailable')
+      return nestedJournal
+    }
+    if (path.endsWith('/owner.json')) return JSON.stringify({ generation: m.generation, ended: true })
+    return text
+  } })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const s = await step($, m.host, i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+    await runCalls($, s.chunks, m.host)
+  }
+  expect(w.spawned.length).toBe(0)
+  expect(w.sleeps.slice(0, 2)).toEqual([50, 100])
+  expect(final).not.toContain('truncated or replaced')
+  expect(final).toContain(persistent ? 'child journal read failed after 3 attempts' : 'child checked the fixture')
 })
 
 for (const gap of ['owner-lost', 'truncated', 'invalid-depth', 'malformed', 'foreign-child']) test(`nested recovery ${gap}: fail closed with no execution, inference or relaunch`, async ($, on) => {
@@ -4625,7 +4692,7 @@ for (const richRows of [false, true]) for (const nativeActions of [false, true])
 }
 
 test('batch 4 fallback ToolUse labels exact source identity and keeps the native row after consumption', async ($, on) => {
-  world(on, { stdout: batch4Line(batch4Items.find(i => i.id === 'open-missing')) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const w = world(on, { stdout: batch4Line(batch4Items.find(i => i.id === 'open-missing')) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
   on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
   const first = await step($, 'agent-progress')
   const [call] = callsOf(first.chunks)
@@ -4636,6 +4703,14 @@ test('batch 4 fallback ToolUse labels exact source identity and keeps the native
   expect(card.type).toBe('Box')
   expect(card.children[0].children).toEqual(['Codex web.openPage'])
   expect(card.children[1].children).toEqual(['HOST'])
+  expect(w.reads.some(path => /state-row-cache\/row-\d+\.json$/.test(path))).toBe(true)
+  const cached = [...w.files].find(([path]) => /state-row-cache\/row-\d+\.json$/.test(path))!
+  expect(JSON.parse(cached[1]).row.source).toBe(undefined)
+  expect(cached[1].length < 1024).toBe(true)
+  await step($, 'agent-progress', 1)
+  expect((await render(call.name, call.id) as any).children[0].children).toEqual(['Codex web.openPage'])
+  const replay: any = await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any)
+  expect(replay.deny).toContain('not executed')
   for (const [tool, id] of [['Bash', call.id], [call.name, 'foreign'], [call.name, `${ID_PREFIX}missing`]]) {
     expect((await render(tool, id) as any).children).toEqual(['HOST'])
   }
@@ -5129,7 +5204,7 @@ function b7Engine(w: ReturnType<typeof world>, agents: () => any[] = () => []) {
         return text
       },
       write: async (path: string, text: string) => {
-        if (/\/runs\/state-[^/]+\/record\.json$/.test(path)) {
+        if (/\/runs\/state-[^/]+\/(?:record\.json(?:\.\d+)?|row-\d+\.json)$/.test(path)) {
           w.stateWrites.push({ path, text })
           w.files.set(path, text)
         } else w.writes.push({ path, text })
@@ -5697,6 +5772,57 @@ for (const transport of ['exec', 'app-server'] as const) test(`R6 ${transport} c
     expect(rec.effectiveConfig).toMatchObject({ multiAgent: false })
     expect(w.core).toEqual([])
   })
+
+for (const transport of ['exec', 'app-server'] as const) test(`capacity fallback ${transport}: one final footer with a short failed-attempt usage note`,
+  { options: { transport } }, async ($, on) => {
+    const failed = cacheJsonl([{ type: 'thread.started', thread_id: cacheThread }, cacheUsageEvent(cacheFirst),
+      { type: 'turn.failed', error: { message: 'Selected model is at capacity' } }])
+    const opts = { files: cacheFiles(), runs: [{ stdout: failed, code: 1 }, { stdout: cacheJsonl([
+      { type: 'thread.started', thread_id: cacheThread }, { type: 'item.completed', item: { type: 'agent_message', text: 'recovered' } }, cacheUsageEvent(cacheTotal),
+    ]) }] }
+    const w = transport === 'exec' ? await startProject($, on, opts) : appWorld(on, opts)
+    if (transport === 'app-server') await startSession($)
+    const result = await step($, 'agent-project')
+    const text = handback(result.result)
+    expect(w.spawned.length).toBe(2)
+    expect(text).toContain('capacity attempt usage:')
+    expect(text).toContain('at capacity; continued on gpt-6-sol')
+    expect(text.split('\n').filter(line => line.includes(' · thread ')).length).toBe(1)
+    expect(text).not.toContain('implementer · gpt-6.1-sol ·')
+  })
+
+for (const failure of ['none', 'missing', 'write'] as const) test(`recovery reload ${failure}: long identities cannot relaunch completed work`, async ($, on) => {
+  const task = 'task'.repeat(1100)
+  const key = 'agent:sess-1:agent-restarted'
+  const w = world(on, { task })
+  const engine = b7Engine(w) as any
+  const write = engine.fs.write
+  engine.fs.write = async (path: string, body: string) => {
+    expect(body.length <= 4 * 1024 * 1024).toBe(true)
+    if (failure === 'write') throw new Error('disk full')
+    return write(path, body)
+  }
+  const value = { ...PERSISTED, agentName: 'codex', lastTask: task, launchKey: `1:${task}`, userCount: 1, launchesSinceNew: 1, lastAnswer: 'a'.repeat(4 * 1024 * 1024 + 100), updatedAt: 1_000_000 }
+  expect(await writeStoreState(engine, key, value)).toBe(failure !== 'write')
+  const compact: any = w.store.get(key)
+  expect(compact.lastTask).toBe(undefined)
+  expect(compact.lastTaskFingerprint).toEqual(fingerprint(task))
+  expect(compact.launchKeyFingerprint).toEqual(fingerprint(`1:${task}`))
+  if (failure === 'missing') w.files.clear()
+  const result = await step($, 'agent-restarted')
+  expect(w.spawned.length).toBe(0)
+  if (failure !== 'none') expect(handback(result.result)).toContain('codex failed: recovery state unavailable')
+})
+
+test('compact launch fingerprint alone still blocks the same queued message after reload', async ($, on) => {
+  const task = 'same launch'.repeat(400)
+  const record = { ...compactStoreState({ ...PERSISTED, agentName: 'codex', lastTask: 'previous', userCount: 1, launchKey: `1:receipt:${task}`, launchesSinceNew: 1, updatedAt: 1_000_000 }),
+    followUps: [{ text: task, count: 1, uuid: 'receipt' }], handedBack: true }
+  const w = world(on, { store: new Map([['agent:sess-1:agent-restarted', record]]), messages: () => [user('previous'), ...toolResult('SubagentHandback')] })
+  const result = await step($, 'agent-restarted')
+  expect(w.spawned.length).toBe(0)
+  expect(handback(result.result)).toContain('this message already had its Codex run')
+})
 
 for (const mode of ['twice', 'guard', 'invalid', 'role', 'empty'] as const) test(`R6 capacity fallback ${mode}: bounded retry and validated per-role choices`,
   { options: { maxRunsPerWindow: mode === 'guard' ? 1 : 3, capacityFallback: mode === 'invalid' ? ['gpt-hidden', 'missing'] : ['gpt-6-sol', 'gpt-5.6-sol'] } }, async ($, on) => {

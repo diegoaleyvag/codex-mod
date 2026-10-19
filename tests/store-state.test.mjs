@@ -1,9 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { fingerprint, matchesIdentity } from '../hooks/fingerprint.ts'
 import { compactStoreState, readStoreState, writeStoreState, flushStoreMigrations, RECORD_BUDGET, FIELD_BUDGET, DEDUP_LIMIT } from '../hooks/store-state.ts'
 
 const record = () => ({ model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', agentName: 'codex', thread: 'resume-me', updatedAt: 100 })
-function host({ limit = Infinity, reject = false, diskFails = false } = {}) {
+function host({ limit = Infinity, reject = false, diskFails = false, fsLimit = 4 * 1024 * 1024 } = {}) {
   const store = new Map()
   const files = new Map()
   const logs = []
@@ -13,8 +15,8 @@ function host({ limit = Infinity, reject = false, diskFails = false } = {}) {
     ui: { log: text => logs.push(text) },
     process: { run: async () => ({ code: 0 }) },
     fs: {
-      write: async (path, body) => { if (diskFails) throw new Error('disk full'); files.set(path, body) },
-      read: async path => { if (!files.has(path)) throw new Error('missing cache'); return files.get(path) },
+      write: async (path, body) => { if (diskFails) throw new Error('disk full'); assert.ok(Buffer.byteLength(body) <= fsLimit, 'host fs write limit'); files.set(path, body) },
+      read: async path => { if (!files.has(path)) throw new Error('missing cache'); assert.ok(Buffer.byteLength(files.get(path)) <= fsLimit, 'host fs read limit'); return files.get(path) },
     },
     store: {
       set: async (key, value) => {
@@ -156,4 +158,42 @@ test('concurrent checkpoints serialize file and metadata writes for an agent', a
   release()
   assert.deepEqual(await Promise.all([old, next]), [true, true])
   assert.deepEqual(await readStoreState(h.$, 'agent:s:a', h.store.get('agent:s:a')), latest)
+})
+
+test('SHA-256 identities match Node for Unicode, lone surrogates and block boundaries', () => {
+  for (const text of ['', 'abc', 'á😀\ud800', ...[55, 56, 63, 64, 65, 10000].map(n => 'x'.repeat(n))]) {
+    assert.deepEqual(fingerprint(text), { length: text.length, sha256: createHash('sha256').update(text).digest('hex') })
+  }
+})
+
+test('over-4-MiB recovery checkpoints reload losslessly through bounded fs calls', async () => {
+  const h = host()
+  const value = { ...record(), lastTask: 'task😀'.repeat(2000), launchKey: '1:task😀'.repeat(2000), lastAnswer: 'done😀'.repeat(900000), userCount: 1, launchesSinceNew: 1 }
+  assert.ok(Buffer.byteLength(JSON.stringify(value)) > 4 * 1024 * 1024)
+  assert.equal(await writeStoreState(h.$, 'large', value), true)
+  const metadata = structuredClone(h.store.get('large'))
+  assert.equal(metadata.lastTask, undefined)
+  assert.equal(metadata.lastAnswer, undefined)
+  assert.ok(matchesIdentity(metadata, 'lastTask', value.lastTask))
+  assert.ok(matchesIdentity(metadata, 'launchKey', value.launchKey))
+  assert.equal(matchesIdentity(metadata, 'lastTask', value.lastTask + '!'), false)
+  const fresh = host()
+  for (const [path, text] of h.files) fresh.files.set(path, text)
+  assert.deepEqual(await readStoreState(fresh.$, 'large', metadata), value)
+  fresh.files.delete([...fresh.files.keys()].find(path => path.endsWith('.2')))
+  const lost = await readStoreState(fresh.$, 'large', metadata)
+  assert.equal(lost.recoveryUnavailable, true)
+  assert.ok(matchesIdentity(lost, 'launchKey', value.launchKey))
+})
+
+test('failed cache writes preserve independent fingerprints and a durable fail-closed marker', async () => {
+  const h = host({ diskFails: true })
+  const value = { ...record(), lastTask: 'same task'.repeat(1000), launchKey: '1:same task'.repeat(1000), capacityRetryKey: '1:same task'.repeat(1000), guardTrip: { key: '1:same task'.repeat(1000), reason: 'already launched' }, lastAnswer: 'answer'.repeat(1000), userCount: 1, launchesSinceNew: 2 }
+  assert.equal(await writeStoreState(h.$, 'lost', value), false)
+  const loaded = await readStoreState(host().$, 'lost', structuredClone(h.store.get('lost')))
+  assert.equal(loaded.recoveryUnavailable, true)
+  for (const field of ['lastTask', 'launchKey', 'capacityRetryKey']) assert.ok(matchesIdentity(loaded, field, value[field]))
+  assert.ok(matchesIdentity(loaded, 'guardTripKey', value.guardTrip.key))
+  assert.equal(loaded.launchesSinceNew, 2)
+  assert.equal(loaded.userCount, 1)
 })

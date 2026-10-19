@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve bounded SHA-256 task/launch identities independently of recovery payloads, split large checkpoints below the host filesystem limit, and refuse relaunches with an explicit recovery error when state is unavailable.
+- Rotate child journals into indexed 1 MiB segments with resumable cursors, preserve Unicode across stream/segment boundaries, and report persistent read failures separately from truncation.
+- Replace retained row source copies with bounded presentation metadata, release consumed/run/session entries, and recover historical labels/plans lazily from a bounded private disk cache. Show one final footer on capacity fallback with a short note for the failed attempt's usage.
+
 - R6: add per-role lean, selective capabilities and fallbackModels with user-level allowProjectNonLean/projectCapabilityAllowlist limits. Snapshot canonical overrides, role instructions and Codex home with an effective-config fingerprint for both transports; warn on model/effort continuity changes.
 - Add an explicit no-subagents instruction and spawn detection when multiAgent is off. Preserve real child rows/mirrors and document native v2 feature-gate limits, MCP discovery limits and unverified history-output caps.
 - Correct exec resumed accounting with persisted full-thread deltas, duplicate-total replacement, partial/unknown interruption baselines and full footer thread IDs. Keep final app-server direct/tree accounting consistent without counting response and cumulative copies twice.

@@ -56,6 +56,9 @@ const childWork = () => {
   childNote('item/commandExecution/outputDelta', { itemId: nestedCommand.id, delta: 'child' })
   childNote('item/started', { item: { ...nestedFile, status: 'inProgress' } })
   childNote('item/completed', { item: nestedFile })
+  if (scenario === 'nested-large-journal') {
+    for (let i = 0; i < 6; i++) childNote('item/completed', { item: { type: 'agentMessage', id: `large-${i}`, text: 'á😀'.repeat(180000) } })
+  }
   const numeric = { threadId: CHILD, turnId: CHILD_TURN, responseId: 'child-response-1', rootTurnId: PARENT_TURN, usage: nestedUsage(2000, 1500, 100).total }
   note('rawResponse/completed', numeric)
   note('rawResponse/completed', numeric)
