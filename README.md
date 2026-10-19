@@ -2,13 +2,43 @@
 
 [![CI](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml/badge.svg)](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version 1.1.0](https://img.shields.io/badge/version-1.1.0-informational.svg)](CHANGELOG.md)
+[![Version 1.2.0](https://img.shields.io/badge/version-1.2.0-informational.svg)](CHANGELOG.md)
 
 codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hooks-module API) that adds subagent types answered by the OpenAI Codex CLI running on your machine instead of an Anthropic model. Claude stays the orchestrator and delegates self-contained tasks to `codex exec --json`, using your own ChatGPT/Codex login. Codex's commands and file changes show up in the transcript as ordinary Bash, Edit and Write rows, and its final answer comes back like any other subagent report.
 
 ![Codex agent steered mid-turn in Claude Code Desktop: the agent panel shows its commands, the "↪ steer delivered to Codex mid-turn" note and the footer with app-server · 1 steer](docs/demo.gif)
 
 *Claude delegates to a Codex agent (gpt-6-luna, low), then sends it a change of plan while it works; Codex picks it up mid-turn.*
+
+## What's new in 1.2
+
+- **More faithful action rows:** reads, searches, file changes, web results and
+  plans use native rows when source evidence and host admission permit them,
+  with full-text fallbacks and conservative compound-command labels.
+- **Model and effort selection:** choose a registered model type or declare
+  project roles; titles identify the executing Codex model and effort.
+- **Steering and child lifecycle:** correlated delivery outcomes, existing-child
+  observation without rerunning its work, bounded retries and honest fallbacks.
+- **Recovery and accounting:** bounded presentation caches, segmented child
+  journals, exact launch identities, direct/tree usage and one same-thread
+  capacity fallback when configured.
+
+Desktop acceptance is partial. Native Read/Write/Edit, model/effort titles,
+delivered steering and a real parent/helper completion were observed. The
+Coordinator receipt preserves full text and accepted-turn status, but its
+custom card and live redraw remain unaccepted. The host may still label a
+Codex child as Haiku. Interactive questions, native task placement and some
+expanded/reopened rows also need live checks. `richRows` stays off by default;
+`app-server` remains opt-in. See the [verification record](docs/codex-ui-map.md#desktop-followup-verification-2026-10-19).
+
+### Upgrading from 1.1
+
+The built-in `sol`, `sol-high` and `astra-audit` types were removed. Replace
+them with [project roles](#roles-per-project), or use `codex-mod:codex` with
+`codex-model:` and `codex-effort:` prompt lines. The former `roles` option is
+ignored with a warning. Existing Codex login and plugin options are retained.
+Finish active work and start a fresh session after updating; Desktop hooks
+may require quitting and reopening the application.
 
 ## How it works
 
@@ -33,13 +63,18 @@ Codex events --> native Bash / Edit / Write rows (answered by a tool.call hook,
 
 ### What Codex work looks like
 
+Exploration adapters accept agent commands marked `agent` or `unifiedExecStartup`.
+User-shell commands and later unified-exec interactions retain Bash rows. Compound
+and conditional Bash descriptions summarize the whole command conservatively;
+the original command and output stay intact.
+
 Commands normally appear as Bash rows. With `app-server`, a single faithful read, file listing or search can appear as Read, Glob or Grep when Codex reports a matching `commandActions` entry. A literal command parser admits whole `cat` reads, `head`/`tail` slices whose output establishes the file total, file-only NUL-delimited `find`/`rg --files` listings, and framed ripgrep content/files/match-count searches. Fixed strings are escaped into equivalent regexes. The original command and cwd appear beside each translated row; results come from Codex's output without another read, search or shell run.
 
 Pipelines, multiple actions, redirects, substitutions, unknown slice totals, directory listings, ambiguous filenames/output and unsupported options keep one Bash row. Normal `exec` output has no command actions and stays Bash. A streamed command and its polls produce one final row. Read/Glob/Grep are admitted in each Codex agent's own tools and protected by both guards and their refusing catches, including the placeholder agent's Read; ordinary main-thread and verified Claude subagent calls pass unchanged. An unavailable exploration tool falls back to Bash when admitted. Results retain the delivered output, including CRLF and trailing newlines; already truncated output stays Bash. An unreported Glob duration is disclosed as a 0 ms display sentinel.
 
 File additions use Write only with complete exact content. Updates use Edit only when the source diff applies to a captured base and matches stable completion reads; several bounded exact hunks can produce ordered Edit rows. Other patches use Bash’s typed patch diff with a display-comment input, including deletion flags and both move paths when images are verified. Missing facts retain the literal reported diff. Failed/declined or unconfirmed patches use error rows; they never imply successful writes. Each source patch counts once, separately from its file/hunk rows. Plan updates use `codex_plan`. These rows show work Codex already did and never execute a Claude action tool. Main-list UI isolation additionally depends on the host retaining child scope; see the Batch 5 live checks below. Grep content decodes ripgrep's JSON into matching/context lines with reported paths and requested line numbers; raw JSON remains in the source record. Count mode requires actual regex-match counts (`--count-matches`), rather than treating matching-line counts as match totals. Empty no-match searches succeed; actual failures keep Bash error rows. Desktop grouping and expanded-row appearance still need a new-session live check.
 
-Messages received from the coordinator appear in the Codex subagent view as display-only `coordinator_message` rows with a **Coordinator** card and the full original text, including override lines. Source UUIDs prevent repeat display after a worker restart; messages over 90,000 characters split into numbered parts. With `nativeActions: false`, or if tool registration fails, they appear as text headed "Coordinator message:". The same card subscribes to message status: received, accepted into a specific turn, queued after a turn, rejected with the reason, or uncertain. Acceptance confirms the RPC response, not that the model read or followed the instruction. Literal receipt/status text and `↪` notes remain as fallbacks. Owned receipt rows survive worker restart; reopened rows can restore their literal full-body rendering from the durable record. Text fallback fences markup so tags and Markdown stay visible. Cards need a new Desktop session after reloading the plugin; their live appearance and history replay still need Desktop verification.
+Messages received from the coordinator appear in the Codex subagent view as display-only `coordinator_message` rows with the full original text, including override lines. Where the host dispatches the custom renderer, a **Coordinator** card shows the message first, its delivery status below, and full message/turn identifiers in dimmed details. Status distinguishes received, accepted into a specific turn, observed in Codex input, queued after a turn, rejected with the reason, and uncertain. Source UUIDs prevent repeat display after a worker restart; messages over 90,000 characters split into numbered parts. With `nativeActions: false`, or if tool registration fails, they appear as text headed "Coordinator message:". Acceptance confirms the RPC response, not that the model read or followed the instruction. Literal receipt/status text and `↪` notes remain as fallbacks. Reopened rows can restore their literal full-body rendering before tool registration; nonlegacy names require a matching session, cached row owner, exact tool name/ID and received receipt. Text fallback fences markup so tags and Markdown stay visible. New-session Desktop tests with bundled CLI 2.1.299 confirmed literal receipt, accepted-turn status and delivered steering, but showed generic tool details; custom-card paint and live redraw are not accepted on that host.
 
 Experimental `richRows: true` prefers TodoWrite for plans when admitted, then the paired TaskCreate/TaskUpdate tools, then `codex_plan`. TodoWrite is disabled in the tested host; Task* admission depends on the host/model. The plugin keeps per-agent/thread snapshots and synthetic `codex-plan-…` IDs across restarts/resume, matching exact text occurrences and explicitly removing/creating ambiguous reordered or renamed steps. Native task rows acknowledge this display registry only: no host tasks, assignments, dependencies or hooks execute. The fallback includes the full checklist and explanation in input, result and an owned checkbox card.
 
@@ -86,6 +121,12 @@ claude plugin install codex-mod@codex-mod --scope user
 ```
 
 Start a new session afterwards: agent types are registered at session start.
+
+For local development, a directory marketplace can execute the clone directly;
+the versioned `installed_plugins.json` cache path alone does not identify the
+loaded source. After hooks-module edits, finish active work, quit and reopen
+Desktop, then test in a new session. A new chat or `/reload-plugins` alone did
+not load the changed diagnostic module in the tested Desktop setup.
 
 Update:
 
@@ -313,7 +354,11 @@ launches, and call/check admissions with their tool ID. Nested re-entry logs
 flush when the parent's spawn call settles; prompt tokens are never logged.
 Exec, failed rejoin, unavailable history and host admission failures keep the
 Batch 5 view and log the reason. A lost mirror or owner is never relaunched
-automatically. Native stop targets the exact child and its source descendants;
+automatically. The host's exact auto-mode no-verdict denial can request one
+unchanged observer-launch retry. That retry requires an unconsumed live launch
+capability, no created host, and a durable checkpoint retiring the first core
+tool ID. A second denial, other refusal or uncertain outcome keeps the fallback;
+the plugin never fabricates consent. Native stop targets the exact child and its source descendants;
 parent stop also cascades after a hooks-worker restart. A stop request remains
 `stopping` until source termination confirms interruption; a killed observer
 may retain that pending state until its journal is read again. Running child

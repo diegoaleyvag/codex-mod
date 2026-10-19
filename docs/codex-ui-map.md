@@ -383,6 +383,11 @@ host store; hydration restores presentation, never executable guard answers.
 Plain receipt results, literal text/status and `↪` notes remain export/replay
 fallbacks until NEW Desktop validation passes.
 
+New-session Desktop checks with bundled CLI 2.1.299 on 2026-10-19 confirmed the literal receipt,
+accepted-turn status and delivered steering. The host displayed generic tool
+details; custom Coordinator paint and live status redraw are not accepted.
+This observation does not establish whether dispatch or the renderer failed.
+
 Status distinguishes received/pending, accepted into the matching RPC turn,
 observed correlated input (when emitted), queued after a turn, rejected with
 the actual error, and uncertain. Accepted/observed do not claim obedience or
@@ -415,3 +420,45 @@ harness](../tests/fixtures/steer-v2-harness.md) for host ordering and live gates
 - Automated fixtures are evidence of routing/accounting only. Use a new Desktop
   session after plugin reload for native controls and real capability checks;
   follow `tests/fixtures/cache-harness.md` for headless reproduction.
+
+## Desktop followup verification (2026-10-19)
+
+- Desktop's bundled CLI 2.1.299 and PATH CLI 2.1.302 both passed 718 plugin tests;
+  the runner passed 105 tests. Strict plugin validation passed.
+- Native Read rows and the compound label `Run shell commands: pwd, wc` were
+  observed. Earlier checks observed native Write/Edit and model/effort titles.
+- A fresh real parent with one Codex helper completed with a native
+  `task-notification` status of `completed`. The helper journal contains one
+  completed terminal and no stale interrupted projection; direct and child
+  usage remain separate in the ledger.
+- Auto denied the observer launch twice, including the single unchanged retry.
+  The explicit unavailable-mirror fallback preserved the helper's real result.
+  A native helper transcript remains unavailable under that denial.
+- The child panel's host model badge still says Haiku; the owned parent title
+  identifies the actual Codex model and effort. Custom Coordinator paint,
+  replay and live redraw remain unaccepted. These checks do not establish all
+  native rows, task placement, question controls or reopened-history behavior.
+
+## Audit followup (2026-10-19)
+
+- Reproduced and fixed a distinct fresh-worker recovery gap: a persisted
+  host-returned name can restore before registration through the current
+  session's exact row owner and received receipt. Foreign/session/name/ID
+  mismatches remain host fallbacks; recovery grants no execution authority.
+- Observer fallback notices now show a short child identity and concise
+  launch outcome. Full identity/reason stay in private diagnostics. The
+  Coordinator renderer keeps the body primary, delivery state separate and
+  full message/turn identifiers dimmed; exported status text is unchanged.
+- PATH CLI 2.1.302 and bundled Desktop CLI 2.1.299 each passed 739 plugin
+  tests; the runner passed 105 tests. Strict validation and diff checks passed.
+- One temporary metadata-only probe was loaded by a full restart of Desktop
+  2.42304.2. Reopening the existing completed agent and expanding its Coordinator
+  receipt and native Read produced no child ToolUse entry. The same worker
+  recorded main Agent, ToolSearch and SendMessage entries, with matching request
+  and tool-use IDs. The receipt still showed generic details with its full
+  text and accepted-turn status.
+- This narrows that historical observation to a boundary before the plugin's
+  child-row handler; the exact host gate remains unresolved. The recovery fix
+  does not explain it, and the new card layout/live redraw remain unaccepted
+  in Desktop. No source work was launched for the probe. Instrumentation was
+  removed from the runtime root and cache, and Desktop was restarted again.

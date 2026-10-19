@@ -132,6 +132,59 @@ for (const scenario of ['nested-rejoin-failure', 'nested-ancestry', 'nested-hist
   } finally { r.cleanup() }
 })
 
+test('replayed terminal yields to a buffered same-ID start; real completion closes the root once', async () => {
+  const r = start('nested-replayed-terminal')
+  try {
+    await r.waitFor(() => existsSync(join(r.control, 'owner.json')) && JSON.parse(readFileSync(join(r.control, 'owner.json'), 'utf8')).ended)
+    assert.equal((await r.exit).code, 0, r.stderr())
+    const rpc = r.sent().filter(m => m.method)
+    assert.equal(rpc.filter(m => m.method === 'thread/start').length, 1)
+    assert.equal(rpc.filter(m => m.method === 'turn/start').length, 1)
+    assert.deepEqual(rpc.filter(m => m.method === 'turn/start').map(m => m.params.threadId), [PARENT])
+    assert.equal(rpc.filter(m => m.method === 'thread/resume').length, 1)
+    assert.equal(rpc.filter(m => m.method === 'thread/turns/list').length, 1)
+    assert.equal(rpc.filter(m => m.method === 'thread/items/list').length, 2)
+    const events = r.lines().filter(l => l.type === 'codexmod.childEvent').map(l => l.event)
+    assert.equal(events.filter(e => e.type === 'codexmod.turn').length, 1)
+    assert.equal(events.filter(e => e.type === 'turn.failed').length, 0)
+    assert.equal(events.filter(e => e.type === 'turn.completed').length, 1)
+    assert.equal(events.filter(e => e.source?.event === 'turn/completed').length, 1)
+    assert.equal(events.filter(e => e.type === 'item.completed' && e.source.item.id === 'child-command').length, 1)
+    assert.equal(events.filter(e => e.type === 'item.completed' && e.source.item.id === 'child-file').length, 1)
+    assert.equal(events.filter(e => e.type === 'item.completed' && e.source.item.id === 'child-final').length, 1)
+    assert.deepEqual(events.find(e => e.type === 'turn.completed').usage, { input_tokens: 2000, cached_input_tokens: 1500, output_tokens: 100 })
+    assert.deepEqual(events.filter(e => e.type === 'codexmod.directUsage').at(-1).usage, { input: 2000, cached: 1500, output: 100 })
+    const tree = r.lines().filter(e => e.type === 'codexmod.treeUsage').at(-1)
+    assert.deepEqual(tree.tree, { input: 3000, cached: 2100, output: 150 })
+    assert.equal(tree.active, 0)
+    const usage = JSON.parse(readFileSync(join(r.control, 'usage.json'), 'utf8'))
+    assert.equal(usage.turns.filter(([, value]) => value.thread === CHILD && value.turn === CHILD_TURN).length, 1)
+    assert.equal(usage.responses.filter(([, value]) => value.thread === CHILD).length, 1)
+    const journal = readFileSync(join(r.control, `events-${CHILD}.jsonl`), 'utf8').trim().split('\n').map(JSON.parse)
+    assert.deepEqual(journal, events)
+    assert.equal(r.lines().filter(e => e.type === 'turn.completed').length, 1)
+  } finally {
+    r.child.kill('SIGKILL')
+    r.cleanup()
+  }
+})
+
+test('replayed interrupted history remains terminal without a superseding source start', async () => {
+  const r = start('nested-history-terminal')
+  try {
+    await r.waitFor(() => existsSync(join(r.control, 'owner.json')) && JSON.parse(readFileSync(join(r.control, 'owner.json'), 'utf8')).ended)
+    assert.equal((await r.exit).code, 0, r.stderr())
+    const events = r.lines().filter(l => l.type === 'codexmod.childEvent').map(l => l.event)
+    assert.equal(events.filter(e => e.type === 'turn.failed' && e.status === 'interrupted').length, 1)
+    assert.equal(events.filter(e => e.type === 'turn.completed').length, 0)
+    assert.equal(events.filter(e => e.type === 'codexmod.turn').length, 0)
+    assert.equal(r.sent().filter(m => m.method === 'turn/start').length, 1)
+  } finally {
+    r.child.kill('SIGKILL')
+    r.cleanup()
+  }
+})
+
 test('nestedAgents:false retains Batch 5 without child rejoin or mirror events', async () => {
   const r = start('nested-one-child', { extra: ['--nested', 'false'] })
   try {

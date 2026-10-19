@@ -16,6 +16,7 @@ import batch7Models from './fixtures/batch7-models.mjs'
 import { resolvePolicy, canonicalOverrides, configHash, policyTask, capacityFallback } from '../hooks/run-policy.ts'
 import { RECORD_BUDGET, compactStoreState, writeStoreState } from '../hooks/store-state.ts'
 import { fingerprint } from '../hooks/fingerprint.ts'
+import { ROW_SLOTS } from '../hooks/row-cache.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
 import { PARENT as N_PARENT, CHILD as N_CHILD, PARENT_TURN as N_PT, CHILD_TURN as N_CT, nestedCommand, nestedFile, nestedActivity } from './fixtures/nested-items.mjs'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, resolveProfile, modelTitle, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
@@ -456,6 +457,65 @@ const nestedJournal = [
 ].map(e => JSON.stringify(e) + '\n').join('')
 const nestedRootPieces = [THREAD(N_PARENT), out(JSON.stringify({ type: 'codexmod.turn', turn_id: N_PT })),
   out(JSON.stringify(nestedSource(nestedActivity, true))), out(JSON.stringify(nestedReady)), MESSAGE('parent done')]
+// Literal captured host denial, independent of the implementation constant.
+const HOST_MIRROR_NO_VERDICT = 'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is; if it is denied again, continue with other tasks that don\'t require it and tell the user that auto mode could not evaluate it. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.'
+const HOST_MIRROR_NO_VERDICT_CURLY = 'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is; if it is denied again, continue with other tasks that don’t require it and tell the user that auto mode could not evaluate it. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.'
+let nestedHarnessCount = 0
+
+/** The kit's plugin worker and imported helpers have separate live maps.
+ * Keep the entire source step and native guard chain in this one module. */
+async function nestedLaunchHarness(on: On, opts: WorldOpts) {
+  const w = world(on, opts)
+  const hooks = b7Hooks({ transport: 'app-server', richRows: true, progressIntervalMs: 0, timeoutMs: 0 })
+  const unique = `nested-harness-${++nestedHarnessCount}`
+  const parent = `agent-${unique}`
+  const session = `${unique}:sess-1`
+  const agents = () => opts.agentList!().map(a => ({ ...a, id: a.id === 'agent-progress' ? parent : a.id,
+    ...(a.parentId === 'agent-progress' ? { parentId: parent } : {}) }))
+  const engine: any = b7Engine(w, agents)
+  engine.session.id = async () => `${unique}:${typeof opts.sessionId === 'function' ? opts.sessionId() : 'sess-1'}`
+  engine.session.messages = async ({ as }: any) => as === 'api' ? [apiOf(user('root task')), apiOf(HANDBACK_ROW)] : [user('root task')]
+  engine.tool = {
+    list: async () => ['Bash', 'Edit', 'Write', 'Agent', 'TodoWrite'].map(name => ({ name })),
+    register: async (spec: any) => { w.toolSpecs.push(spec); return { tool: `mcp__codex-mod__${spec.name}` } },
+  }
+  engine.agent.register = async ({ name }: any) => ({ agent: `codex-mod:${name}` })
+  engine.fs.exists = async (path: string) => path.endsWith('/scripts/codex-runner.mjs')
+  engine.fs.list = async () => []
+  engine.clock.sleep = async (ms: number) => { w.clock.now += ms }
+  engine.process.run = async (argv: string[]) => runOk(argv[0] === 'which' ? `/bin/${argv[1]}`
+    : argv[1]?.endsWith('/scripts/codex-runner.mjs') && argv[2] === '--version' ? '1'
+    : argv.includes('--version') ? 'codex-cli 0.163.0' : 'ok').value
+  engine.process.spawn = async function* (input: Spawned) {
+    w.spawned.push(input)
+    for (const piece of opts.pieces ?? []) {
+      if (typeof piece === 'string' || typeof piece === 'function') throw new Error('unexpected harness wait')
+      yield piece
+    }
+    return { code: 0, signal: null }
+  }
+  const set = engine.store.set
+  engine.store.set = async (key: string, value: any) => {
+    if (opts.storeReject?.(key, value)) throw new Error('store limit exceeded')
+    return set(key, value)
+  }
+  await hooks.get('session.start')!.handler(engine, {}, b7Next(async () => ({})))
+  return { w, hooks, engine, parent, session,
+    step: async (index: number) => {
+      const chunks: any[] = []
+      const e = { turnId: 'turn-1', index, agentId: parent, model: 'claude-haiku-4-5', messageCount: 1 }
+      const stream = hooks.get('turn.step')!.handler(engine, e, b7Next(async function* () { w.modelCalls.push(parent); throw new Error('model must not run') }))
+      for (;;) { const r = await stream.next(); if (r.done) return { chunks, result: r.value }; chunks.push(r.value) }
+    },
+    calls: async (chunks: any[]) => {
+      for (const c of callsOf(chunks).filter(c => c.name !== 'SubagentHandback')) {
+        const result = await hooks.get('tool.call')!.handler(engine, { tool: c.name, ...c.input, tool_use_id: c.id, agentId: parent },
+          b7Next(async () => { w.core.push({ tool: c.name }); throw new Error('native executor must not run') }))
+        expect(result.deny).toBe(undefined)
+      }
+    },
+  }
+}
 
 test('nested mirrors: hidden type; early core-event identity reconciles with list; child rows execute zero native tools', { options: { transport: 'app-server', progressIntervalMs: 0 } }, async ($, on) => {
   let prompt = 'root task'
@@ -534,10 +594,178 @@ for (const refusal of ['deny', 'depth', 'attachment', 'uncertain']) test(`nested
   on('agent.spawn', (_$, e: any) => { calls.push(e); if (refusal === 'uncertain') throw new Error('lost host result'); return { deny: 'concurrency limit' } })
   const s = await step($, 'agent-progress')
   const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n') + (s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer)
-  expect(text).toContain('mirror unavailable')
-  if (refusal === 'depth') expect(text).toContain('observer dispatch depth limit 3')
+  const notice = text.split('\n').find(line => line.includes('observer transcript unavailable'))!
+  expect(notice).toContain(`Codex child ${N_CHILD.slice(-8)}`)
+  expect(notice).toContain('Showing reported child activity')
+  expect(notice).not.toContain(N_CHILD)
+  expect(notice).not.toContain('Batch 5')
+  expect(notice.length < 220).toBe(true)
+  if (refusal === 'depth') {
+    expect(notice).toContain('Observer nesting limit reached')
+    expect(w.logs.some(line => line.includes('observer dispatch depth limit 3'))).toBe(true)
+  }
+  if (refusal === 'deny') {
+    expect(notice).toContain('Observer launch declined')
+    expect(w.logs.some(line => line.includes(N_CHILD) && line.includes('concurrency limit'))).toBe(true)
+  }
+  if (refusal === 'attachment') expect(notice).toContain('Observer attachment incomplete')
   expect(w.spawned.length).toBe(1)
   expect(calls.length).toBe(refusal === 'deny' || refusal === 'uncertain' ? 1 : 0)
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+for (const [apostrophe, denial] of [['ASCII', HOST_MIRROR_NO_VERDICT], ['curly', HOST_MIRROR_NO_VERDICT_CURLY]] as const) {
+for (const outcome of ['success', 'second-denial'] as const) test(`nested exact ${apostrophe} auto-mode denial then ${outcome}: one unchanged retry with a fresh core ID`,
+  { options: { transport: 'app-server', richRows: true, progressIntervalMs: 0 } }, async ($, on) => {
+    const host = 'host-retried-child'
+    const inputs: any[] = []
+    let observers = 0
+    const agents = () => [{ id: 'agent-progress', type: 'codex-mod:codex', description: 'parent', status: 'running' },
+      { id: host, type: 'codex-mod:codex-child', parentId: 'agent-progress', spawnedBy: 'codex-mod', status: 'running' }]
+    const harness = await nestedLaunchHarness(on, { agentList: agents, pieces: [...nestedRootPieces.slice(0, -1), out(JSON.stringify(nestedReady)), MESSAGE('parent done')] })
+    const { w, hooks, engine, parent, session } = harness
+    const pluginNext = (fn: any) => Object.assign(b7Next(fn), { origin: { plugin: 'codex-mod', tier: 'project' } })
+    engine.agent.spawn = async (input: any) => {
+      inputs.push({ ...input })
+      const id = `toolu_plugin_retry_${inputs.length}`
+      const { subagentType, ...rest } = input
+      const call = { tool: 'Agent', ...rest, subagent_type: subagentType, run_in_background: true, tool_use_id: id, agentId: parent }
+      if (inputs.length === 2) {
+        const old = { ...call, tool_use_id: 'toolu_plugin_retry_1' }
+        let reached = 0
+        expect((await hooks.get('tool.call')!.handler(engine, old, pluginNext(async () => { reached++; return {} }))).deny).toContain('not executed')
+        expect((await hooks.get('tool.check')!.handler(engine, old, pluginNext(async () => { reached++; return {} }))).decision).toBe('deny')
+        expect((await hooks.get('agent.spawn')!.handler(engine, { ...input, tool_use_id: old.tool_use_id, background: true, fork: false }, pluginNext(async () => { reached++; return {} }))).deny).toContain('unowned')
+        expect(reached).toBe(0)
+        const checkpoint: any = w.store.get(`mirror:${session}:${N_CHILD}`)
+        expect(checkpoint.launch).toBe('launching')
+        expect(checkpoint.hostToolId).toBe(undefined)
+      }
+      return hooks.get('tool.call')!.handler(engine, call, pluginNext(async () => {
+        const { tool, tool_use_id, agentId, ...checkInput } = call
+        const check = await hooks.get('tool.check')!.handler(engine, { tool, tool_use_id, agentId, input: checkInput, ceiling: 'allow' }, pluginNext(async () => ({ decision: 'allow' })))
+        expect(check.decision).toBe('allow')
+        if (inputs.length === 1 || outcome === 'second-denial') return { deny: denial }
+        return hooks.get('agent.spawn')!.handler(engine, { ...input, tool_use_id: id, background: true, fork: false,
+          provider: { plugin: 'codex-mod', tier: 'project' } }, pluginNext(async () => { observers++; return { agentId: host } }))
+      }))
+    }
+    let text = ''
+    for (let i = 0; i < 5; i++) {
+      const s = await harness.step(i)
+      text += s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+      await harness.calls(s.chunks)
+      if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { text += handback(s.result); break }
+    }
+    expect(inputs.length).toBe(2)
+    expect(inputs[1]).toEqual(inputs[0])
+    expect(Object.keys(inputs[0]).sort()).toEqual(['cwd', 'description', 'name', 'prompt', 'subagentType'])
+    expect(observers).toBe(outcome === 'success' ? 1 : 0)
+    const mirror: any = w.store.get(`mirror:${session}:${N_CHILD}`)
+    expect(mirror.launch).toBe(outcome === 'success' ? 'bound' : 'refused')
+    if (outcome === 'success') {
+      expect(mirror.host).toBe(host)
+      expect(mirror.hostToolId).toBe('toolu_plugin_retry_2')
+      expect(text).not.toContain('observer transcript unavailable')
+    } else {
+      const notice = text.split('\n').find(line => line.includes('observer transcript unavailable'))!
+      expect(notice).toContain('Auto mode could not evaluate the observer after one retry')
+      expect(notice).not.toContain(denial)
+      expect(notice).not.toContain('server-side')
+      expect(notice).not.toContain('Batch 5')
+      expect(notice).not.toContain(N_CHILD)
+      expect(mirror.reason).toBe(`auto mode could not evaluate observer launch after one unchanged retry: ${denial}`)
+      expect(w.logs.some(line => line.includes(N_CHILD) && line.includes(mirror.reason))).toBe(true)
+    }
+    expect(w.spawned.length).toBe(1)
+    expect(w.modelCalls).toEqual([])
+    expect(w.core).toEqual([])
+  })
+}
+
+for (const refusal of ['ordinary', 'nonexact', 'exception', 'no-id', 'ack-host', 'spawn-admitted', 'early-host', 'changed-session', 'checkpoint', 'session-during-checkpoint'] as const) {
+  test(`nested retry excludes ${refusal}; repeated ready events never relaunch`,
+    { options: { transport: 'app-server', richRows: true, progressIntervalMs: 0 } }, async ($, on) => {
+      let sid = 'sess-1', failCheckpoint = false, changeSession = false
+      const host = 'host-no-retry'
+      const inputs: any[] = []
+      const agents = () => [{ id: 'agent-progress', type: 'codex-mod:codex', description: 'parent', status: 'running' },
+        { id: host, type: 'codex-mod:codex-child', parentId: 'agent-progress', spawnedBy: 'codex-mod', status: 'running' }]
+      const harness = await nestedLaunchHarness(on, { sessionId: () => sid, agentList: agents,
+        storeReject: key => {
+          if (!key.startsWith('mirror:')) return false
+          if (changeSession) sid = 'changed-session'
+          return failCheckpoint
+        }, pieces: [...nestedRootPieces.slice(0, -1), out(JSON.stringify(nestedReady)), MESSAGE('parent done')] })
+      const { w, hooks, engine, parent, session } = harness
+      const pluginNext = (fn: any) => Object.assign(b7Next(fn), { origin: { plugin: 'codex-mod', tier: 'project' } })
+      engine.agent.spawn = async (input: any) => {
+        inputs.push(input)
+        if (refusal === 'exception') throw new Error('lost host result')
+        const { subagentType, ...rest } = input
+        const id = 'toolu_plugin_no_retry'
+        const call = { tool: 'Agent', ...rest, subagent_type: subagentType, tool_use_id: id, agentId: parent }
+        return hooks.get('tool.call')!.handler(engine, call, pluginNext(async () => {
+          if (refusal === 'spawn-admitted') await hooks.get('agent.spawn')!.handler(engine,
+            { ...input, tool_use_id: id, background: true, fork: false }, pluginNext(async () => ({ deny: HOST_MIRROR_NO_VERDICT })))
+          if (refusal === 'early-host') await hooks.get('turn.start')!.handler(engine,
+            { agentId: host, text: input.prompt }, pluginNext(async () => ({ turnId: 'early' })))
+          if (refusal === 'changed-session') sid = 'changed-session'
+          if (refusal === 'checkpoint') failCheckpoint = true
+          if (refusal === 'session-during-checkpoint') changeSession = true
+          return refusal === 'ordinary' ? { deny: 'concurrency limit' }
+            : refusal === 'nonexact' ? { deny: `${HOST_MIRROR_NO_VERDICT}\n` }
+            : refusal === 'no-id' ? {}
+            : { deny: HOST_MIRROR_NO_VERDICT, ...(refusal === 'ack-host' ? { agentId: host } : {}) }
+        }))
+      }
+      let text = ''
+      for (let i = 0; i < 5; i++) {
+        const s = await harness.step(i)
+        text += s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+        await harness.calls(s.chunks)
+        if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { text += handback(s.result); break }
+      }
+      expect(inputs.length).toBe(1)
+      const notice = text.split('\n').find(line => line.includes('observer transcript unavailable'))!
+      expect(notice).not.toContain('after one retry')
+      expect(notice).not.toContain(HOST_MIRROR_NO_VERDICT)
+      expect(notice).not.toContain('Batch 5')
+      if (refusal === 'checkpoint') {
+        expect(notice).toContain('Observer launch unavailable; no retry')
+        expect(w.logs.some(line => line.includes('mirror retry checkpoint unavailable; no retry'))).toBe(true)
+      }
+      if (refusal === 'exception') {
+        expect(notice).toContain('Observer launch outcome unknown; no retry')
+        expect(w.logs.some(line => line.includes(N_CHILD) && line.includes('host creation outcome unknown: lost host result'))).toBe(true)
+      }
+      expect(w.spawned.length).toBe(1)
+      expect(w.modelCalls).toEqual([])
+      expect(w.core).toEqual([])
+    })
+}
+
+test('observer fallback notices distinguish short child identities while private diagnostics retain full reasons', { options: { transport: 'app-server' } }, async ($, on) => {
+  const other = '33333333-3333-4333-8333-333333333333'
+  const reason = 'rejoin unsupported by this broker'
+  const w = appWorld(on, { pieces: [THREAD(N_PARENT), ...[N_CHILD, other].map(thread_id =>
+    out(JSON.stringify({ ...nestedReady, thread_id, status: 'unavailable', reason }))), MESSAGE('parent done')] })
+  let launches = 0
+  on('agent.spawn', () => { launches++; return { deny: 'must not launch' } })
+  const s = await step($, 'agent-progress')
+  const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n') + (s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer)
+  const notices = text.split('\n').filter(line => line.includes('observer transcript unavailable'))
+  expect(notices.length).toBe(2)
+  for (const [index, id] of [N_CHILD, other].entries()) {
+    expect(notices[index]).toContain(`Codex child ${id.slice(-8)}`)
+    expect(notices[index]).toContain('Observer attachment incomplete')
+    expect(notices[index]).not.toContain(id)
+    expect(notices[index]).not.toContain(reason)
+    expect(w.logs.some(line => line.includes(id) && line.includes(reason))).toBe(true)
+  }
+  expect(launches).toBe(0)
+  expect(w.spawned.length).toBe(1)
   expect(w.modelCalls).toEqual([])
   expect(w.core).toEqual([])
 })
@@ -797,7 +1025,7 @@ for (const launch of ['reserved', 'launching', 'uncertain', 'bound']) test(`nest
   let spawns = 0
   on('agent.spawn', () => { spawns++; return { deny: 'no replacement allowed' } })
   const s = await step($, 'agent-progress')
-  expect(handback(s.result)).toContain('mirror unavailable')
+  expect(handback(s.result)).toContain('observer transcript unavailable')
   expect(spawns).toBe(0)
   expect(w.spawned.length).toBe(1)
   expect(w.modelCalls).toEqual([])
@@ -1435,13 +1663,46 @@ test('helpers: shell unwrapping, descriptions, footer numbers, MCP names, diffs'
   expect(unwrapShell('/bin/zsh -lc ls extra')).toBe('/bin/zsh -lc ls extra')
   expect(unwrapShell('git status')).toBe('git status')
   expect(describeCommand('git status --short')).toBe('Run git status')
-  expect(describeCommand('cd sub && npm test')).toBe('Run npm test')
+  expect(describeCommand('cd sub && npm test')).toBe('Run shell commands: cd, npm test')
   expect(describeCommand('sed -n 1,20p a.ts')).toBe('Read part of a file')
   expect(describeCommand('frobnicate')).toBe('Run frobnicate')
   expect([compact(950), compact(37412), compact(154000), compact(1250000), compact(2000)]).toEqual(['950', '37.4K', '154K', '1.3M', '2K'])
   expect(footer({ agent: 'codex', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', actions: 3, usage: { input: 192000, cached: 154000, output: 631 }, thread: '01a14f50-c51c' }))
     .toBe('codex · gpt-6-luna · low · workspace-write · 3 actions · 38K new tokens (154K cached, 631 out) · thread 01a14f50-c51c')
   expect(mcpServerNames(CONFIG_TOML)).toEqual(['node_repl', 'computer-use', 'quoted_ok'])
+})
+
+test('shell descriptions cover compound and conditional commands while quoted delimiters stay literal', () => {
+  for (const command of ['pwd; wc -l a.ts', 'pwd && wc -l a.ts', 'pwd | wc -l', 'pwd\nwc -l a.ts']) {
+    expect(describeCommand(command)).toBe('Run shell commands: pwd, wc')
+  }
+  expect(describeCommand('git status --short; npm test')).toBe('Run shell commands: git status, npm test')
+  for (const command of ['if test -f a; then cat a; fi', 'case "$x" in a) pwd;; esac', 'pwd; if true; then wc -l a; fi']) {
+    expect(describeCommand(command)).toBe('Run conditional shell command')
+  }
+  expect(describeCommand('for f in a b; do cat "$f"; done')).toBe('Run compound shell command')
+  for (const command of ["printf '%s; | &' 'if then fi'", 'printf "%s; | &" "literal"', 'printf escaped\\;delimiter']) {
+    expect(describeCommand(command)).toBe('Print text')
+  }
+  expect(describeCommand('pwd;')).toBe('Show current directory')
+  for (const command of ['echo "$(pwd; wc -l a)"', 'cat <<EOF\npwd; wc\nEOF', 'printf "unterminated; wc', 'pwd; '.repeat(7), 'x'.repeat(8193)]) {
+    expect(describeCommand(command)).toBe('Run shell command')
+  }
+})
+
+test('compound command labels preserve the original Bash source and output without native reclassification', () => {
+  const command = 'pwd; wc -l "file;name"'
+  const output = '/tmp/project\n7 file;name\n'
+  const action = commandAction(command, output, 0)
+  expect(action.tool).toBe('Bash')
+  expect(action.input.command).toBe(command)
+  expect(action.input.description).toBe('Run shell commands: pwd, wc')
+  expect(action.result).toEqual({ stdout: output, stderr: '', interrupted: false })
+  const source = normalizeSource(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command,
+    aggregated_output: output, exit_code: 0, status: 'completed' } }), { transport: 'exec', cwd: '/tmp/project' })!
+  source.item!.commandActions = [{ type: 'read', command, path: '/tmp/project/file;name' }]
+  expect(explorationAction(source)).toBe(undefined)
+  expect(validAction(action)).toBe(true)
 })
 
 // ---- session.start ---------------------------------------------------------
@@ -1477,6 +1738,11 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question', 'codex_message_status'])
   expect(w.toolSpecs.filter(t => t.name !== 'codex_message_status').every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
+  expect(w.toolSpecs[3].description).toContain('question controls')
+  expect(w.toolSpecs[3].description).toContain('Only an explicit human answer or cancel submits a response')
+  expect(w.toolSpecs[3].description).not.toBe(w.toolSpecs[0].description)
+  expect(w.toolSpecs[3].isDeferred).toBe(false)
+  expect(w.toolSpecs[3].inputSchema).toEqual(w.toolSpecs[0].inputSchema)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
   expect(w.toolSpecs[1].inputSchema.properties.steps.items.properties.status.enum).toEqual(['pending', 'in_progress', 'completed'])
   // The host spreads arguments beside its envelope fields, so display schemas
@@ -2107,6 +2373,161 @@ test('coordinator card uses only the exact returned tool and emitted IDs, with l
     expect(fallback.type).toBe('Text')
     expect(fallback.children).toEqual(['HOST'])
   }
+})
+
+test('fresh UI worker restores only an owned canonical coordinator receipt without tool registration or execution', async ($, on) => {
+  const id = `${ID_PREFIX}saved_coordinator_ui`
+  const text = 'Keep this exact coordinator body.\nSecond line.'
+  const receipt = { tool: COORDINATOR_TOOL, sourceUuid: 'saved-row', text, messageId: 'message-ui' }
+  const record: any = quietCoordinatorRecord('unused')
+  record.coordinator = { received: ['saved-row'], pending: [], rows: {
+    [id]: receipt,
+    [`${id}_wrong_tool`]: { ...receipt, tool: 'Bash' },
+    [`${id}_foreign_tool`]: { ...receipt, tool: 'mcp__foreign__coordinator_message' },
+    [`${id}_unreceived`]: { ...receipt, sourceUuid: 'unreceived' },
+  }, outcomes: { 'message-ui': { status: 'accepted', acceptedTurnId: 'saved-turn', messageId: 'message-ui' } } }
+  const w = world(on, { store: new Map([['agent:sess-1:agent-coordinator', record]]) })
+  const processes: any[] = []
+  on('process.run', (_$, e: any) => { processes.push(e); return runOk() })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  const render = (tool: string, toolId: string) => b7Render($, toolId, tool, { text: 'forged input', sourceUuid: 'forged' })
+  const card: any = await render(COORDINATOR_TOOL, id)
+  expect(card.type).toBe('Box')
+  expect(card.children[0].children).toEqual(['Coordinator'])
+  expect(card.children[1].children).toEqual([text])
+  expect(card.children[2].children).toEqual(['Accepted into turn'])
+  expect(card.children[3].props.dimColor).toBe(true)
+  expect(card.children[3].children[0]).toContain('Message: message-ui')
+  expect(card.children[3].children[0]).toContain('Accepted turn: saved-turn')
+  for (const [tool, toolId] of [[COORDINATOR_TOOL, `${id}_wrong_tool`], ['mcp__foreign__coordinator_message', `${id}_foreign_tool`],
+    [COORDINATOR_TOOL, `${id}_unreceived`], ['Bash', id], ['mcp__codex-mod__codex_tool', id], [COORDINATOR_TOOL, `${id}_impostor`]]) {
+    const fallback: any = await render(tool, toolId)
+    expect(fallback.children).toEqual(['HOST'])
+  }
+  expect((await $.tool.call({ tool: COORDINATOR_TOOL, tool_use_id: id, sourceUuid: receipt.sourceUuid, text, agentId: 'agent-coordinator' } as any) as any).deny).toContain('not executed')
+  expect(w.toolSpecs).toEqual([])
+  expect(processes).toEqual([])
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+for (const mismatch of ['none', 'foreign-tool', 'wrong-receipt-tool', 'wrong-cache-tool', 'wrong-session', 'wrong-record-session', 'wrong-agent', 'wrong-id', 'missing-cache', 'unreceived'] as const) {
+  test(`fresh coordinator UI with an unregistered runtime name: ${mismatch}`, async ($, on) => {
+    const id = `${ID_PREFIX}runtime_coordinator_${mismatch}`
+    const tool = 'mcp__host_runtime__coordinator_message'
+    const foreign = 'mcp__foreign__coordinator_message'
+    const agent = 'agent-coordinator-reload'
+    const text = '<literal>Complete coordinator message\n  keep every line.</literal>'
+    const receipt = { tool: mismatch === 'wrong-receipt-tool' ? foreign : tool, sourceUuid: 'received-source', text }
+    const record: any = quietCoordinatorRecord('unused')
+    record.coordinator = { received: mismatch === 'unreceived' ? [] : ['received-source'], pending: [], rows: { [id]: receipt } }
+    const cached = { id: mismatch === 'wrong-id' ? `${id}_other` : id, row: {
+      sessionId: mismatch === 'wrong-session' ? 'other-session' : 'sess-1',
+      agentId: mismatch === 'wrong-agent' ? 'another-agent' : agent,
+      tool: mismatch === 'wrong-cache-tool' ? foreign : tool, sourceDigest: fingerprint('null').sha256,
+    } }
+    const slot = parseInt(fingerprint(id).sha256.slice(0, 8), 16) % ROW_SLOTS
+    const path = `/home/t/.cache/codex-mod/runs/state-row-cache/row-${slot}.json`
+    const w = world(on, {
+      store: new Map([[`agent:${mismatch === 'wrong-record-session' ? 'other-session' : 'sess-1'}:${agent}`, record]]),
+      files: mismatch === 'missing-cache' ? new Map() : new Map([[path, JSON.stringify(cached)]]),
+    })
+    const processes: any[] = []
+    on('process.run', (_$, e: any) => { processes.push(e); return runOk() })
+    on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+    const renderedTool = mismatch === 'foreign-tool' || mismatch === 'wrong-receipt-tool' ? foreign : tool
+    const card: any = await b7Render($, id, renderedTool, { text: 'forged body', sourceUuid: 'forged' })
+    if (mismatch === 'none') {
+      expect(card.type).toBe('Box')
+      expect(card.children[0].children).toEqual(['Coordinator'])
+      expect(card.children[1].children).toEqual([text])
+    } else expect(card.children).toEqual(['HOST'])
+    // Presentation restoration must never restore a held execution answer.
+    expect((await $.tool.call({ tool: renderedTool, tool_use_id: id, sourceUuid: receipt.sourceUuid, text, agentId: agent } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool: renderedTool, tool_use_id: id, agentId: agent, input: { sourceUuid: receipt.sourceUuid, text } } as any)).decision).toBe('deny')
+    expect(w.toolSpecs).toEqual([])
+    expect(processes).toEqual([])
+    expect(w.spawned).toEqual([])
+    expect(w.modelCalls).toEqual([])
+    expect(w.core).toEqual([])
+  })
+}
+
+test('restored runtime coordinator presentation cannot cross a session change', async ($, on) => {
+  const id = `${ID_PREFIX}runtime_coordinator_session_change`
+  const tool = 'mcp__host_runtime__coordinator_message'
+  const agent = 'agent-coordinator-reload'
+  let sid = 'sess-1'
+  const record: any = quietCoordinatorRecord('unused')
+  record.coordinator = { received: ['source'], pending: [], rows: { [id]: { tool, sourceUuid: 'source', text: 'Owned body' } } }
+  const slot = parseInt(fingerprint(id).sha256.slice(0, 8), 16) % ROW_SLOTS
+  const w = world(on, { sessionId: () => sid, store: new Map([[`agent:sess-1:${agent}`, record]]), files: new Map([
+    [`/home/t/.cache/codex-mod/runs/state-row-cache/row-${slot}.json`, JSON.stringify({ id, row: { sessionId: sid, agentId: agent, tool, sourceDigest: fingerprint('null').sha256 } })],
+  ]) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  expect((await b7Render($, id, tool) as any).type).toBe('Box')
+  sid = 'other-session'
+  expect((await b7Render($, id, tool) as any).children).toEqual(['HOST'])
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+for (const [name, outcome, label] of [
+  ['received', { status: 'received' }, 'Received · pending Codex acknowledgment'],
+  ['pending', { status: 'pending', expectedTurnId: 'expected-turn-full-id' }, 'Pending Codex acknowledgment'],
+  ['accepted', { status: 'accepted', acceptedTurnId: 'accepted-turn-full-id', turnId: 'source-turn-full-id' }, 'Accepted into turn'],
+  ['observed', { status: 'observed', acceptedTurnId: 'observed-turn-full-id', echoedItemId: 'observed-item' }, 'Observed in Codex input'],
+  ['accepted-observed', { status: 'accepted', acceptedTurnId: 'accepted-observed-turn-full-id', echoedItemId: 'observed-item' }, 'Accepted into turn · observed in input'],
+  ['queued', { status: 'queued', queuedAfterTurnId: 'queued-turn-full-id', reason: 'source turn already finished' }, 'Queued after turn · source turn already finished'],
+  ['unknown', { status: 'unknown', expectedTurnId: 'uncertain-turn-full-id', reason: 'acknowledgment was lost' }, 'Delivery uncertain · acknowledgment was lost'],
+  ['rejected', { status: 'rejected', reason: 'stale turn identity' }, 'Rejected · stale turn identity'],
+  ['rejected-error', { status: 'rejected', error: { message: 'broker refused the request' } }, 'Rejected · broker refused the request'],
+] as const) test(`coordinator presentation separates literal body, ${name} state and full evidence IDs`, async ($, on) => {
+  const id = `${ID_PREFIX}coordinator_state_${name}`
+  const messageId = `message-full-id-${name}`
+  const text = '<tag>**Keep this literal body**</tag>\n  café 😀\nFinal line.'
+  const record: any = quietCoordinatorRecord('unused')
+  record.coordinator = { received: ['source'], pending: [], rows: { [id]: { tool: COORDINATOR_TOOL, sourceUuid: 'source', text, messageId } },
+    outcomes: { [messageId]: { ...outcome, messageId, receivedAt: 1 } } }
+  const w = world(on, { store: new Map([['agent:sess-1:agent-coordinator', record]]) })
+  on('ui.render', () => ({ type: 'Text', children: ['HOST'] }))
+  const card: any = await b7Render($, id, COORDINATOR_TOOL)
+  expect(card.children[1].children).toEqual([text])
+  expect(card.children[2].children).toEqual([label])
+  expect(card.children[2].children[0]).not.toContain(messageId)
+  expect(card.children[3].props.dimColor).toBe(true)
+  expect(card.children[3].children[0]).toContain(`Message: ${messageId}`)
+  for (const [key, value] of Object.entries(outcome)) {
+    if (key.endsWith('TurnId') || key === 'turnId') expect(card.children[3].children[0]).toContain(value)
+  }
+  expect((await $.tool.call({ tool: COORDINATOR_TOOL, tool_use_id: id, agentId: 'agent-coordinator', text, sourceUuid: 'source' } as any) as any).deny).toContain('not executed')
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('coordinator history keeps its saved outcome when the live state query fails', async ($, on) => {
+  const id = `${ID_PREFIX}saved_coordinator_state_error`
+  const record: any = quietCoordinatorRecord('unused')
+  record.coordinator = { received: ['saved-row'], pending: [], rows: {
+    [id]: { tool: COORDINATOR_TOOL, sourceUuid: 'saved-row', text: 'Saved body', messageId: 'saved-message' },
+  }, outcomes: { 'saved-message': { status: 'queued', queuedAfterTurnId: 'saved-turn', messageId: 'saved-message' } } }
+  const w = world(on, { store: new Map([['agent:sess-1:agent-coordinator', record]]) })
+  const engine: any = b7Engine(w)
+  engine.ui.resolve = () => ({ Box: (props: any) => ({ type: 'Box', ...props }), Text: (props: any) => ({ type: 'Text', ...props }) })
+  engine.state = { get: async () => { throw new Error('state unavailable') } }
+  const render = b7Hooks().get('ui.renderToolUse')!.handler
+  const card = await render(engine, { props: { tool_use_id: id, tool: COORDINATOR_TOOL } }, b7Next(async () => ({ type: 'HOST' })))
+  expect(card.type).toBe('Box')
+  expect(card.children[1].children).toBe('Saved body')
+  expect(card.children[2].children).toBe('Queued after turn')
+  expect(card.children[3].dimColor).toBe(true)
+  expect(card.children[3].children).toContain('Queued after turn: saved-turn')
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+  expect(w.core).toEqual([])
 })
 
 test('coordinator render errors fall back through next(e)', async () => {
@@ -4178,6 +4599,8 @@ for (const { item, tool } of batch2Cases) {
 test('batch 2 exact results: whole/empty/CRLF/slices, glob scope, grep modes and literal regex escaping', () => {
   const action = (id: string): any => explorationAction(explorationSource(batch2Cases.find(c => c.item.id === id)!.item))!
   expect(action('whole').result).toEqual({ type: 'text', file: { filePath: '/workspace/a.txt', content: 'one\ntwo\n', numLines: 2, startLine: 1, totalLines: 2 } })
+  expect(action('startup-shell-read').input).toEqual({ file_path: '/workspace/notes.txt' })
+  expect(action('startup-shell-read').result.file).toEqual({ filePath: '/workspace/notes.txt', content: 'Exact file contents.\nSecond line.\n', numLines: 2, startLine: 1, totalLines: 2 })
   expect(action('empty').result.file).toMatchObject({ content: '', numLines: 0, totalLines: 0 })
   expect(action('crlf').result.file).toMatchObject({ content: 'one\r\ntwo\r\n', numLines: 2, totalLines: 2 })
   expect(action('no-final-newline').result.file).toMatchObject({ content: 'one\ntwo', numLines: 2, totalLines: 2 })
@@ -5173,7 +5596,7 @@ for (const option of ['lean', 'text', 'registration-fails']) test(`batch 6 quest
 function b7Hooks(options: any = {}) {
   const hooks = new Map<string, { handler: any; catcher: any }>()
   codexRegister(((name: string, ...args: any[]) => {
-    const filter = typeof args[0] === 'object' ? args[0].component ?? '' : ''
+    const filter = typeof args[0] === 'object' ? args[0].component ?? String(args[0].agentId ?? '') : ''
     const hook = { handler: args.at(-1), catcher: undefined as any }
     hooks.set(name + filter, hook)
     return { catch: (fn: any) => { hook.catcher = fn } }
@@ -5481,11 +5904,13 @@ test('steer v2: coordinator card subscribes to outcome state and redraws the sam
     tool: call.name, tool_use_id: call.id, input: call.input, isRunning: false, isErrored: false, isInterrupted: false,
   } } as any)
   const first: any = await render()
-  expect(first.children[2].children[0]).toContain('Received')
+  expect(first.children[2].children).toEqual(['Pending Codex acknowledgment'])
   await step($, 'agent-coordinator', 2)
   const accepted: any = await render()
   expect(accepted.children[1].children).toEqual(['<literal body>'])
-  expect(accepted.children[2].children).toEqual(['Accepted into turn turn-X'])
+  expect(accepted.children[2].children).toEqual(['Accepted into turn'])
+  expect(accepted.children[3].props.dimColor).toBe(true)
+  expect(accepted.children[3].children[0]).toContain('Accepted turn: turn-X')
   expect(savedState(w, 'agent:sess-1:agent-coordinator').coordinator.outcomes['saved-row'].status).toBe('accepted')
 })
 

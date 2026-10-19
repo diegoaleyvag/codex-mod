@@ -615,7 +615,7 @@ async function main() {
       .filter(c => typeof c?.path === 'string' && c.path !== '')
       .map(c => ({ ...c }))
 
-  const handleNotification = (m, state) => {
+  const handleNotification = (m, state, replayed = false) => {
     const threadId = state?.id ?? rootThread()
     const turnId = state?.turnId ?? rootTurn()
     const emit = event => state && state.id !== rootThread()
@@ -625,6 +625,14 @@ async function main() {
       const turns = state.terminalTurns ??= new Set()
       if (turns.has(turnId)) return
       turns.add(turnId)
+      if (replayed) {
+        const replayedTurns = state.replayedTerminalTurns ??= new Set()
+        replayedTurns.add(turnId)
+        // A buffered start is explicit evidence that the snapshot's terminal
+        // state is stale. Do not stop a mirror reader on that projection.
+        if (state.buffer.some(n => n.method === 'turn/started' && n.params?.turn?.id === turnId &&
+          (!n.params.turn.rootTurnId || n.params.turn.rootTurnId === state.rootTurnId))) return
+      }
     }
     if (!KNOWN_METHODS.has(m.method)) unknownMethods.add(m.method)
     const item = p.item
@@ -751,7 +759,7 @@ async function main() {
             if (itemCursor && itemCursors.has(itemCursor)) throw new Error('repeated child item cursor')
             itemCursors.add(itemCursor)
           } while (itemCursor)
-          if (['completed', 'failed', 'interrupted'].includes(turn.status)) handleNotification({ method: 'turn/completed', params: { threadId: state.id, turn } }, state)
+          if (['completed', 'failed', 'interrupted'].includes(turn.status)) handleNotification({ method: 'turn/completed', params: { threadId: state.id, turn } }, state, true)
         }
         cursor = page.nextCursor
         if (cursor && cursors.has(cursor)) throw new Error('repeated child turn cursor')
@@ -813,6 +821,12 @@ async function main() {
       const tid = p.turnId ?? p.turn?.id
       if (m.method === 'turn/started') {
         if (p.turn.rootTurnId && p.turn.rootTurnId !== state.rootTurnId) return
+        if (state.terminalTurns?.has(tid)) {
+          // Only a replay projection can be superseded. A duplicate start
+          // after a live completion must not reopen an already finished turn.
+          if (!state.replayedTerminalTurns?.delete(tid)) return
+          state.terminalTurns.delete(tid)
+        }
         if (state.turnId !== tid) state.lastTotal = undefined
         state.turnId = tid
         state.done = false

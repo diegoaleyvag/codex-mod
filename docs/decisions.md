@@ -62,3 +62,38 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
   stronger model than the Sol implementer, which keeps the review independent.
 - Consequences: the final review is no longer cross-family; the orchestrator's own checks
   (diff, tests, live runs) carry more weight.
+
+## D-008 - Retry only an explicit no-start host denial
+- Date: 2026-10-19 (1.2.0).
+- Decision: an observer launch may repeat the identical request once only for the complete
+  auto-mode no-verdict denial that explicitly asks for one retry. The live capability must
+  remain unconsumed, no host may exist, and retiring the first core tool ID must checkpoint
+  before submitting the replacement. All call/check/spawn identity guards still apply.
+- Why: a denied launch starts no agent; unknown creation outcomes can already own a task.
+  Treating either case as a generic retry would risk duplicate observers or source execution.
+- Consequences: second denials retain the explicit lifecycle/report fallback. Worker recovery,
+  safety refusals and uncertain outcomes never gain permission to launch again. No consent
+  or permission mode is synthesized.
+
+## D-009 - Reconcile history with buffered source lifecycle
+- Date: 2026-10-19 (1.2.0).
+- Decision: a matching buffered source start supersedes a child's replayed terminal claim.
+  Suppress that stale terminal before journaling it, and retire only the replay claim when
+  draining the start. A live terminal remains closed against duplicate starts and completions.
+- Why: the app-server can expose an interrupted history snapshot while buffering the same
+  turn's actual start. Treating that projection as a permanent completion discards the later
+  real completion and leaves the parent waiting forever.
+- Consequences: attachment preserves source actions and usage once without starting or
+  rerunning child work. A terminal history entry without a superseding start remains terminal.
+
+## D-010 - Restore presentation through persisted ownership
+- Date: 2026-10-19 (1.2.0).
+- Decision: a fresh UI worker may recover a nonlegacy Coordinator tool name before
+  registration only when its current-session row cache identifies the exact tool ID,
+  tool name and owning agent, whose durable record contains that row and received UUID.
+  Legacy receipts retain their exact-name compatibility path within the current session.
+- Why: registration is worker-local and may not precede historical rendering. A suffix
+  match alone cannot establish ownership, while verified persisted data can restore it.
+- Consequences: recovery supplies presentation only. It never restores a held answer,
+  executes an action or changes the guards. This fixes a reproducible recovery gap;
+  it does not establish the cause of Desktop's generic Coordinator rows.

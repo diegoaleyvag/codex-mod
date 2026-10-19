@@ -41,7 +41,13 @@ const childComplete = (status = 'completed') => {
   if (!childActive) return
   childActive = false
   childNote('item/completed', { item: { type: 'agentMessage', id: 'child-final', text: 'child checked the fixture' } })
-  for (let i = 0; i < 2; i++) childNote('turn/completed', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status, error: status === 'failed' ? { message: 'child failed' } : null } })
+  for (let i = 0; i < 2; i++) {
+    childNote('turn/completed', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status, error: status === 'failed' ? { message: 'child failed' } : null } })
+    if (scenario === 'nested-replayed-terminal' && i === 0) {
+      // A duplicate start after a real terminal must not reactivate dedup.
+      childNote('turn/started', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status: 'inProgress' } })
+    }
+  }
   if (scenario !== 'nested-response-only') setTimeout(() => childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) }), 20)
 }
 const childWork = () => {
@@ -171,14 +177,19 @@ createInterface({ input: process.stdin }).on('line', line => {
         if (childAttached) throw new Error('child attached twice')
         childAttached = true
         reply({ thread: { id: CHILD, parentThreadId: scenario === 'nested-ancestry' ? CHILD : PARENT, historyMode: scenario === 'nested-history-mode' ? 'unknown' : 'paginated', model: 'gpt-6.1-sol' } })
-        if (scenario !== 'nested-early') setTimeout(childWork, 30)
+        if (!['nested-early', 'nested-replayed-terminal', 'nested-history-terminal'].includes(scenario)) setTimeout(childWork, 30)
         return
       }
       THREAD = m.params.threadId ?? THREAD
       return reply({ thread: { id: THREAD } })
     case 'thread/turns/list':
-      return reply({ data: [{ id: CHILD_TURN, rootTurnId: PARENT_TURN, status: 'inProgress', items: [] }], nextCursor: null })
+      return reply({ data: [{ id: CHILD_TURN, rootTurnId: PARENT_TURN,
+        status: ['nested-replayed-terminal', 'nested-history-terminal'].includes(scenario) ? 'interrupted' : 'inProgress',
+        ...(scenario === 'nested-replayed-terminal' ? { completedAt: null } : {}), items: [] }], nextCursor: null })
     case 'thread/items/list':
+      // Publish live evidence before the history response, deterministically
+      // buffering the same-ID start while the interrupted snapshot is merged.
+      if (scenario === 'nested-replayed-terminal' && !m.params.cursor) childWork()
       return reply({ data: m.params.cursor ? [] : [{ turnId: CHILD_TURN, item: nestedCommand, startedAtMs: 1, completedAtMs: 2 }], nextCursor: m.params.cursor ? null : 'page-2' })
     case 'thread/unsubscribe':
       return reply({ status: 'unsubscribed' })

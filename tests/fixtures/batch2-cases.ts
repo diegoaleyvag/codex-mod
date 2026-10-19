@@ -19,6 +19,15 @@ export const batch2Cases: { item: Record<string, any>; tool: string }[] = [
   { item: read('double-quoted', 'cat "a \\$x.txt"', 'literal\n', 'a $x.txt'), tool: 'Read' },
   { item: read('escaped', 'cat a\\ b.txt', 'literal\n', 'a b.txt'), tool: 'Read' },
   { item: read('shell-wrapper', "/bin/zsh -lc 'cat a.txt'", 'one\n', 'a.txt', { commandActions: [{ type: 'read', command: 'cat a.txt', name: 'a.txt', path: 'a.txt' }] }), tool: 'Read' },
+  { item: read('startup-shell-read', "/bin/zsh -lc 'cat /workspace/notes.txt'", 'Exact file contents.\nSecond line.\n', '/workspace/notes.txt', {
+    source: 'unifiedExecStartup', commandActions: [{ type: 'read', command: 'cat /workspace/notes.txt', name: 'notes.txt', path: '/workspace/notes.txt' }],
+  }), tool: 'Read' },
+  { item: read('startup-compound', "/bin/zsh -lc 'cat a.txt; wc -l a.txt'", 'one\n1 a.txt\n', 'a.txt', {
+    source: 'unifiedExecStartup', commandActions: [{ type: 'read', command: 'cat a.txt', path: 'a.txt' }],
+  }), tool: 'Bash' },
+  { item: read('startup-head-full-window', "/bin/zsh -lc 'head -n 2 a.txt'", 'one\ntwo\n', 'a.txt', {
+    source: 'unifiedExecStartup', commandActions: [{ type: 'read', command: 'head -n 2 a.txt', path: 'a.txt' }],
+  }), tool: 'Bash' },
   { item: read('shell-whole-action', "/bin/bash -c 'cat a.txt'", 'one\n'), tool: 'Read' },
   { item: read('shell-pipeline', "/bin/zsh -lc 'cat a.txt | head'", 'one\n', 'a.txt', { commandActions: [{ type: 'read', command: 'cat a.txt', path: 'a.txt' }] }), tool: 'Bash' },
   { item: read('symlink-parent', 'cat link/../a.txt', 'one\n', 'link/../a.txt'), tool: 'Bash' },
@@ -44,7 +53,8 @@ export const batch2Cases: { item: Record<string, any>; tool: string }[] = [
   { item: read('multi-action', 'cat a.txt', 'one\n', 'a.txt', { commandActions: [{ type: 'read', command: 'cat a.txt', path: 'a.txt' }, { type: 'read', command: 'cat b.txt', path: 'b.txt' }] }), tool: 'Bash' },
   { item: read('partial-action', 'cat a.txt', 'one\n', 'a.txt', { commandActions: [{ type: 'read', command: 'cat', path: 'a.txt' }] }), tool: 'Bash' },
   { item: read('exec-missing-actions', 'cat a.txt', 'one\n', 'a.txt', { commandActions: undefined }), tool: 'Bash' },
-  ...['userShell', 'unifiedExecStartup', 'unifiedExecInteraction'].map(source => ({ item: read(source, 'cat a.txt', 'one\n', 'a.txt', { source }), tool: 'Bash' })),
+  { item: read('unifiedExecStartup', 'cat a.txt', 'one\n', 'a.txt', { source: 'unifiedExecStartup' }), tool: 'Read' },
+  ...['userShell', 'unifiedExecInteraction'].map(source => ({ item: read(source, 'cat a.txt', 'one\n', 'a.txt', { source }), tool: 'Bash' })),
   { item: list('immediate-files', 'find . -maxdepth 1 -type f -print0'), tool: 'Glob' },
   { item: list('recursive-files', 'find . -type f -print0', './a.txt\0./sub/b.txt\0'), tool: 'Glob' },
   { item: list('empty-list', 'find . -type f -print0', ''), tool: 'Glob' },

@@ -79,7 +79,7 @@ const globPattern = (pattern: string): string | undefined => {
 /** Undefined means that Bash is the truthful representation. */
 function parseExploration(source: SourceRecord | undefined): Action | undefined {
   const item = source?.item
-  if (!item || item.type !== 'commandExecution' || item.source !== 'agent' ||
+  if (!item || item.type !== 'commandExecution' || !['agent', 'unifiedExecStartup'].includes(item.source) ||
     !['completed', 'failed'].includes(item.status) || ![0, 1].includes(item.exitCode) ||
     typeof item.command !== 'string' || typeof item.aggregatedOutput !== 'string' ||
     !Array.isArray(item.commandActions) || item.commandActions.length !== 1) return undefined

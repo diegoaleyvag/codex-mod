@@ -109,9 +109,9 @@
 // so the user-level AGENTS.md is not loaded. Nothing in the real home is
 // written or deleted by this module.
 
-import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics } from './mirror-launch.ts'
+import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics, isMirrorAutoModeNoVerdict, prepareMirrorRetry } from './mirror-launch.ts'
 import type { MirrorAuthority } from './mirror-launch.ts'
-import { explorationAction, validExploration } from './exploration.ts'
+import { explorationAction, validExploration, literalWords } from './exploration.ts'
 import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
 import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult } from './web-tools.ts'
 import { childRows, planRows, planText, emptyDisplayState } from './plans-children.ts'
@@ -192,7 +192,7 @@ type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message' | 'codex_
 const displayTools: Partial<Record<DisplayTool, string>> = {}
 const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
 // Kept after the guard consumes its answer, so resolved rows still render.
-const coordinatorRows = new RowCache<{ tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
+const coordinatorRows = new RowCache<{ sessionId: string; tool: string; text: string; messageId?: string; outcome?: MessageOutcome }>()
 const planCards = new RowCache<PlanInput>()
 type Question = { token: string; requestId: string | number; method: string; params: any; status: string; result?: any; error?: any }
 const questionRows = new RowCache<{ session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
@@ -1162,15 +1162,61 @@ const DESCRIBE: Record<string, string> = {
   python: 'Run Python', python3: 'Run Python', node: 'Run Node.js', test: 'Check a condition', which: 'Locate a program',
 }
 
-/** A short, active description of a command, as Claude's own Bash calls carry. */
-export function describeCommand(command: string): string {
-  const words = command.trim().replace(/^cd\s+\S+\s*&&\s*/, '').split(/\s+/)
-  const prog = (words[0] ?? '').split('/').pop() ?? ''
-  if (prog === 'sed') return words.includes('-i') ? 'Edit file in place' : 'Read part of a file'
-  if (['git', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'cargo', 'go', 'make', 'uv', 'pip', 'swift', 'gh'].includes(prog)) {
-    const sub = words.slice(1).find(w => !w.startsWith('-'))
-    return sub ? `Run ${prog} ${sub}` : `Run ${prog}`
+// Labels alone use this bounded scanner. It never evaluates shell syntax or
+// supplies evidence for the separate, stricter native exploration classifier.
+function shellLabelParts(command: string): string[] | undefined {
+  if (command.length > 8192) return undefined
+  const parts: string[] = []
+  let quote = '', start = 0
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!
+    if (quote === "'") { if (c === "'") quote = ''; continue }
+    if (c === '\\') { if (i + 1 >= command.length || command[i + 1] === '\n') return undefined; i++; continue }
+    if (quote === '"') {
+      if (c === '"') quote = ''
+      else if ('$`'.includes(c)) return undefined
+      continue
+    }
+    if (c === "'" || c === '"') { quote = c; continue }
+    if ('\r\0<>($`){}#'.includes(c)) return undefined
+    if (';|&\n'.includes(c)) {
+      const part = command.slice(start, i).trim()
+      if (part) parts.push(part)
+      if (parts.length > 6) return undefined
+      start = i + 1
+    }
   }
+  if (quote) return undefined
+  const tail = command.slice(start).trim()
+  if (tail) parts.push(tail)
+  return parts.length && parts.length <= 6 ? parts : undefined
+}
+
+const COMMAND_FAMILIES = ['git', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'cargo', 'go', 'make', 'uv', 'pip', 'swift', 'gh']
+const commandProgram = (words: string[]) => {
+  const prog = (words[0] ?? '').split('/').pop() ?? ''
+  return /^[\w.+-]{1,40}$/.test(prog) ? prog : undefined
+}
+const commandName = (words: string[], prog: string) => {
+  const sub = COMMAND_FAMILIES.includes(prog) ? words.slice(1).find(w => !w.startsWith('-')) : undefined
+  return sub && /^[\w.+-]{1,40}$/.test(sub) ? `${prog} ${sub}` : prog
+}
+
+/** A short description of the whole command, without inferring its result. */
+export function describeCommand(command: string): string {
+  if (/^\s*(?:if|case)\b/.test(command)) return 'Run conditional shell command'
+  if (/^\s*(?:for|while|until|select|function)\b/.test(command)) return 'Run compound shell command'
+  const parts = shellLabelParts(command)
+  if (!parts) return 'Run shell command'
+  if (parts.some(p => /^(?:if|elif|then|else|fi|case|esac)\b/.test(p))) return 'Run conditional shell command'
+  if (parts.some(p => /^(?:for|while|until|do|done|select|function)\b/.test(p))) return 'Run compound shell command'
+  const commands = parts.map(p => literalWords(p))
+  if (commands.some(words => !words || !commandProgram(words))) return 'Run shell command'
+  if (commands.length > 1) return `Run shell commands: ${commands.map(words => commandName(words!, commandProgram(words!)!)).join(', ')}`
+  const words = commands[0]!
+  const prog = commandProgram(words)!
+  if (prog === 'sed') return words.includes('-i') ? 'Edit file in place' : 'Read part of a file'
+  if (COMMAND_FAMILIES.includes(prog)) return `Run ${commandName(words, prog)}`
   return DESCRIBE[prog] ?? (prog ? `Run ${prog}` : 'Run a command')
 }
 
@@ -1742,10 +1788,27 @@ function validMirrorLink(a: Action): boolean {
     a.source?.threadId === m.parentThread && a.source?.data?.thread_id === m.thread
 }
 
+function mirrorFallbackStatus(reason: string, launch?: ChildMirror['launch'], attachmentStatus?: string): string {
+  const afterRetry = 'auto mode could not evaluate observer launch after one unchanged retry: '
+  const withoutRetry = 'auto mode could not evaluate observer launch: '
+  if (reason.startsWith(afterRetry) && isMirrorAutoModeNoVerdict(reason.slice(afterRetry.length))) return 'Auto mode could not evaluate the observer after one retry.'
+  if (reason.startsWith(withoutRetry) && isMirrorAutoModeNoVerdict(reason.slice(withoutRetry.length))) return 'Auto mode could not evaluate the observer; no retry.'
+  if (reason.startsWith('host creation outcome unknown: ') || launch === 'uncertain') return 'Observer launch outcome unknown; no retry.'
+  if (reason.includes('checkpoint unavailable')) return 'Observer launch unavailable; no retry.'
+  if (reason === 'host returned no agentId') return 'Observer identity unavailable; no retry.'
+  if (reason === 'observer dispatch depth limit 3') return 'Observer nesting limit reached.'
+  if (attachmentStatus && attachmentStatus !== 'attached' || reason.includes('attachment')) return 'Observer attachment incomplete.'
+  if (reason.includes('no relaunch') || reason.startsWith('previous launch ')) return 'Observer recovery unavailable; no relaunch.'
+  return launch === 'refused' ? 'Observer launch declined.' : 'Observer unavailable.'
+}
+
 async function mirrorFallback($: EngineInterface, run: Run, data: any, reason: string): Promise<void> {
-  const text = `↪ Codex child ${data.thread_id}: mirror unavailable (${reason}); using Batch 5 lifecycle/report view. Child transcript unavailable.`
+  const m = mirrors.get(mirrorKey(run.sessionId, data.thread_id))
+  const summary = mirrorFallbackStatus(reason, m?.launch, data.status)
+  const child = validThreadId(data.thread_id) ? data.thread_id.slice(-8) : oneLine(String(data.thread_id ?? 'unknown'), 12)
+  const text = `↪ Codex child ${child}: observer transcript unavailable. ${summary} Showing reported child activity.`
   run.queue.push({ kind: 'note', text })
-  $.ui.log(`codex-mod: ${text}`, { to: 'debug' })
+  $.ui.log(`codex-mod: ↪ Codex child ${data.thread_id}: mirror unavailable (${reason}); using Batch 5 lifecycle/report view. Child transcript unavailable.`, { to: 'debug' })
   const source = run.childSources?.get(data.thread_id)
   run.childSources?.delete(data.thread_id)
   if (source?.item) {
@@ -1806,17 +1869,40 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
   }
   m.launch = 'launching'
   if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror launch checkpoint unavailable; no host launched')
-  mirrorAuthorities.set(token, { parentHost: run.agentId, session: run.sessionId })
+  const authority: MirrorAuthority = { parentHost: run.agentId, session: run.sessionId, spawned: false }
+  mirrorAuthorities.set(token, authority)
+  let retried = false
   try {
     // Only the source relation is ours: core chooses host parent/depth.
     // This creates an observer for the already running Codex child.
-    const result = await $.agent.spawn(input)
+    let result = await $.agent.spawn(input)
+    const live = () => mirrors.get(key) === m && mirrorAuthorities.get(token) === authority && runs.get(run.agentId) === run && !run.killed &&
+      m.launch === 'launching' && m.host === undefined && m.parentHost === run.agentId && m.session === run.sessionId &&
+      authority.parentHost === run.agentId && authority.session === run.sessionId && authority.spawned === false
+    if (isMirrorAutoModeNoVerdict(result.deny) && live() && await $.session.id().catch(() => undefined) === run.sessionId &&
+      live() && prepareMirrorRetry(m, authority, result, input, run.agentId, run.sessionId)) {
+      // Retire the denied core ID before any await: delayed first-attempt
+      // events cannot claim the fresh ID used by the unchanged API request.
+      if (!await saveMirror($, m)) {
+        m.launch = 'refused'; m.reason = 'mirror retry checkpoint unavailable; no retry'
+        await saveMirror($, m)
+        return mirrorFallback($, run, data, m.reason)
+      }
+      if (await $.session.id().catch(() => undefined) === run.sessionId && live() &&
+        authority.toolUseId === undefined && m.hostToolId === undefined) {
+        retried = true
+        result = await $.agent.spawn(input)
+      }
+    }
     // turn.start may bind a core identity before the launch call resolves.
     // Reconcile that verified identity when a host omits it from the ack.
     const early = mirrors.get(key)
     const host = result.agentId ?? (early?.launch === 'bound' ? early.host : undefined)
     if (result.deny || !host) {
-      m.launch = m.host ? 'uncertain' : 'refused'; m.reason = result.deny ?? 'host returned no agentId'
+      m.launch = m.host ? 'uncertain' : 'refused'
+      m.reason = isMirrorAutoModeNoVerdict(result.deny)
+        ? `auto mode could not evaluate observer launch${retried ? ' after one unchanged retry' : ''}: ${result.deny}`
+        : result.deny ?? 'host returned no agentId'
       await saveMirror($, m)
       return mirrorFallback($, run, data, m.reason)
     }
@@ -2225,7 +2311,8 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     const id = e.props.tool_use_id
-    const saved = hasPrefix(id) && !sourceRows.has(id) ? await loadRow($, id, await sessionId($)) : undefined
+    const sid = hasPrefix(id) ? await sessionId($) : undefined
+    const saved = hasPrefix(id) && !sourceRows.has(id) ? await loadRow($, id, sid!) : undefined
     const owned = hasPrefix(id) ? sourceRows.get(id) ?? saved?.row : undefined
     if (e.props.tool === 'Agent') {
       const profile = await agentRowProfile($, id)
@@ -2240,18 +2327,22 @@ export const register: Register = (on, options) => {
       }
     }
     let row = hasPrefix(id) ? coordinatorRows.get(id) : undefined
+    if (row?.sessionId !== sid) row = undefined
     // Reopened history need not have called turn.step or consumed a guard.
-    // Restore presentation only; never restore an executable held answer.
-    if (!row && hasPrefix(id) && e.props.tool === displayTools.coordinator_message) {
-      const sid = await sessionId($)
+    // A matching row cache and received receipt attest a host-returned name
+    // even before registration. Restore presentation only, never an answer.
+    const legacyCoordinatorTool = e.props.tool === `mcp__${$.plugin.name}__coordinator_message`
+    const owner = owned?.sessionId === sid && owned?.tool === e.props.tool && typeof owned?.agentId === 'string' && owned.agentId !== '' ? owned.agentId : undefined
+    if (!row && hasPrefix(id) && (legacyCoordinatorTool || owner !== undefined)) {
       for (const key of await $.store.keys()) {
         if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
+        if (!legacyCoordinatorTool && key !== `${STORE_PREFIX}${sid}:${owner}`) continue
         const stored = await $.store.get(key)
         const rec = stored && await readStoreState($, key, stored)
         if (!isRecord(rec)) continue
         const saved = rec.coordinator?.rows?.[id]
         if (saved && saved.tool === e.props.tool && rec.coordinator!.received.includes(saved.sourceUuid)) {
-          row = { ...saved, outcome: saved.messageId ? rec.coordinator?.outcomes?.[saved.messageId] : undefined }
+          row = { ...saved, sessionId: sid!, outcome: saved.messageId ? rec.coordinator?.outcomes?.[saved.messageId] : undefined }
           coordinatorRows.set(id, row)
           break
         }
@@ -2293,7 +2384,7 @@ export const register: Register = (on, options) => {
       ] })
     }
     const plan = planCards.get(e.props.tool_use_id) ?? saved?.plan
-    if (plan && owned?.tool === displayTools.codex_plan && e.props.tool === owned.tool) {
+    if (plan && owned && owned.tool === displayTools.codex_plan && e.props.tool === owned.tool) {
       const { Box, Text } = $.ui.resolve(e)
       return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: 'Codex plan (display only)' }),
         ...(plan.explanation === undefined ? [] : [Text({ children: plan.explanation })]),
@@ -2301,18 +2392,39 @@ export const register: Register = (on, options) => {
         ...(plan.steps.length ? [] : [Text({ children: '(empty checklist)' })]),
       ] })
     }
-    if (owned?.tool === displayTools.codex_tool && e.props.tool === owned.tool && owned.label) {
+    if (owned && owned.tool === displayTools.codex_tool && e.props.tool === owned.tool && owned.label) {
       const label = owned.label
       // Keep the host's expansion, errors and controls under an owned identity label.
       const { Box, Text } = $.ui.resolve(e)
       return next(e).then(child => Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: label }), child] }))
     }
-    if (row === undefined || e.props.tool !== displayTools.coordinator_message || e.props.tool !== row.tool) return next(e)
+    if (row === undefined || e.props.tool !== row.tool) return next(e)
+    let outcome = row.outcome
+    if (row.messageId) {
+      try { outcome = (await $.state.get({ plugin: 'codex-mod', key: 'messageStatus', id: row.messageId })).value ?? outcome } catch {
+        // Saved receipt status remains useful when the live state is absent.
+      }
+    }
     const { Box, Text } = $.ui.resolve(e)
+    const labels: Record<MessageOutcome['status'], string> = {
+      received: 'Received · pending Codex acknowledgment', pending: 'Pending Codex acknowledgment',
+      accepted: 'Accepted into turn', observed: 'Observed in Codex input', queued: 'Queued for Codex',
+      rejected: 'Rejected', unknown: 'Delivery uncertain',
+    }
+    let status = outcome ? labels[outcome.status] ?? labels.received : labels.received
+    if (outcome?.status === 'queued' && outcome.queuedAfterTurnId) status = 'Queued after turn'
+    if (outcome?.status === 'accepted' && outcome.echoedItemId) status += ' · observed in input'
+    const reason = outcome?.reason ?? outcome?.error?.message ?? (outcome?.status === 'rejected' ? 'no reason supplied' : undefined)
+    if (reason) status += ` · ${reason}`
+    const details = [
+      ['Message', row.messageId ?? outcome?.messageId], ['Turn', outcome?.turnId], ['Accepted turn', outcome?.acceptedTurnId],
+      ['Expected turn', outcome?.expectedTurnId], ['Queued after turn', outcome?.queuedAfterTurnId],
+    ].filter(([, value]) => value !== undefined).map(([label, value]) => `${label}: ${value}`)
     return Box({ flexDirection: 'column', children: [
       Text({ weight: 'semibold', children: 'Coordinator' }),
       Text({ children: row.text }),
-      Text({ children: messageStatus(row.messageId ? (await $.state.get({ plugin: 'codex-mod', key: 'messageStatus', id: row.messageId })).value ?? row.outcome : undefined) }),
+      Text({ children: status }),
+      ...(details.length ? [Text({ dimColor: true, children: details.join(' · ') })] : []),
     ] })
   }).catch(($, e, next) => next(e))
 
@@ -2743,7 +2855,9 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
     const coordinator = name === 'coordinator_message'
     const registered = await $.tool.register({
       name,
-      description: `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
+      description: name === 'codex_question'
+        ? 'Display-only question controls for a pending Codex question. Only an explicit human answer or cancel submits a response. Never call this tool: all other calls are refused and it performs no work.'
+        : `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
       ...(coordinator || name === 'codex_question' ? { isDeferred: false } : {}),
       inputSchema: {
         type: 'object', additionalProperties: false,
@@ -4152,7 +4266,7 @@ async function* withCoordinatorMessages(
               const id = mintId(e)
               const input = { sourceUuid: message.sourceUuid ?? message.uuid, text }
               const o = message.messageId ? coordinator.outcomes?.[message.messageId] : Object.values(coordinator.outcomes ?? {}).find(o => o.sourceUuid === message.uuid)
-              coordinatorRows.set(id, { tool, text, messageId: o?.messageId, outcome: o })
+              coordinatorRows.set(id, { sessionId: await sessionId($), tool, text, messageId: o?.messageId, outcome: o })
               const rows = coordinator.rows ??= {}
               rows[id] = { tool, text, sourceUuid: message.sourceUuid ?? message.uuid, messageId: o?.messageId }
               if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: messageStatus(o) }] })) throw new Error('invalid coordinator display answer')

@@ -2,6 +2,11 @@
 
 ## 1.2.0 - 2026-10-19
 
+- Follow the host's exact auto-mode no-verdict instruction with at most one unchanged observer-launch retry, after retiring the denied core tool ID and checkpointing the live capability. Other denials, admitted spawns and uncertain outcomes never retry.
+- Recover Coordinator presentation data from verified persisted receipts before tool registration, contain missing presentation records and live-status read failures, and clarify that question controls require an explicit human answer or cancellation. Custom-card Desktop paint remains unaccepted.
+- Restore unregistered host-returned Coordinator names only through session-scoped cached ownership and a matching received receipt. Keep the message primary, delivery state separate and full identifiers dimmed; preserve exported status text. Shorten unavailable-observer notices while retaining complete private diagnostics.
+- Admit exact exploration results from Codex's observed `unifiedExecStartup` source while retaining conservative user-shell/interaction fallbacks. Describe compound and conditional Bash commands without reducing the label to their first token.
+
 - Preserve bounded SHA-256 task/launch identities independently of recovery payloads, split large checkpoints below the host filesystem limit, and refuse relaunches with an explicit recovery error when state is unavailable.
 - Rotate child journals into indexed 1 MiB segments with resumable cursors, preserve Unicode across stream/segment boundaries, and report persistent read failures separately from truncation.
 - Replace retained row source copies with bounded presentation metadata, release consumed/run/session entries, and recover historical labels/plans lazily from a bounded private disk cache. Show one final footer on capacity fallback with a short note for the failed attempt's usage.
@@ -48,6 +53,8 @@
 - `projectRoles` (default `true`) to enable project role loading and `allowProjectFullAccess` (default `false`) as the user-level opt-in for repository-declared `danger-full-access` roles.
 
 ### Fixed
+
+- Reconcile a child's replayed terminal snapshot with a buffered same-turn start before emitting a false interruption. Live completion then closes the parent normally; duplicate live terminal events remain deduplicated and usage is counted once.
 
 - Match nested mirror admission to CLI 2.1.302's host events: bind one-time tokens and stable launch fields to the spawning step's recorded parent and one core tool ID; tolerate omitted parent/cwd metadata while refusing conflicting identities and repeated launches. Preserve source cwd for replay, remove temporary spawn diagnostics and retain bounded store/private-cache persistence.
 - Keep permanent mirror launch diagnostics: explicit admission/binding reason codes and non-secret host field summaries, plus call/check admissions with the core tool ID. Re-entry diagnostics flush from the active parent after spawn settles without engine calls inside catches.

@@ -4,7 +4,10 @@ export type MirrorLaunch = {
   token: string; parentHost: string; session: string; depth: number
   inputDigest: string; launch: string; hostToolId?: string; host?: string
 }
-export type MirrorAuthority = { parentHost: string; session: string; toolUseId?: string; spawned?: boolean }
+export type MirrorAuthority = {
+  parentHost: string; session: string; toolUseId?: string; spawned?: boolean
+  retryUsed?: boolean; retiredToolUseId?: string
+}
 export type MirrorVerdict = 'admit' | 'no-reservation' | 'no-authority' | 'origin' | 'state' | 'depth' | 'session' |
   'type' | 'token' | 'digest' | 'parent' | 'background' | 'fork' | 'resume' | 'workflow' | 'teammate' |
   'reused' | 'provider' | 'tool' | 'keys' | 'tool-id' | 'host-id' | 'no-host'
@@ -14,6 +17,25 @@ const object = (v: any) => v !== null && typeof v === 'object' && !Array.isArray
 export const mirrorLaunchDigest = (input: any): string => JSON.stringify({
   subagentType: input.subagentType, prompt: input.prompt, description: input.description, name: input.name,
 })
+
+// This host denial guarantees that no agent started and explicitly requests
+// one unchanged retry. Other denials and uncertain outcomes grant no retry.
+export const MIRROR_AUTO_MODE_NO_VERDICT = 'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is; if it is denied again, continue with other tasks that don’t require it and tell the user that auto mode could not evaluate it. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.'
+const MIRROR_AUTO_MODE_NO_VERDICT_ASCII = 'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is; if it is denied again, continue with other tasks that don\'t require it and tell the user that auto mode could not evaluate it. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.'
+export const isMirrorAutoModeNoVerdict = (reason: unknown): boolean =>
+  reason === MIRROR_AUTO_MODE_NO_VERDICT || reason === MIRROR_AUTO_MODE_NO_VERDICT_ASCII
+
+export function prepareMirrorRetry(m: MirrorLaunch, authority: MirrorAuthority, result: { deny?: string; agentId?: string }, input: any, parentHost: string, session: string): boolean {
+  if (!isMirrorAutoModeNoVerdict(result.deny) || result.agentId !== undefined || m.host !== undefined || m.launch !== 'launching' || ![2, 3].includes(m.depth) ||
+    authority.spawned !== false || authority.retryUsed || authority.parentHost !== parentHost || m.parentHost !== parentHost ||
+    authority.session !== session || m.session !== session || input.prompt !== m.token || mirrorLaunchDigest(input) !== m.inputDigest ||
+    !authority.toolUseId || authority.toolUseId !== m.hostToolId) return false
+  authority.retryUsed = true
+  authority.retiredToolUseId = authority.toolUseId
+  delete authority.toolUseId
+  delete m.hostToolId
+  return true
+}
 
 /** Consume one source-step capability, allowing its call/check/spawn phases
  * to share exactly one core tool ID. A second spawn cannot reuse the token. */
@@ -50,7 +72,7 @@ export function admitMirrorLaunch(m: MirrorLaunch | undefined, authority: Mirror
     if (nested && Object.keys(e).some(k => !['tool', 'tool_use_id', 'agentId', 'input', 'ceiling'].includes(k))) return 'keys'
   }
   const id = e.tool_use_id
-  if (typeof id !== 'string' || id === '' || id.startsWith('toolu_codexmod_') || authority.toolUseId !== undefined && authority.toolUseId !== id ||
+  if (typeof id !== 'string' || id === '' || id === authority.retiredToolUseId || id.startsWith('toolu_codexmod_') || authority.toolUseId !== undefined && authority.toolUseId !== id ||
     m.hostToolId !== undefined && m.hostToolId !== id) return 'tool-id'
   authority.toolUseId = id
   m.hostToolId = id

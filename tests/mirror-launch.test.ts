@@ -1,12 +1,13 @@
 import { test, expect } from 'claude-code/testing'
-import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics } from '../hooks/mirror-launch.ts'
+import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics, MIRROR_AUTO_MODE_NO_VERDICT, isMirrorAutoModeNoVerdict, prepareMirrorRetry } from '../hooks/mirror-launch.ts'
 import type { MirrorAuthority, MirrorLaunch } from '../hooks/mirror-launch.ts'
 
 const reservedInput = () => ({ subagentType: 'codex-mod:codex-child', prompt: 'one-time-private-token',
   description: 'Codex gpt-6.1-sol · /root/check', name: 'codex-child-thread', cwd: '/source/project' })
 const reservation = (): MirrorLaunch => ({ ...reservedInput(), token: reservedInput().prompt,
   parentHost: 'parent-from-step', session: 'session-1', depth: 2, launch: 'launching', inputDigest: mirrorLaunchDigest(reservedInput()) })
-const authority = (): MirrorAuthority => ({ parentHost: 'parent-from-step', session: 'session-1' })
+const authority = (): MirrorAuthority => ({ parentHost: 'parent-from-step', session: 'session-1', spawned: false })
+const actualAsciiDenial = 'The server-side auto mode classifier gave no verdict for Agent: the request that produced this action did not ask for one. Issue the action again once, as-is; if it is denied again, continue with other tasks that don\'t require it and tell the user that auto mode could not evaluate it. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.'
 
 // CLI 2.1.302: cwd is present but undefined, and parentAgentId is absent.
 const liveSpawn = () => ({ tool_use_id: 'toolu_plugin_live_spawn', ...reservedInput(), cwd: undefined,
@@ -64,7 +65,7 @@ for (const [index, [reason, change]] of spawnRejections.entries()) test(`mirror 
   const m = reservation(), own = authority()
   expect(admitMirrorLaunch(m, own, { ...liveSpawn(), ...change }, 'codex-mod', 'spawn')).toBe(reason)
   expect(m.hostToolId).toBe(undefined)
-  expect(own.spawned).toBe(undefined)
+  expect(own.spawned).toBe(false)
 })
 
 test('mirror admission reports missing authority and every reservation predicate', () => {
@@ -98,6 +99,76 @@ test('mirror admission refuses a different tool ID and preserves the original cl
   expect(admitMirrorLaunch(m, own, { ...liveSpawn(), tool_use_id: 'toolu_plugin_other' }, 'codex-mod', 'spawn')).toBe('tool-id')
   expect(admitMirrorLaunch(m, own, liveSpawn(), 'codex-mod', 'spawn')).toBe('admit')
   expect(admitMirrorLaunch({ ...reservation(), hostToolId: 'other' }, authority(), liveSpawn(), 'codex-mod', 'spawn')).toBe('tool-id')
+})
+
+test('mirror auto-mode retry accepts only the two complete host apostrophe templates', () => {
+  for (const deny of [actualAsciiDenial, MIRROR_AUTO_MODE_NO_VERDICT]) {
+    expect(isMirrorAutoModeNoVerdict(deny)).toBe(true)
+    const m = reservation(), own = authority()
+    expect(admitMirrorLaunch(m, own, liveCall(), 'codex-mod', 'call')).toBe('admit')
+    expect(prepareMirrorRetry(m, own, { deny }, reservedInput(), m.parentHost, m.session)).toBe(true)
+  }
+  for (const deny of [undefined, null, {}, '', 'concurrency limit', actualAsciiDenial.trimEnd() + ' ', ` ${actualAsciiDenial}`,
+    `${actualAsciiDenial}\n`, actualAsciiDenial.replace('The server-side auto mode classifier ', ''),
+    actualAsciiDenial.replace('Agent:', 'Bash:'), actualAsciiDenial.replace("don't", 'do not'),
+    actualAsciiDenial.replace("don't", 'don‘t')]) expect(isMirrorAutoModeNoVerdict(deny)).toBe(false)
+})
+
+test('mirror retry retires the denied ID across every phase and admits only one fresh spawn', () => {
+  const m = reservation(), own = authority()
+  expect(admitMirrorLaunch(m, own, liveCall(), 'codex-mod', 'call')).toBe('admit')
+  expect(prepareMirrorRetry(m, own, { deny: MIRROR_AUTO_MODE_NO_VERDICT }, reservedInput(), m.parentHost, m.session)).toBe(true)
+  expect(own.retryUsed).toBe(true)
+  expect(own.retiredToolUseId).toBe(liveSpawn().tool_use_id)
+  expect(own.toolUseId).toBe(undefined)
+  expect(m.hostToolId).toBe(undefined)
+  for (const phase of ['call', 'check', 'spawn'] as const) {
+    expect(admitMirrorLaunch(m, own, phase === 'spawn' ? liveSpawn() : liveCall(), 'codex-mod', phase)).toBe('tool-id')
+  }
+  const id = 'toolu_plugin_retry'
+  expect(admitMirrorLaunch(m, own, { ...liveCall(), tool_use_id: id }, 'codex-mod', 'call')).toBe('admit')
+  expect(admitMirrorLaunch(m, own, { ...liveCall(), tool_use_id: id }, 'codex-mod', 'check')).toBe('admit')
+  expect(admitMirrorLaunch(m, own, { ...liveSpawn(), tool_use_id: id }, 'codex-mod', 'spawn')).toBe('admit')
+  expect(admitMirrorLaunch(m, own, { ...liveSpawn(), tool_use_id: id }, 'codex-mod', 'spawn')).toBe('reused')
+  expect(prepareMirrorRetry(m, own, { deny: MIRROR_AUTO_MODE_NO_VERDICT }, reservedInput(), m.parentHost, m.session)).toBe(false)
+})
+
+test('mirror retry refuses changed outcomes, authority, input and launch state without clearing a claim', () => {
+  const cases = [
+    { result: { deny: 'concurrency limit' } },
+    { result: { deny: `${MIRROR_AUTO_MODE_NO_VERDICT}\n` } },
+    { result: { deny: MIRROR_AUTO_MODE_NO_VERDICT.replace('Agent:', 'Bash:') } },
+    { result: {} },
+    { result: { deny: MIRROR_AUTO_MODE_NO_VERDICT, agentId: 'created' } },
+    { result: { deny: MIRROR_AUTO_MODE_NO_VERDICT, agentId: '' } },
+    { mirror: { host: 'early-host' } },
+    { mirror: { launch: 'bound' } },
+    { mirror: { launch: 'reserved' } },
+    { mirror: { launch: 'uncertain' } },
+    { mirror: { launch: 'refused' } },
+    { mirror: { depth: 4 } },
+    { mirror: { session: 'changed' } },
+    { mirror: { parentHost: 'changed' } },
+    { mirror: { hostToolId: 'changed' } },
+    { own: { spawned: true } },
+    { own: { spawned: undefined } },
+    { own: { retryUsed: true } },
+    { own: { parentHost: 'changed' } },
+    { own: { session: 'changed' } },
+    { own: { toolUseId: undefined } },
+    { input: { description: 'changed' } },
+    { input: { prompt: 'changed' } },
+  ]
+  for (const changes of cases) {
+    const m = reservation(), own = authority()
+    expect(admitMirrorLaunch(m, own, liveCall(), 'codex-mod', 'call')).toBe('admit')
+    Object.assign(m, changes.mirror)
+    Object.assign(own, changes.own)
+    const before = JSON.stringify({ m, own })
+    expect(prepareMirrorRetry(m, own, changes.result ?? { deny: MIRROR_AUTO_MODE_NO_VERDICT },
+      { ...reservedInput(), ...changes.input }, 'parent-from-step', 'session-1')).toBe(false)
+    expect(JSON.stringify({ m, own })).toBe(before)
+  }
 })
 
 test('mirror host binding diagnoses every mismatch and accepts omitted parent metadata', () => {
