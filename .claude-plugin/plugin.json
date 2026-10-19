@@ -1,6 +1,6 @@
 {
   "name": "codex-mod",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Subagent types codex-mod:codex and project-declared roles answered by the local OpenAI Codex CLI (codex exec) instead of an Anthropic model.",
   "author": {
     "name": "Diego Leyva",

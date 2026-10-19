@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-10-19
 
 - Preserve bounded SHA-256 task/launch identities independently of recovery payloads, split large checkpoints below the host filesystem limit, and refuse relaunches with an explicit recovery error when state is unavailable.
 - Rotate child journals into indexed 1 MiB segments with resumable cursors, preserve Unicode across stream/segment boundaries, and report persistent read failures separately from truncation.
