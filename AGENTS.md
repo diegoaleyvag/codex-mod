@@ -28,8 +28,8 @@ OpenAI Codex CLI, with Codex actions drawn as native rows and never executed by 
   tests, live check); there is no separate per-phase review.
 - **Final reviewer (one per change):** `gpt-6-astra` at low or medium effort, read-only
   (`codex-mod:auditor`), once at the end of a whole change; never per phase or per task.
-  A Claude reviewer (Fable, else Opus) only if Astra is unavailable. Now and then, for
-  variety, the orchestrator may add a short Opus review of a risky change; keep Claude use minimal.
+  No Fable review. At most, the orchestrator (Opus) may double-check Astra's findings;
+  otherwise Astra's review is final. Keep Claude use minimal.
 - Two writers never share a checkout; concurrent writers use separate worktrees.
 
 ## Rules for Codex workers
