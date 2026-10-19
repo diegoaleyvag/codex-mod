@@ -32,6 +32,8 @@
 import { spawn } from 'node:child_process'
 import { chmodSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
 
 const PROTOCOL_VERSION = 1
 const PLUGIN_VERSION = '1'
@@ -58,11 +60,11 @@ const KNOWN_METHODS = new Set([
   'model/safetyBuffering/updated', 'skills/changed', 'app/list/updated', 'remoteControl/status/changed',
   ...OPT_OUT,
 ])
-const DEFERRED_ITEMS = ['userMessage', 'hookPrompt', 'functionCallOutput', 'imageView']
+const DEFERRED_ITEMS = ['userMessage', 'hookPrompt', 'functionCallOutput']
 const KNOWN_ITEMS = new Set([
   ...DEFERRED_ITEMS, 'agentMessage', 'plan', 'reasoning', 'commandExecution',
   'fileChange', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch',
-  'imageGeneration', 'enteredReviewMode', 'exitedReviewMode', 'contextCompaction', 'sleep',
+  'imageView', 'imageGeneration', 'enteredReviewMode', 'exitedReviewMode', 'contextCompaction', 'sleep',
 ])
 
 // --- output ---------------------------------------------------------------
@@ -190,11 +192,11 @@ function completedItem(item, changesOf) {
       return { type: 'note', text }
     }
     case 'contextCompaction': return { type: 'note', text: 'Codex compacted context', dim: true }
-    case 'enteredReviewMode': return { type: 'note', text: 'Codex entered review mode', dim: true }
-    case 'exitedReviewMode': return { type: 'note', text: 'Codex exited review mode', dim: true }
-    case 'sleep': return { type: 'note', text: `Codex slept for ${item.durationMs} ms`, dim: true }
-    case 'imageGeneration': return { type: 'note', text: `Codex image generation: ${item.status}${item.savedPath ? ` (${item.savedPath})` : ''}`, dim: true }
-    // imageView is deliberately deferred; the known-item list still exempts it from drift.
+    case 'enteredReviewMode': return { ...item, type: 'entered_review_mode' }
+    case 'exitedReviewMode': return { ...item, type: 'exited_review_mode' }
+    case 'sleep': return { ...item, type: 'sleep' }
+    case 'imageView': return { ...item, type: 'image_view' }
+    case 'imageGeneration': return { ...item, type: 'image_generation' }
     default: return undefined
   }
 }
@@ -234,6 +236,7 @@ async function main() {
   let interruptTimer
   let codexVersion = 'unknown'
   const buffered = []
+  const bufferedRequests = []
   let badLineReported = false
   const unknownMethods = new Set()
   const unknownItems = new Set()
@@ -243,6 +246,8 @@ async function main() {
   const turnWaiters = []
   const retries = new Map()
   const inflight = new Set()
+  const questions = new Map()
+  const requestIds = new Map()
   let ppid = process.ppid
 
   const flushAndExit = code => {
@@ -277,6 +282,7 @@ async function main() {
     clearInterval(parentWatch)
     clearTimeout(interruptTimer)
     sweepControl(true)
+    for (const q of questions.values()) settleQuestion(q, { error: { code: -32800, message: 'turn finished before a user response' } }, 'cancelled')
     if (unknownMethods.size > 0 || unknownItems.size > 0) {
       emit({ type: 'codexmod.protocol', unknown_methods: [...unknownMethods], unknown_items: [...unknownItems] })
     }
@@ -357,6 +363,32 @@ async function main() {
     } catch {}
   }
 
+  const requestEvent = (q, status, extra = {}) => emit({ type: 'codexmod.request', token: q.token,
+    requestId: q.id, method: q.method, params: q.params, status, ...extra })
+  const settleQuestion = (q, response, status) => {
+    if (!questions.delete(q.token)) return
+    const failed = () => requestEvent(q, 'failed', { error: { code: -32000, message: 'question response could not be delivered to Codex' } })
+    try {
+      if (!child.stdin.writable || child.stdin.destroyed) return failed()
+      child.stdin.write(JSON.stringify({ id: q.id, ...response }) + '\n', err => err ? failed() : requestEvent(q, status, response))
+    } catch { failed() }
+  }
+  const responseFile = (name, path, final) => {
+    const token = name.slice('response-'.length, -'.json'.length)
+    const q = questions.get(token)
+    let body
+    try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { return }
+    remove(path)
+    if (!q || final || turnDone || body.token !== token || body.requestId !== q.id || body.threadId !== threadId || body.turnId !== turnId || body.itemId !== q.params.itemId) {
+      emit({ type: 'codexmod.responseRejected', token, message: 'stale or mismatched question response; no answer delivered' })
+      return
+    }
+    if (body.unsupported === true && body.result === undefined) settleQuestion(q, { error: { code: -32601, message: 'owned question UI unavailable; no user answer supplied' } }, 'unsupported')
+    else if (body.cancel === true && body.result === undefined) settleQuestion(q, { error: { code: -32800, message: 'user cancelled the question' } }, 'cancelled')
+    else if (choiceResponse(q.params, body.result)) settleQuestion(q, { result: body.result }, 'answered')
+    else emit({ type: 'codexmod.responseRejected', token, message: 'invalid question response; no answer delivered' })
+  }
+
   const handleSteer = async (name, path, text) => {
     const id = fileId(name)
     remove(path)
@@ -378,6 +410,10 @@ async function main() {
     }
     for (const name of names) {
       const path = join(args.control, name)
+      if (/^response-[A-Za-z0-9-]+\.json$/.test(name)) {
+        responseFile(name, path, final)
+        continue
+      }
       if (name === 'interrupt') {
         if (final || turnDone) {
           remove(path)
@@ -477,8 +513,23 @@ async function main() {
         emit({ type: 'item.updated', item: { type: 'plan_update', explanation: p.explanation, steps: p.plan } })
         break
       case 'error':
-        if (p.willRetry === false) emit({ type: 'error', message: p.error?.message ?? 'error' })
+        emit({ type: p.willRetry === false ? 'error' : 'codexmod.warning', message: p.error?.message ?? 'error' })
         break
+      case 'warning':
+      case 'configWarning':
+      case 'deprecationNotice':
+      case 'guardianWarning':
+        emit({ type: 'codexmod.warning', message: p.message ?? p.summary ?? p.error?.message ?? JSON.stringify(p) })
+        break
+      case 'serverRequest/resolved': {
+        const token = requestIds.get(JSON.stringify(p.requestId))?.token
+        const q = questions.get(token)
+        if (q) {
+          questions.delete(token)
+          requestEvent(q, 'cancelled', { error: { code: -32800, message: 'request resolved by Codex; late answers refused' } })
+        }
+        break
+      }
       case 'turn/completed': {
         const t = p.turn ?? {}
         turnDone = true
@@ -527,6 +578,7 @@ async function main() {
     turnId = id
     emit({ type: 'codexmod.turn', turn_id: id })
     for (const m of buffered.splice(0)) route(m)
+    for (const m of bufferedRequests.splice(0)) onLine(JSON.stringify(m))
     if (pendingInterrupt) {
       pendingInterrupt = false
       void interruptAndEnd()
@@ -557,12 +609,31 @@ async function main() {
       return
     }
     if (m.id !== undefined && typeof m.method === 'string') {
+      if (!turnId && !turnDone && m.params?.threadId === threadId) {
+        bufferedRequests.push(m)
+        return
+      }
+      const key = JSON.stringify(m.id)
+      const previous = requestIds.get(key)
+      if (previous) {
+        if (previous.method !== m.method || JSON.stringify(previous.params) !== JSON.stringify(m.params)) emit({ type: 'codexmod.responseRejected', token: previous.token, message: 'RPC ID reused with different request; no answer delivered' })
+        return
+      }
+      const q = { id: m.id, token: randomUUID(), method: m.method, params: publicSource(m.params ?? {}) }
+      requestIds.set(key, q)
+      if (m.method === QUESTION_METHOD && args.questions === 'choices' && choiceQuestions(q.params) && q.params.threadId === threadId && q.params.turnId === turnId && !turnDone && !finished) {
+        questions.set(q.token, q)
+        requestEvent(q, 'pending')
+        return
+      }
+      const error = { code: -32601, message: 'unsupported by codex-mod (only enabled, non-secret bounded choice questions; approvals remain disabled)' }
+      requestEvent(q, 'unsupported', { error })
       if (m.params?.threadId === undefined || m.params.threadId === threadId) {
         emit({ type: 'codexmod.source', source: { transport: 'app-server', event: m.method, threadId, turnId,
-          data: publicSource({ ...m.params, requestId: m.id, response: { code: -32601, message: 'unsupported by codex-mod' } }) } })
+          data: publicSource({ ...m.params, requestId: m.id, response: error }) } })
       }
       try {
-        child.stdin.write(JSON.stringify({ id: m.id, error: { code: -32601, message: 'unsupported by codex-mod' } }) + '\n')
+        child.stdin.write(JSON.stringify({ id: m.id, error }) + '\n')
       } catch {}
       return
     }

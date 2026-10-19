@@ -7,6 +7,7 @@ import { dirname, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import batch4Items from './batch4-items.mjs'
 import batch5Items from './batch5-items.mjs'
+import batch6Items, { PNG, questionParams } from './batch6-items.mjs'
 
 // Scenarios: normal, slow (completes after 1.5 s), instant (turn/start reply
 // and the whole turn in ONE stdout write), steer / steer-reject / hang / deaf
@@ -91,7 +92,10 @@ createInterface({ input: process.stdin }).on('line', line => {
   const m = JSON.parse(line)
   log(m)
   const reply = result => out({ id: m.id, result })
-  if (m.id !== undefined && m.method === undefined) return // reply to our server request
+  if (m.id !== undefined && m.method === undefined) {
+    if (scenario.startsWith('batch6-question') && m.id === 201) finishNormally()
+    return
+  }
   switch (m.method) {
     case 'initialize':
       if (scenario === 'legacy') return out({ id: m.id, error: { code: -32601, message: 'Method not found' } })
@@ -126,6 +130,35 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       reply({ turn: { id: TURN, status: 'inProgress' } })
       turnActive = true
+      if (scenario === 'batch6-images-modes') {
+        const root = process.env.FAKE_IMAGE_ROOT && resolve(process.env.FAKE_IMAGE_ROOT)
+        if (root) {
+          mkdirSync(resolve(root, 'batch6'), { recursive: true })
+          for (const name of ['view.png', 'generated.png']) writeFileSync(resolve(root, 'batch6', name), Buffer.from(PNG, 'base64'))
+          writeFileSync(resolve(root, 'batch6/vector.svg'), '<svg/>')
+        }
+        note('configWarning', { threadId: THREAD, summary: 'Configuration warning: ignored optional setting' })
+        note('error', { threadId: THREAD, turnId: TURN, willRetry: true, error: { message: 'Retryable warning' } })
+        note('thread/compacted', { threadId: THREAD, turnId: TURN })
+        for (const template of batch6Items) {
+          const item = { ...template, ...(root && template.path ? { path: resolve(root, template.path) } : {}), ...(root && template.savedPath ? { savedPath: resolve(root, template.savedPath) } : {}) }
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+          note('item/completed', { threadId: THREAD, turnId: TURN, item })
+        }
+        note('thread/compacted', { threadId: THREAD, turnId: TURN })
+        out({ id: 202, method: 'item/permissions/requestApproval', params: { threadId: THREAD, turnId: TURN, itemId: 'approval', reason: 'Explicit request; never consent' } })
+        return complete('completed')
+      }
+      if (scenario.startsWith('batch6-question')) {
+        const params = { ...questionParams, threadId: THREAD,
+          ...(scenario === 'batch6-question-unsupported' ? { questions: [{ ...questionParams.questions[0], isSecret: true }] } : {}),
+          ...(scenario === 'batch6-question-foreign' ? { turnId: 'stale-turn' } : {}) }
+        out({ id: 201, method: 'item/tool/requestUserInput', params })
+        out({ id: 201, method: 'item/tool/requestUserInput', params })
+        if (scenario === 'batch6-question-resolved') setTimeout(() => note('serverRequest/resolved', { threadId: THREAD, requestId: 201 }), 400)
+        if (scenario === 'batch6-question-finish') setTimeout(finishNormally, 500)
+        return
+      }
       if (scenario === 'batch5-plans-children') {
         for (const entry of batch5Items) {
           if (entry.plan) note('turn/plan/updated', { threadId: THREAD, turnId: TURN, ...entry.plan })

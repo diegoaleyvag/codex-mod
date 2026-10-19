@@ -9,6 +9,10 @@ import { webAction, toolFallback, publicToolText } from '../hooks/web-tools.ts'
 import { absolute } from '../hooks/codex.ts'
 import { childRows, planRows, emptyDisplayState, planText, displayChildId } from '../hooks/plans-children.ts'
 import batch5Items, { CHILD as B5_CHILD, THREAD as B5_THREAD } from './fixtures/batch5-items.mjs'
+import batch6Items, { PNG, questionParams, ANSWER } from './fixtures/batch6-items.mjs'
+import batch6Images from './fixtures/batch6-images.mjs'
+import { imageFile, captureImage, generationAction, findingsAction, literalReceipt, IMAGE_MAX } from '../hooks/images-modes.ts'
+import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
 import { compact, footer, mcpServerNames, unwrapShell, describeCommand, parseConfig, parseModelsCache, checkProfile, stripCoordinator, launchArgv, SHADOW_LINKS, cleanText, readConversation, itemsFromApi, parseCodexLine, runnerArgv, parseCodexVersion, codexTooOld, modelProvider, steerNote, coordinatorPayload, chooseHandback, parseProjectRoles, normalizeSource, SourceLedger, validAction, commandAction, NATIVE_TOOLS, ID_PREFIX, HANDBACK_ID_PREFIX, register as codexRegister } from '../hooks/codex.ts'
 
 // The test environment has timers; the hooks' type environment declares none.
@@ -139,6 +143,7 @@ type WorldOpts = {
   store?: Map<string, unknown>
   /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
+  binary?: Map<string, string>
   readFile?: (path: string, text: string | undefined) => string | undefined
   /** False: the agent's conversation lacks the host's SubagentHandback reminder. */
   handback?: boolean
@@ -213,6 +218,7 @@ function world(on: On, opts: WorldOpts = {}) {
     // The host resolves relative reads before dispatching this mock hook.
     const path = e.path.endsWith('/.claude/codex-mod.json') ? '.claude/codex-mod.json' : e.path
     reads.push(path)
+    if (e.as === 'bytes' && opts.binary?.has(path)) return { value: { base64: opts.binary.get(path)! } }
     const text = opts.readFile ? opts.readFile(path, files.get(path)) : files.get(path)
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
@@ -971,15 +977,15 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high'])
-  expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
-  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message'])
+  expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
+  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'])
   expect(w.toolSpecs.every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[0].inputSchema.required).toEqual(['server', 'name', 'arguments'])
   expect(w.toolSpecs[1].inputSchema.properties.steps.items.properties.status.enum).toEqual(['pending', 'in_progress', 'completed'])
   // The host spreads arguments beside its envelope fields, so display schemas
   // must keep these keys out of their top-level inputs.
   const envelopeKeys = ['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent', 'input', 'ceiling']
-  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text']])
+  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text'], ['server', 'name', 'arguments']])
   for (const spec of w.toolSpecs) {
     expect(spec.inputSchema.additionalProperties).toBe(false)
     expect(Object.keys(spec.inputSchema.properties).some(key => envelopeKeys.includes(key))).toBe(false)
@@ -1389,7 +1395,7 @@ test('coordinator receipt: full original message, returned name, UUID dedup acro
   expect(w.modelCalls).toEqual([])
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
-  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toEqual({ received: ['full-row'], pending: [] })
+  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toMatchObject({ received: ['full-row'], pending: [] })
 })
 
 for (const nativeActions of [true, false]) {
@@ -1412,7 +1418,7 @@ for (const nativeActions of [true, false]) {
       expect(displayed.result.toolUses).toEqual([])
     }
     const stored = w.store.get(key) as any
-    expect(stored.coordinator).toEqual({ received: ['saved-row'], pending: [] })
+    expect(stored.coordinator).toMatchObject({ received: ['saved-row'], pending: [] })
     expect(stored.lastAnswer).toBe('Previous Codex answer')
     expect(stored.followUps).toBe(undefined)
     await $.session.append(deliveryRow('agent-coordinator-reload', 'saved-row', text))
@@ -1460,7 +1466,7 @@ test('coordinator first receipt survives a copied launch record waiting for its 
   release()
   const s = await pending
   expect(coordinatorCalls(s.chunks).map(c => c.input)).toEqual([{ sourceUuid: 'during-save', text: 'Keep this receipt' }])
-  expect((w.store.get(key) as any).coordinator).toEqual({ received: ['during-save'], pending: [] })
+  expect((w.store.get(key) as any).coordinator).toMatchObject({ received: ['during-save'], pending: [] })
   expect(w.spawned.length).toBe(1)
 })
 
@@ -1514,7 +1520,7 @@ test('coordinator concurrent first receipts share their UUIDs and bodies before 
   expect(coordinatorCalls(s.chunks).map(c => c.input)).toEqual([
     { sourceUuid: 'concurrent-1', text: 'First receipt' }, { sourceUuid: 'concurrent-2', text: 'Second receipt' },
   ])
-  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toEqual({ received: ['concurrent-1', 'concurrent-2'], pending: [] })
+  expect((w.store.get('agent:sess-1:agent-coordinator') as any).coordinator).toMatchObject({ received: ['concurrent-1', 'concurrent-2'], pending: [] })
 })
 
 test('coordinator display guards: own answer only once, foreign IDs, wrong owner, dispatch and main-model calls denied', async ($, on) => {
@@ -1618,7 +1624,7 @@ test('coordinator render errors fall back through next(e)', async () => {
   let passed: any
   const next = (value: any) => { passed = value; return { type: 'Text', children: ['HOST'] } }
   let threw = false
-  try { render({}, e, next) } catch { threw = true }
+  try { await render({}, e, next) } catch { threw = true }
   expect(threw).toBe(true)
   expect(catcher({}, e, next)).toEqual({ type: 'Text', children: ['HOST'] })
   expect(passed === e).toBe(true)
@@ -1661,9 +1667,9 @@ test('coordinator plain text received mid-stream uses a separate block and never
     chunks.push(r.value)
   }
   expect(chunks.filter(c => c.kind === 'text').map(c => [c.index, c.text])).toEqual([
-    [0, '$ make'], [1, `Coordinator message:\n\n${text}`], [2, '\n\n$ lint'],
+    [0, '$ make'], [1, literalReceipt(text)], [2, '\n\n$ lint'],
   ])
-  expect(result.answer).toContain(`Coordinator message:\n\n${text}`)
+  expect(result.answer).toContain(literalReceipt(text))
   expect(handback(result)).toContain('built')
   expect(handback(result)).not.toContain('Full message')
   expect((w.store.get('agent:sess-1:agent-coordinator-stream') as any).lastAnswer).not.toContain('Full message')
@@ -2699,7 +2705,7 @@ test('phase 3 parser: summary only, MCP/dynamic text and errors, TODO updates, p
   expect(parseCodexLine(itemLine({ type: 'note', text: 'Codex compacted context', dim: true }))).toEqual({ kind: 'note', text: '↪ Codex compacted context', dim: true })
   expect(parseCodexLine(itemLine({ type: 'agent_message', phase: 'commentary', text: 'Working.' }))).toEqual({ kind: 'interim', text: 'Working.' })
   expect(parseCodexLine(itemLine({ type: 'agent_message', text: 'Exec answer.' }))).toEqual({ kind: 'message', text: 'Exec answer.' })
-  expect(parseCodexLine(itemLine({ type: 'error', message: 'Configuration notice' }))).toEqual({ kind: 'other' })
+  expect(parseCodexLine(itemLine({ type: 'error', message: 'Configuration notice' }))).toEqual({ kind: 'warning', text: 'Configuration notice' })
 })
 
 test('phase 3 parser: full collaboration fallback and waits without state transitions', () => {
@@ -2735,7 +2741,7 @@ test('phase 3 steps use returned registered names; own calls are answered and co
   })
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   expect(registered.length).toBe(1)
-  expect(registered[0].tools).toEqual(['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message'])
+  expect(registered[0].tools).toEqual(['Bash', 'Edit', 'Write', 'WebSearch', 'mcp__runtime__codex_tool', 'mcp__runtime__codex_plan', 'mcp__runtime__coordinator_message', 'mcp__runtime__codex_question'])
   const first = await step($, 'agent-progress')
   expect(first.chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Check the evidence.' })
   expect(first.chunks[1]).toEqual({ kind: 'text', index: 1, text: 'Checking sources.' })
@@ -2846,7 +2852,7 @@ test('phase 3 safety: every guard exception denies, including main-model registe
     return { catch: (handler: any) => { entry.catcher = handler } }
   }) as any, {})
   const $ = { agent: { list: async () => { throw new Error('Cannot resolve agent') } } }
-  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message']) {
+  for (const tool of ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'TodoWrite', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question']) {
     for (const name of ['tool.call', 'tool.check']) {
       const guard = guards.get(name)!
       const e = { tool, agentId: 'unresolved-phase3-agent', tool_use_id: 'foreign' }
@@ -3412,7 +3418,7 @@ for (const richRows of [false, true]) for (const nativeActions of [false, true])
         expect((await $.tool.check({ tool, tool_use_id: 'host-id', input: {}, agentId } as any)).decision).toBe('deny')
       }
     }
-    for (const tool of ['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message']) {
+    for (const tool of ['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question']) {
       for (const agentId of [undefined, 'agent-gp', 'agent-codex', 'foundation-unlisted']) {
         expect((await $.tool.call({ tool, tool_use_id: 'ordinary', agentId } as any) as any).deny).toContain('not executed')
         expect((await $.tool.check({ tool, tool_use_id: 'ordinary', input: {}, agentId } as any)).decision).toBe('deny')
@@ -3501,7 +3507,7 @@ test('foundation capability failure: only registered tools are admitted; absent 
   const specs: any[] = []
   on('agent.register', (_$, e: any) => { specs.push(e); return { value: { agent: `codex-mod:${e.name}` } } })
   await startSession($)
-  expect(specs[0].tools).toEqual(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'])
+  expect(specs[0].tools).toEqual(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
   const s = await step($, 'agent-progress')
   expect(callsOf(s.chunks).map(c => c.name)).toEqual(['mcp__codex-mod__codex_tool'])
   const [answer]: any[] = await runCalls($, s.chunks, 'agent-progress')
@@ -4430,4 +4436,220 @@ test('batch 5 reducer evidence boundary: child stream/reload/resume cannot repla
   expect(mainReader(rows.map(r => ({ ...r, parent_tool_use_id: null })))).toEqual([])
   expect(w.core).toEqual([])
   expect(w.writes).toEqual([])
+})
+
+// ---- Batch 6: images, prose/modes, questions and durable receipts ----------
+const b6Line = (item: any, transport: 'exec' | 'app-server' = 'app-server') => transport === 'exec' ? itemLine(execItem(item)) : JSON.stringify({ type: 'item.completed',
+  item: item.type === 'agentMessage' ? { type: 'agent_message', text: item.text, phase: item.phase }
+    : item.type === 'reasoning' ? { type: 'reasoning', summary: item.summary } : { type: 'source_only' },
+  source: { transport, event: 'item/completed', threadId: 'thr-1', turnId: 'turn-1', item } })
+const b6Source = (event: string, data: any = {}) => JSON.stringify({ type: 'codexmod.source', source: { transport: 'app-server', event, threadId: 'thr-1', turnId: 'turn-1', data } })
+const b6Request = (status: string, extra: any = {}) => out(JSON.stringify({ type: 'codexmod.request', token: 'request-token', requestId: 201, method: 'item/tool/requestUserInput', params: questionParams, status, ...extra }))
+const b6Render = ($: any, call: any) => $.ui.render({ component: 'ToolUse', surface: 'desktop', requestId: call.id, props: {
+  tool: call.name, tool_use_id: call.id, input: call.input, isRunning: false, isErrored: false, isInterrupted: false,
+} })
+
+// Assert exact bytes and format against original fixture bytes, not the filename.
+test('batch 6 image contract sniffs MIME/size and rejects malformed, oversized and invented Read fields', () => {
+  for (const image of batch6Images) expect(imageFile(image.base64)).toEqual({ base64: image.base64, type: image.mime, originalSize: image.size })
+  const file = imageFile(PNG)!
+  expect(file.type).toBe('image/png')
+  expect(file.originalSize).toBe(PNG.length / 4 * 3 - (PNG.endsWith('==') ? 2 : PNG.endsWith('=') ? 1 : 0))
+  const a: any = { tool: 'Read', input: { file_path: '/tmp/no-extension' }, result: { type: 'image', file } }
+  expect(validAction(a)).toBe(true)
+  for (const bad of ['', 'not base64', 'PHN2Zy8+', PNG.slice(4), 'A'.repeat(Math.ceil(IMAGE_MAX / 3) * 4 + 4)]) expect(imageFile(bad)).toBe(undefined)
+  for (const result of [{ type: 'image', file: { ...file, originalSize: file.originalSize + 1 } }, { type: 'image', file: { ...file, type: 'image/svg+xml' } }, { type: 'image', file: { ...file, filePath: '/tmp/image' } }]) expect(validAction({ ...a, result })).toBe(false)
+})
+
+for (const failure of ['changed', 'oversize', 'unsupported', 'missing']) test(`batch 6 ${failure} image capture has a faithful fallback`, async () => {
+  const size = imageFile(PNG)!.originalSize
+  let stats = 0, reads = 0
+  const api: any = { fs: {
+    stat: async () => {
+      if (failure === 'missing') throw new Error('ENOENT image')
+      return { kind: 'file', size: failure === 'oversize' ? IMAGE_MAX + 1 : size, mtimeMs: failure === 'changed' ? ++stats : 1, isLink: false, realPath: '/tmp/image' }
+    },
+    read: async () => { reads++; return { base64: failure === 'unsupported' ? 'PHN2Zy8+' : PNG } },
+  } }
+  const result = await captureImage(api, '/tmp/image')
+  expect(result.action).toBe(undefined)
+  expect(result.reason).toContain(failure === 'oversize' ? '4 MiB' : failure === 'missing' ? 'ENOENT' : failure)
+  if (failure === 'oversize') expect(reads).toBe(0)
+})
+
+for (const nativeActions of [true, false]) test(`batch 6 full image/mode corpus, nativeActions ${nativeActions}`, { options: { nativeActions, progressIntervalMs: 0 } }, async ($, on) => {
+  const size = imageFile(PNG)!.originalSize
+  const corpus = batch6Items.map(i => b6Line(i))
+  const w = world(on, { availableTools: ['Read'], binary: new Map([['/tmp/project/batch6/view.png', PNG], ['/tmp/project/batch6/generated.png', PNG]]),
+    stdout: [b6Source('thread/compacted'), ...corpus, b6Source('thread/compacted'), itemLine({ type: 'error', id: 'warning', message: 'Configuration warning' })].join('\n') })
+  on('fs.stat', (_$, e: any) => {
+    if (e.path.includes('missing')) throw new Error('ENOENT image')
+    return { value: { kind: 'file', size, mtimeMs: 1, isLink: false, realPath: e.path } }
+  })
+  const emitted: any[] = [], answers: any[] = [], chunks: any[] = []
+  let final = ''
+  for (let index = 0; index < 20; index++) {
+    const s = await step($, 'agent-progress', index)
+    chunks.push(...s.chunks)
+    if (callsOf(s.chunks).some(c => c.name === 'SubagentHandback')) { final = handback(s.result); break }
+    emitted.push(...callsOf(s.chunks))
+    answers.push(...await runCalls($, s.chunks, 'agent-progress'))
+  }
+  expect(final).toContain('Batch 6 complete.')
+  expect(final).toContain('6 actions')
+  for (const prose of ['Working commentary.', 'Incomplete partial answer.', 'Configuration warning', 'review mode', 'Codex waited']) expect(final).not.toContain(prose)
+  const text = chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')
+  expect(text).toContain(batch6Items.find(i => i.id === 'review-start')!.review)
+  expect(text).toContain(batch6Items.find(i => i.id === 'review-end')!.review)
+  expect(text.match(/Codex compacted context/g)?.length).toBe(1)
+  expect(text).toContain('Codex waited 25 ms')
+  expect(text).toContain('Configuration warning')
+  expect(JSON.stringify(chunks)).not.toContain('PRIVATE_')
+  if (nativeActions) {
+    expect(emitted.map(c => c.name)).toEqual(['Read', 'mcp__codex-mod__codex_tool', 'Read', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_tool'])
+    expect(answers.filter(a => a.result?.type === 'image').map(a => a.result.file.base64)).toEqual([PNG, PNG])
+    expect(answers.some(a => a.deny?.includes('image quota exceeded'))).toBe(true)
+    expect(text).toContain('later file image')
+    expect(chunks.some(c => c.kind === 'thinking' && c.text.includes('Public summary.'))).toBe(true)
+  } else {
+    expect(w.reads.some(p => p.endsWith('.png'))).toBe(false)
+    expect(text).toContain('nativeActions:false')
+    expect(text).toContain('Actual revised prompt')
+  }
+  expect(w.sleeps).toEqual([])
+  expect(w.core).toEqual([])
+  expect(w.writes).toEqual([])
+})
+
+test('batch 6 structured findings require every reported field and a matching guarded result', () => {
+  const item: any = { level: 'medium', findings: [{ file: 'hooks/a.ts', line: 3, summary: 'Issue', failure_scenario: 'Trigger', verdict: 'PLAUSIBLE' }] }
+  const a = findingsAction(item)!
+  expect(validAction(a)).toBe(true)
+  expect(validAction({ ...a, result: { ...a.result, count: 2 } })).toBe(false)
+  expect(findingsAction({ findings: [{ file: 'a', summary: 'No failure scenario' }] })).toBe(undefined)
+  expect(findingsAction({ ...item, level: 'invented' })).toBe(undefined)
+})
+
+test('batch 6 partial/commentary, review and warning alone never satisfy a missing final answer', async ($, on) => {
+  const w = world(on, { stdout: batch6Items.filter(i => ['commentary', 'partial', 'review-end'].includes(i.id)).map(i => b6Line(i, 'exec')).join('\n') + '\n' + itemLine({ type: 'error', message: 'Configuration warning' }) })
+  const s = await step($, 'agent-progress')
+  expect(handback(s.result)).toContain('codex failed: no agent message')
+  for (const text of ['Incomplete partial answer.', 'Working commentary.', 'Full review result.']) expect(handback(s.result)).not.toContain(text)
+  expect(w.core).toEqual([])
+})
+
+test('batch 6 question normalization accepts only actual bounded, non-secret choice answers', () => {
+  expect(choiceQuestions(questionParams)).toBe(true)
+  expect(choiceResponse(questionParams, ANSWER)).toBe(true)
+  const a = answeredQuestion(questionParams, ANSWER)!
+  expect(a.input.answers).toEqual({ 'Which mode?': 'Small' })
+  expect(validAction(a)).toBe(true)
+  expect(validAction({ ...a, result: { ...a.result, answers: { 'Which mode?': 'Invented' } } })).toBe(false)
+  for (const changes of [{ isSecret: true }, { isOther: true }, { options: null }, { header: 'header too long' }, { options: [questionParams.questions[0].options[0]] }]) expect(choiceQuestions({ ...questionParams, questions: [{ ...questionParams.questions[0], ...changes }] })).toBe(false)
+  for (const result of [{ answers: {} }, { answers: { mode: { answers: [] } } }, { answers: { mode: { answers: ['Invented'] } } }, { answers: { mode: { answers: ['Small', 'Full'] } } }]) expect(answeredQuestion(questionParams, result)).toBe(undefined)
+})
+
+for (const cancel of [false, true]) test(`batch 6 owned pending question ${cancel ? 'cancel' : 'answer'} UI writes exactly once after explicit controls`, { options: { transport: 'app-server', lean: false, richRows: true, progressIntervalMs: 0 } }, async ($, on) => {
+  const w = appWorld(on, { availableTools: ['AskUserQuestion'], pieces: [THREAD('thr-1'), TURN('turn-1'), b6Request('pending'), () => w.writes.some(v => v.path.includes('/response-')), b6Request(cancel ? 'cancelled' : 'answered', cancel ? { error: { code: -32800, message: 'user cancelled' } } : { result: ANSWER }), MESSAGE('Done')] })
+  await startSession($)
+  const s = await step($, 'agent-progress')
+  const call = callsOf(s.chunks)[0]
+  expect(call.name).toBe('mcp__codex-mod__codex_question')
+  expect(w.spawned[0].argv.slice(-2)).toEqual(['--questions', 'choices'])
+  const [ack]: any[] = await runCalls($, s.chunks, 'agent-progress')
+  expect(JSON.stringify(ack)).toContain('awaiting an explicit user response')
+  expect(w.writes).toEqual([])
+  const card: any = await b6Render($, call)
+  const buttons = card.children.filter((c: any) => c.type === 'Button')
+  expect(buttons.length).toBe(4)
+  // The resolved tree holds callback handles; ui.press invokes the actual handler.
+  const press = (button: any) => $.ui.press({ plugin: 'codex-mod', surface: 'desktop', requestId: call.id, key: button.props.key } as any)
+  if (!cancel) {
+    await press(buttons[2])
+    expect(w.writes).toEqual([])
+    await press(buttons[0])
+  }
+  await press(buttons[cancel ? 3 : 2])
+  await press(buttons[cancel ? 3 : 2])
+  expect(w.writes.length).toBe(1)
+  expect(JSON.parse(w.writes[0].text)).toMatchObject({ token: 'request-token', requestId: 201, threadId: 'thr-1', turnId: 'turn-1', itemId: 'question-1', ...(cancel ? { cancel: true } : { result: ANSWER }) })
+  const next = await step($, 'agent-progress', 1)
+  if (!cancel) {
+    expect(callsOf(next.chunks).map(c => c.name)).toEqual(['AskUserQuestion'])
+    const [answer]: any[] = await runCalls($, next.chunks, 'agent-progress')
+    expect(answer.result.answers).toEqual({ 'Which mode?': 'Small' })
+    const final = await step($, 'agent-progress', 2)
+    expect(handback(final.result)).toContain('Done')
+  } else expect(handback(next.result)).toContain('Done')
+  expect(w.core).toEqual([])
+})
+
+for (const tool of ['AskUserQuestion', 'ReportFindings', 'Read']) test(`batch 6 ${tool} guards preserve ordinary work and refuse Codex, replay, foreign and unresolved calls`, async ($, on) => {
+  const w = world(on)
+  for (const agentId of [undefined, 'agent-gp']) {
+    const result: any = await $.tool.call({ tool, tool_use_id: 'ordinary', agentId } as any)
+    expect(result.result.stdout).toBe('REALLY RAN')
+    expect((await $.tool.check({ tool, input: {}, tool_use_id: 'ordinary', agentId } as any)).decision).toBe('allow')
+  }
+  for (const [agentId, id] of [['agent-progress', 'ordinary'], ['agent-normal', ID_PREFIX + 'foreign'], [undefined, ID_PREFIX + 'main']]) {
+    expect((await $.tool.call({ tool, tool_use_id: id, agentId } as any) as any).deny).toContain('not executed')
+    expect((await $.tool.check({ tool, input: {}, tool_use_id: id, agentId } as any)).decision).toBe('deny')
+  }
+  expect(w.core.length).toBe(2)
+})
+
+test('batch 6 persisted coordinator render restores literal full body without restoring a guard answer', async ($, on) => {
+  const text = 'codex-model: gpt-6.1-sol\n<tag>**literal**</tag>\n```\n😀 café\n  tail  '
+  const id = ID_PREFIX + 'reopened'
+  const record = quietCoordinatorRecord('unused') as any
+  record.coordinator = { received: ['source'], pending: [], rows: { [id]: { tool: COORDINATOR_TOOL, sourceUuid: 'source', text } } }
+  const w = world(on, { store: new Map([['agent:sess-1:agent-coordinator', record]]) })
+  await startSession($)
+  const card: any = await b6Render($, { name: COORDINATOR_TOOL, id, input: { sourceUuid: 'forged', text: 'forged' } })
+  expect(card.children[1].children).toEqual([text])
+  expect((await $.tool.call({ tool: COORDINATOR_TOOL, tool_use_id: id, agentId: 'agent-coordinator', sourceUuid: 'source', text } as any) as any).deny).toContain('not executed')
+  const fallback = literalReceipt(text)
+  expect(fallback).toContain('````text\n' + text + '\n````')
+  expect(w.spawned).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+for (const surface of ['absent-read', 'registration-fails', 'generation-progress', 'findings-native', 'findings-fallback']) test(`batch 6 ${surface} selects only admitted, guarded rows`, { options: { richRows: true, progressIntervalMs: 0 } }, async ($, on) => {
+  const review: any = { type: 'exitedReviewMode', id: 'review-findings', review: 'Preserve full review', findings: [{ file: 'a.ts', summary: 'Actual supplied finding', failure_scenario: 'Explicit source scenario' }], level: 'low' }
+  const generation: any = { ...batch6Items.find(i => i.id === 'generation'), status: 'generating', result: 'Actual in-progress report' }
+  const item = surface.startsWith('findings') ? review : surface === 'generation-progress' ? generation : surface === 'registration-fails' ? batch6Items.find(i => i.id === 'generation')! : batch6Items[0]
+  const w = world(on, { availableTools: surface === 'findings-native' ? ['ReportFindings'] : [], toolRegisterThrows: surface === 'registration-fails' ? 'codex_tool' : undefined,
+    stdout: b6Line(item) + '\n' + MESSAGE('Done').text })
+  // With no session.start, no display registration exists: text is the valid fallback.
+  // This case specifically exercises the registered-card branch.
+  if (surface === 'findings-fallback') await startSession($)
+  const first = await step($, 'agent-progress')
+  const calls = callsOf(first.chunks)
+  if (surface === 'findings-native') {
+    expect(calls.map(c => c.name)).toEqual(['ReportFindings'])
+    const [r]: any[] = await runCalls($, first.chunks, 'agent-progress')
+    expect(r.result.findings).toEqual(review.findings)
+  } else if (surface === 'findings-fallback' || surface === 'generation-progress') {
+    expect(calls.map(c => c.name)).toEqual(['mcp__codex-mod__codex_tool'])
+    const [r]: any[] = await runCalls($, first.chunks, 'agent-progress')
+    expect(r.deny).toBe(undefined)
+    expect(JSON.stringify(r)).toContain(surface === 'findings-fallback' ? 'Explicit source scenario' : 'Actual in-progress report')
+  } else {
+    expect(calls.map(c => c.name)).toEqual(['SubagentHandback'])
+    expect(first.chunks.some(c => c.kind === 'text' && c.text.includes('Read unavailable'))).toBe(true)
+  }
+  expect(w.reads.some(p => p.endsWith('view.png'))).toBe(false)
+  expect(w.core).toEqual([])
+})
+
+for (const option of ['lean', 'text', 'registration-fails']) test(`batch 6 question UI ${option} disables the runner adapter and errors without implying a response`, { options: { transport: 'app-server', lean: option === 'lean', nativeActions: option !== 'text', progressIntervalMs: 0 } }, async ($, on) => {
+  const w = appWorld(on, { toolRegisterThrows: option === 'registration-fails' ? 'codex_question' : undefined,
+    pieces: [THREAD('thr-1'), TURN('turn-1'), b6Request('unsupported', { error: { code: -32601, message: 'unsupported by codex-mod' } }), MESSAGE('Done')] })
+  await startSession($)
+  const s = await step($, 'agent-progress')
+  expect(w.spawned[0].argv.includes('--questions')).toBe(false)
+  expect(callsOf(s.chunks).every(c => c.name === 'SubagentHandback')).toBe(true)
+  expect(w.writes).toEqual([])
+  expect(handback(s.result)).not.toContain('unsupported')
+  expect(w.core).toEqual([])
 })

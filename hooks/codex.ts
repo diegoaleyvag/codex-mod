@@ -113,6 +113,8 @@ import { explorationAction, validExploration } from './exploration.ts'
 import { patchActions, PATCH_TEXT_MAX } from './patches.ts'
 import { webAction, webFallback, toolFallback, sourceDuration, validFetchResult } from './web-tools.ts'
 import { childRows, planRows, planText, emptyDisplayState } from './plans-children.ts'
+import { captureImage, validImage, generationAction, findingsAction, literalReceipt } from './images-modes.ts'
+import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuestion } from './questions.mjs'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
@@ -171,14 +173,16 @@ const HANDBACK_TOOL = 'SubagentHandback'
 export const ID_PREFIX = 'toolu_codexmod_'
 export const HANDBACK_ID_PREFIX = 'toolu_codexhandback_'
 /** The built-in tools Codex's actions are drawn as; never executed for a Codex agent. */
-export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'WebFetch', 'Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop'] as const
-const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop'])
-type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message'
+export const NATIVE_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'Edit', 'Write', 'WebSearch', 'WebFetch', 'Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop', 'ReportFindings', 'AskUserQuestion'] as const
+const RICH_TOOLS = new Set<string>(['Agent', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'SendMessage', 'TaskStop', 'ReportFindings', 'AskUserQuestion'])
+type DisplayTool = 'codex_tool' | 'codex_plan' | 'coordinator_message' | 'codex_question'
 const displayTools: Partial<Record<DisplayTool, string>> = {}
-const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message'])
+const displayNames = new Set(['mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'])
 // Kept after the guard consumes its answer, so resolved rows still render.
 const coordinatorRows = new Map<string, { tool: string; text: string }>()
 const planCards = new Map<string, PlanInput>()
+type Question = { token: string; requestId: string | number; method: string; params: any; status: string; result?: any; error?: any }
+const questionRows = new Map<string, { session: string; agent: string; control: string; question: Question; selected: Record<string, string> }>()
 const COORDINATOR_PART_MAX = 90000
 const dimNotes = new Set<string>()
 export const NOT_EXECUTED = 'codex-mod: not executed'
@@ -420,7 +424,7 @@ export type AgentRecord = Profile & {
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
   // Receipt deduplication and unshown bodies survive a hooks-worker restart.
-  coordinator?: { received: string[]; pending: { uuid: string; text: string }[] }
+  coordinator?: { received: string[]; pending: { uuid: string; text: string }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string }> }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
   // Latest run's public wire evidence, including unsupported source variants.
@@ -560,6 +564,8 @@ export type CodexEvent =
   | { kind: 'files'; changes: FileChange[] }
   | { kind: 'usage'; input: number; cached: number; output: number }
   | { kind: 'error'; text: string }
+  | { kind: 'warning'; text: string }
+  | { kind: 'question'; question: Question }
   // runner-only lines (app-server transport)
   | { kind: 'turn'; id: string }
   | { kind: 'steer'; id: string; accepted: boolean; reason?: string }
@@ -598,7 +604,13 @@ export function validAction(a: Action): a is Action & { result: NativeResult | D
   const i = a.input
   const r = a.result
   if (!object(i)) return false
+  if (a.tool === 'Read' && validImage(a)) return true
   if (['Read', 'Glob', 'Grep'].includes(a.tool)) return a.error === undefined && validExploration(a)
+  if (a.tool === 'AskUserQuestion') return a.error === undefined && validAnsweredQuestion(a)
+  if (a.tool === 'ReportFindings') {
+    const expected = findingsAction(i)
+    return expected !== undefined && keysOnly(i, ['findings', 'level']) && stableJSON(r) === stableJSON(expected.result)
+  }
   let inputOK = false
   if (a.tool === 'Bash') inputOK = keysOnly(i, ['command', 'description']) && typeof i.command === 'string' && typeof i.description === 'string'
   else if (a.tool === 'Edit') inputOK = keysOnly(i, ['file_path', 'old_string', 'new_string', 'replace_all']) && ['file_path', 'old_string', 'new_string'].every(k => typeof i[k] === 'string') && (i.replace_all === undefined || i.replace_all === false)
@@ -670,6 +682,8 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
   }
   const type = typeof ev?.type === 'string' ? ev.type : undefined
   if (type?.startsWith('codexmod.')) {
+    if (type === 'codexmod.request' && typeof ev.token === 'string' && typeof ev.method === 'string') return { kind: 'question', question: ev }
+    if (type === 'codexmod.warning' || type === 'codexmod.responseRejected') return { kind: 'warning', text: String(ev.message ?? 'warning') }
     if (type === 'codexmod.turn' && typeof ev.turn_id === 'string') return { kind: 'turn', id: ev.turn_id }
     if (type === 'codexmod.steer' && (typeof ev.id === 'string' || typeof ev.id === 'number')) {
       return { kind: 'steer', id: String(ev.id), accepted: ev.status === 'accepted', ...(typeof ev.reason === 'string' ? { reason: ev.reason } : {}) }
@@ -728,6 +742,7 @@ export function parseCodexLine(line: string, richRows = false, todoWriteAvailabl
       return { kind: 'action', display: 'codex_tool', action: toolFallback(ev.source?.item ?? item, 'Host input schema and verified server binding unavailable; replacement contract unknown.') }
     }
     if (item?.type === 'proposed_plan' && typeof item.text === 'string') return { kind: 'interim', text: `Proposed plan:\n${item.text}` }
+    if (item?.type === 'error') return { kind: 'warning', text: String(item.message ?? 'Codex warning') }
     if (item?.type === 'note' && typeof item.text === 'string') return { kind: 'note', text: `↪ ${oneLine(item.text, 300)}`, ...(item.dim === true ? { dim: true as const } : {}) }
     if (item?.type === 'collab_tool_call' || item?.type === 'collabAgentToolCall') {
       return childRows(item, emptyDisplayState(), { session: 'unreported', agent: 'unreported', thread: 'unreported', rich: richRows, tools: new Set(richRows ? ['Agent'] : []) })[0] ?? { kind: 'other' }
@@ -1200,6 +1215,7 @@ export function runnerArgv(p: {
   lean: string[]
   extra: readonly string[]
   control: string
+  questions?: boolean
 }): string[] {
   const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra]
   return [
@@ -1208,6 +1224,7 @@ export function runnerArgv(p: {
     ...(p.resume ? ['--thread', p.resume] : []),
     ...overrides.flatMap(kv => ['--config', kv]),
     '--control', p.control,
+    ...(p.questions ? ['--questions', 'choices'] : []),
   ]
 }
 
@@ -1313,6 +1330,7 @@ type Run = {
   unknown: number
   unknownTypes: string[]
   fatal?: string
+  compactions?: Map<string, { notification: boolean; items: string[] }>
 }
 
 /** What session start found for the app-server transport: the launch, or why runs fall back to exec. */
@@ -1405,7 +1423,8 @@ function holdAnswer(id: string, sid: string, agentId: string, action: Action): b
   // Unconfirmed patches still need native error rows. Individual success must
   // be explicitly reported for this file; a sampled filesystem change cannot grant it.
   if (patch && !action.error && status !== 'completed' && !completedFile) return false
-  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status) && !completedFile && !(patch && action.error)) return false
+  const generation = action.source?.item?.type === 'imageGeneration' && action.tool === displayTools.codex_tool
+  if (status !== undefined && !['completed', 'failed', 'declined'].includes(status) && !completedFile && !(patch && action.error) && !generation) return false
   const noMatches = ['Grep', 'Bash'].includes(action.tool) && action.source?.item?.exitCode === 1 && explorationAction(action.source)?.tool === 'Grep'
   if (['failed', 'declined'].includes(status) && !action.error && !noMatches && !completedFile && !(status === 'failed' && action.tool === 'WebFetch' && !Array.isArray(action.result) && Number(action.result.code) >= 400)) return false
   // Snapshot before handing anything to core; later caller/input mutations must
@@ -1494,8 +1513,60 @@ export const register: Register = (on, options) => {
     return $.ui.resolve(e).Text({ dimColor: true, children: e.props.text })
   }).catch(($, e, next) => next(e))
 
-  on('ui.render', { component: 'ToolUse' }, ($, e, next) => {
-    const row = hasPrefix(e.props.tool_use_id) ? coordinatorRows.get(e.props.tool_use_id) : undefined
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const id = e.props.tool_use_id
+    let row = hasPrefix(id) ? coordinatorRows.get(id) : undefined
+    // Reopened history need not have called turn.step or consumed a guard.
+    // Restore presentation only; never restore an executable held answer.
+    if (!row && hasPrefix(id) && e.props.tool === displayTools.coordinator_message) {
+      const sid = await sessionId($)
+      for (const key of await $.store.keys()) {
+        if (!key.startsWith(`${STORE_PREFIX}${sid}:`)) continue
+        const rec = await $.store.get(key)
+        if (!isRecord(rec)) continue
+        const saved = rec.coordinator?.rows?.[id]
+        if (saved && saved.tool === e.props.tool && rec.coordinator!.received.includes(saved.sourceUuid)) {
+          row = saved
+          coordinatorRows.set(id, saved)
+          break
+        }
+      }
+    }
+    const questionRow = questionRows.get(id)
+    if (questionRow && e.props.tool === displayTools.codex_question && sourceRows.get(id)?.tool === e.props.tool && questionRow.session === await sessionId($)) {
+      const { Box, Text, Button } = $.ui.resolve(e)
+      const q = questionRow.question
+      const send = async (cancel = false) => {
+        const run = runs.get(questionRow.agent)
+        if (q.status !== 'pending' || !run || run.ended || run.killed || run.control !== questionRow.control || run.thread !== q.params.threadId || run.turnId !== q.params.turnId) return
+        const result = { answers: Object.fromEntries(q.params.questions.map((v: any) => [v.id, { answers: [questionRow.selected[v.id]] }])) }
+        if (!cancel && q.params.questions.some((v: any) => !v.options.some((o: any) => o.label === questionRow.selected[v.id]))) return
+        q.status = 'submitting'
+        $.ui.invalidate('ui.render')
+        try {
+          await $.fs.write(`${questionRow.control}/response-${q.token}.json`, JSON.stringify({ token: q.token, requestId: q.requestId,
+            threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, ...(cancel ? { cancel: true } : { result }) }))
+        } catch {
+          q.status = 'pending'
+          $.ui.invalidate('ui.render')
+        }
+      }
+      return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: 'Codex question' }),
+        Text({ children: `${q.status}; receipt is not an answer or approval` }),
+        ...q.params.questions.flatMap((v: any) => [Text({ children: v.question }), ...v.options.map((o: any) =>
+          q.status === 'pending' ? Button({ key: `${q.token}:${v.id}:${o.label}`, label: `${questionRow.selected[v.id] === o.label ? '✓ ' : ''}${o.label}: ${o.description}`,
+            onPress: () => {
+              if (q.status === 'pending') {
+                questionRow.selected[v.id] = o.label
+                $.ui.invalidate('ui.render')
+              }
+            } }) : Text({ children: `${o.label}: ${o.description}` }))]),
+        ...(q.status === 'pending' ? [Button({ key: `${q.token}:submit`, label: 'Send selected answers', onPress: () => { void send() } }),
+          Button({ key: `${q.token}:cancel`, label: 'Cancel question', onPress: () => { void send(true) } })] : []),
+        ...(q.result ? [Text({ children: JSON.stringify(q.result) })] : []),
+        ...(q.error ? [Text({ children: JSON.stringify(q.error) })] : []),
+      ] })
+    }
     const owned = hasPrefix(e.props.tool_use_id) ? sourceRows.get(e.props.tool_use_id) : undefined
     const item = owned?.source?.item
     const plan = planCards.get(e.props.tool_use_id)
@@ -1771,14 +1842,14 @@ async function loadProjectRoles($: EngineInterface, config: Config): Promise<voi
  * agentId, requestMeta, consent) or tool-check fields.
  */
 async function registerDisplayTools($: EngineInterface): Promise<void> {
-  for (const name of ['codex_tool', 'codex_plan', 'coordinator_message'] as const) {
+  for (const name of ['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question'] as const) {
     if (displayTools[name]) continue
-    const tool = name === 'codex_tool'
+    const tool = name === 'codex_tool' || name === 'codex_question'
     const coordinator = name === 'coordinator_message'
     const registered = await $.tool.register({
       name,
       description: `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
-      ...(coordinator ? { isDeferred: false } : {}),
+      ...(coordinator || name === 'codex_question' ? { isDeferred: false } : {}),
       inputSchema: {
         type: 'object', additionalProperties: false,
         properties: coordinator ? { sourceUuid: { type: 'string' }, text: { type: 'string' } } : tool ? { server: { type: 'string' }, name: { type: 'string' }, arguments: {} } : {
@@ -2322,7 +2393,9 @@ async function* startRun(
     // created private (0700) here, before any steer file (prompt text) is written
     // into it: `$.fs.write` would create missing directories with the default mode
     await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
-    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control })
+    const questionTool = displayTools.codex_question
+    const questions = config.nativeActions && !config.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control, questions })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   } else {
     argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
@@ -2519,6 +2592,60 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
   const captured = source ? run.ledger.capture(source) : undefined
   if (captured?.render === false) return
   const item = captured?.record.item
+  const complete = ['item.completed', 'item/completed'].includes(source?.event ?? '')
+  if (item?.type === 'imageGeneration' && !complete && ['item.started', 'item/started', 'item.updated'].includes(source?.event ?? '')) {
+    run.queue.push({ kind: 'interim', text: `Codex image generation status:\n${JSON.stringify(item)}` })
+    return
+  }
+  if (source?.event === 'thread/compacted' || complete && item?.type === 'contextCompaction') {
+    const key = JSON.stringify([source?.threadId, source?.turnId])
+    const seen = (run.compactions ??= new Map()).get(key) ?? { notification: false, items: [] }
+    let show = false
+    if (item) {
+      if (!seen.items.includes(item.id)) {
+        show = seen.items.length > 0 || !seen.notification
+        seen.items.push(item.id)
+      }
+    } else {
+      show = !seen.notification && seen.items.length === 0
+      seen.notification = true
+    }
+    run.compactions.set(key, seen)
+    if (show) run.queue.push({ kind: 'interim', text: '↪ Codex compacted context' })
+    return
+  }
+  if (complete && item && ['imageView', 'imageGeneration'].includes(item.type)) {
+    if (item.type === 'imageGeneration') await handle($, run, { kind: 'action', display: 'codex_tool', action: generationAction(item) }, captured?.record)
+    else run.actions++
+    const path = item.type === 'imageView' ? item.path : item.savedPath
+    if (typeof path !== 'string' || path === '' || item.type === 'imageGeneration' && (item.status !== 'completed' || item.failure)) {
+      if (item.type === 'imageView' || item.status === 'completed') run.queue.push({ kind: 'interim', text: 'Codex image preview unavailable: no real saved image path reported; remote result strings are not fetched.' })
+      return
+    }
+    const resolved = absolute(source?.cwd ?? run.cwd, path)
+    const ownTools = agentTools.get(run.name) ?? availableTools
+    if (!cfg.nativeActions || !ownTools?.has('Read')) {
+      run.queue.push({ kind: 'interim', text: `Codex ${item.type} ${JSON.stringify(resolved)}: preview unavailable (${cfg.nativeActions ? "Read unavailable in this agent's tools" : 'nativeActions:false'}).` })
+      return
+    }
+    const preview = await captureImage($, resolved)
+    run.queue.push({ kind: 'interim', text: `Codex ${item.type} preview ${JSON.stringify(resolved)}: ${preview.action ? 'later file image captured after the reported operation; original viewed bytes are not established.' : preview.reason}` })
+    if (preview.action) run.queue.push({ kind: 'action', action: { ...preview.action, source: captured?.record } })
+    return
+  }
+  if (complete && item && ['enteredReviewMode', 'exitedReviewMode'].includes(item.type)) {
+    run.queue.push({ kind: 'interim', text: `Codex ${item.type === 'enteredReviewMode' ? 'entered' : 'exited'} review mode${typeof item.review === 'string' ? `\n${item.review}` : ''}` })
+    if (item.findings !== undefined) {
+      const action = findingsAction(item)
+      if (action && cfg.richRows) await handle($, run, { kind: 'action', action }, captured?.record)
+      else run.queue.push({ kind: 'interim', text: `Codex review findings (${action ? 'richRows disabled' : 'required structured fields missing'}):\n${JSON.stringify(item.findings)}` })
+    }
+    return
+  }
+  if (complete && item?.type === 'sleep') {
+    run.queue.push({ kind: 'interim', text: `Codex waited ${item.durationMs ?? item.duration_ms ?? '(duration unreported)'} ms` })
+    return
+  }
   const child = ['collabAgentToolCall', 'subAgentActivity'].includes(item?.type)
   const plan = ['todo_list', 'plan_update'].includes(item?.type)
   if (child || plan) {
@@ -2591,7 +2718,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
       ev.display = ev.action.tool === 'codex_tool' ? 'codex_tool' : undefined
     }
     ev.action.source = source
-    if (source?.item?.status === 'inProgress') return
+    if (source?.item?.status === 'inProgress' && source.item.type !== 'imageGeneration') return
     if (['failed', 'declined'].includes(source?.item?.status) && !ev.action.error && !(source?.item?.status === 'failed' && ev.action.tool === 'WebFetch' && !Array.isArray(ev.action.result) && Number(ev.action.result.code) >= 400)) ev.action.error = `Codex ${source!.item!.type} ${source!.item!.status}: ${JSON.stringify(source!.item)}`
     if (ev.action.tool === 'WebSearch' && object(ev.action.result)) ev.action.result.durationSeconds = (sourceDuration(source) ?? 0) / 1000
     if (ev.display) {
@@ -2599,13 +2726,41 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
       const tool = displayTools[ev.display]
       // no registered display tool: the action is shown as its text line, never as a row
       if (tool === undefined) {
-        run.queue.push({ kind: 'note', text: actionLine(ev.action) })
+        run.queue.push({ kind: ev.action.input.name === 'imageGeneration' ? 'interim' : 'note', text: actionLine(ev.action) })
         return
       }
       ev.action.tool = tool
     }
     run.queue.push({ kind: 'action', action: ev.action })
   } else if (ev.kind === 'error') run.errors.push(ev.text)
+  else if (ev.kind === 'warning') run.queue.push({ kind: 'interim', text: `Codex warning: ${ev.text}` })
+  else if (ev.kind === 'question') {
+    const q = ev.question
+    if (run.transport !== 'app-server' || !run.control || q.params?.threadId !== run.thread || q.params?.turnId !== run.turnId || !/^[A-Za-z0-9-]+$/.test(q.token)) {
+      run.queue.push({ kind: 'interim', text: `Codex request ignored: unbound RPC ${JSON.stringify(q.requestId)} (${q.method})` })
+      return
+    }
+    for (const row of questionRows.values()) if (row.agent === run.agentId && row.question.token === q.token) row.question = q
+    $.ui.invalidate('ui.render')
+    if (q.status === 'pending' && q.method === QUESTION_METHOD && choiceQuestions(q.params)) {
+      const tool = displayTools.codex_question
+      const ownTools = agentTools.get(run.name)
+      if (!cfg.nativeActions || cfg.lean || !tool || ownTools && !ownTools.has(tool)) {
+        await $.fs.write(`${run.control}/response-${q.token}.json`, JSON.stringify({ token: q.token, requestId: q.requestId,
+          threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, unsupported: true }))
+        run.queue.push({ kind: 'interim', text: 'Codex question unsupported: owned question UI unavailable; no answer or consent supplied.' })
+        return
+      }
+      // Registration provides the ToolUse site; only its explicit controls write a response.
+      const action: Action = { tool, input: { server: 'codex', name: q.method, arguments: { ...q.params, requestId: q.requestId, token: q.token, status: 'pending' } },
+        result: [{ type: 'text', text: 'Question received; awaiting an explicit user response. Receipt does not answer or approve.' }], source }
+      run.queue.push({ kind: 'action', action })
+    } else {
+      run.queue.push({ kind: 'interim', text: `Codex request ${q.status} (${q.method}, RPC ${JSON.stringify(q.requestId)}):\n${JSON.stringify(q.error ?? q.result ?? q.params)}` })
+      const action = q.status === 'answered' ? answeredQuestion(q.params, q.result) : undefined
+      if (action && cfg.richRows) await handle($, run, { kind: 'action', action }, source)
+    }
+  }
   else if (ev.kind === 'turn') run.turnId = ev.id
   else if (ev.kind === 'steer') {
     const i = run.pendingSteers.findIndex(f => (f.uuid === undefined && String(f.count) === ev.id) || steerFileId(f) === ev.id)
@@ -2834,7 +2989,7 @@ async function* withCoordinatorMessages(
             const ownTools = agentTools.get(known.get(e.agentId!) ?? '')
             const tool = registered && (ownTools === undefined || ownTools.has(registered)) ? registered : undefined
             if (tool === undefined) {
-              const echo = `Coordinator message:\n\n${text}`
+              const echo = literalReceipt(text)
               answer += echo
               textInserted = true
               yield { kind: 'text', index: index++, text: echo }
@@ -2842,6 +2997,8 @@ async function* withCoordinatorMessages(
               const id = mintId(e)
               const input = { sourceUuid: message.uuid, text }
               coordinatorRows.set(id, { tool, text })
+              const rows = coordinator.rows ??= {}
+              rows[id] = { tool, text, sourceUuid: message.uuid }
               if (!holdAnswer(id, await sessionId($), e.agentId!, { tool, input, result: [{ type: 'text', text: 'Received; delivery status is reported separately' }] })) throw new Error('invalid coordinator display answer')
               yield { kind: 'tool', index, id, name: tool }
               yield { kind: 'input', index: index++, json: JSON.stringify(input) }
@@ -2897,7 +3054,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
       else blocks.push({ text: q.text, ...(q.dim ? { dim: true as const } : {}) })
     } else {
       const id = mintId(e)
-      if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && q.action.source?.item) {
+      if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && q.action.source?.item?.type === 'commandExecution') {
         const source = q.action.source
         const item = source.item!
         const durationUnknown = q.action.tool === 'Glob' && item.durationMs == null && (source.startedAtMs === undefined || source.completedAtMs === undefined)
@@ -2919,7 +3076,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
           if (change) q.action = { ...patchActions({ ...change, path: String(original.input.file_path) }, undefined, undefined,
             change.status ?? original.source!.item!.status, '', true, `${original.tool} unavailable in this agent's tools.`)[0]!, source: original.source, patchPath: original.patchPath }
         }
-        if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item) {
+        if (['Read', 'Glob', 'Grep'].includes(q.action.tool) && tools.has('Bash') && q.action.source?.item?.type === 'commandExecution') {
           const original = q.action
           const item = original.source!.item!
           blocks.push({ text: `${original.tool} unavailable in this agent's tools; showing the original Bash command.` })
@@ -2948,6 +3105,10 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         continue
       }
       if (q.action.tool === displayTools.codex_plan) planCards.set(id, JSON.parse(JSON.stringify(q.action.input)) as PlanInput)
+      if (q.action.tool === displayTools.codex_question && run.control) {
+        const data: any = q.action.source?.data
+        if (data?.status === 'pending') questionRows.set(id, { session: run.sessionId, agent: run.agentId, control: run.control, question: data, selected: {} })
+      }
       run.rows[id] = q.action.source ?? null
       blocks.push({ tool: q.action.tool, id, input: q.action.input })
     }

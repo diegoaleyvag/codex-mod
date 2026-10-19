@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import batch5Items from './fixtures/batch5-items.mjs'
+import batch6Items, { questionParams, ANSWER } from './fixtures/batch6-items.mjs'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const RUNNER = join(here, '..', 'scripts', 'codex-runner.mjs')
@@ -47,6 +48,80 @@ function start(scenario, { extra = [], prompt = 'do it', env = {}, control: cont
   return { child, control, exit, lines, sent, waitFor, cleanup, stderr: () => stderr }
 }
 const types = r => r.lines().map(l => l.type)
+
+test('batch 6 full images, generation, review, warnings and summaries cross the wire without private reasoning', async () => {
+  const r = start('batch6-images-modes')
+  try {
+    assert.equal((await r.exit).code, 0)
+    const lines = r.lines(), completed = lines.filter(l => l.type === 'item.completed')
+    assert.equal(completed.length, batch6Items.length)
+    for (const item of batch6Items) {
+      const publicItem = { ...item }
+      if (item.type === 'reasoning') delete publicItem.content
+      assert.deepEqual(completed.find(l => l.source.item.id === item.id).source.item, publicItem)
+    }
+    assert.ok(!JSON.stringify(lines).includes('PRIVATE_'))
+    assert.equal(lines.filter(l => l.type === 'codexmod.warning').length, 2)
+    assert.ok(!lines.some(l => ['turn.failed', 'error'].includes(l.type)))
+    assert.equal(r.sent().find(m => m.id === 202 && !m.method).error.code, -32601)
+    assert.deepEqual(r.sent().filter(m => m.method).map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
+  } finally { r.cleanup() }
+})
+
+const responseTo = (q, extra = {}) => ({ token: q.token, requestId: q.requestId, threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, ...extra })
+for (const cancel of [false, true]) test(`batch 6 explicit question ${cancel ? 'cancel' : 'answer'} is bound once; receipt and stale IDs supply no consent`, async () => {
+  const r = start('batch6-question', { extra: ['--questions', 'choices'] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    assert.equal(r.lines().filter(l => l.type === 'codexmod.request').length, 1)
+    assert.ok(!r.sent().some(m => m.id === 201 && !m.method))
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(responseTo(q, { requestId: 'stale', result: ANSWER })))
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.responseRejected'))
+    assert.ok(!r.sent().some(m => m.id === 201 && !m.method))
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(responseTo(q, { result: { answers: { mode: { answers: ['Invented'] } } } })))
+    await r.waitFor(() => r.lines().filter(l => l.type === 'codexmod.responseRejected').length === 2)
+    assert.ok(!r.sent().some(m => m.id === 201 && !m.method))
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(responseTo(q, cancel ? { cancel: true } : { result: ANSWER })))
+    assert.equal((await r.exit).code, 0)
+    const replies = r.sent().filter(m => m.id === 201 && !m.method)
+    assert.equal(replies.length, 1)
+    assert.deepEqual(cancel ? replies[0].error.code : replies[0].result, cancel ? -32800 : ANSWER)
+    assert.equal(r.lines().filter(l => l.status === (cancel ? 'cancelled' : 'answered')).length, 1)
+    assert.equal(r.sent().find(m => m.method === 'thread/start').params.approvalPolicy, 'never')
+  } finally { r.cleanup() }
+})
+
+test('batch 6 resolved and ended questions reject late responses and never reply twice', async () => {
+  for (const scenario of ['batch6-question-resolved', 'batch6-question-finish']) {
+    const r = start(scenario, { extra: ['--questions', 'choices'] })
+    try {
+      await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+      const q = r.lines().find(l => l.status === 'pending')
+      await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'cancelled'))
+      if (scenario.endsWith('resolved')) {
+        writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(responseTo(q, { result: ANSWER })))
+        await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.responseRejected'))
+        assert.ok(!r.sent().some(m => m.id === 201 && !m.method))
+        writeFileSync(join(r.control, 'interrupt'), '')
+      }
+      await r.exit
+      assert.ok(r.sent().filter(m => m.id === 201 && !m.method).length <= 1)
+      assert.ok(!r.lines().some(l => l.status === 'answered'))
+    } finally { r.cleanup() }
+  }
+})
+
+for (const scenario of ['batch6-question', 'batch6-question-unsupported', 'batch6-question-foreign']) test(`batch 6 ${scenario}: disabled, secret and stale-turn requests explicitly error`, async () => {
+  const r = start(scenario, { extra: scenario === 'batch6-question' ? [] : ['--questions', 'choices'] })
+  try {
+    assert.equal((await r.exit).code, 0)
+    const replies = r.sent().filter(m => m.id === 201 && !m.method)
+    assert.equal(replies.length, 1)
+    assert.equal(replies[0].error.code, -32601)
+    assert.ok(!r.lines().some(l => l.status === 'answered' || l.status === 'pending'))
+  } finally { r.cleanup() }
+})
 
 test('batch 5 transports full plans, child identities, states, messages and failures without child RPCs', async () => {
   const r = start('batch5-plans-children')
@@ -271,7 +346,7 @@ test('server approval request is answered -32601', async () => {
   assert.equal(code, 0)
   const reply = r.sent().find(m => m.id === 101 && m.method === undefined)
   assert.equal(reply.error.code, -32601)
-  assert.equal(reply.error.message, 'unsupported by codex-mod')
+  assert.match(reply.error.message, /unsupported by codex-mod/)
   r.cleanup()
 })
 
@@ -394,11 +469,11 @@ test('phase 3 translates each completed app-server item and plan notification, w
       assert.equal(collab[0].prompt, 'Inspect the tests.\nReport findings.')
       assert.ok(items.some(i => i.type === 'note' && i.text === 'Codex agent /root/reviewer finished'))
     })
-    await t.test('miscellaneous items produce one dim note each; imageView is deferred', () => {
+    await t.test('miscellaneous items preserve their complete Batch 6 contracts', () => {
       assert.deepEqual(items.filter(i => i.type === 'note' && i.dim).map(i => i.text), [
-        'Codex compacted context', 'Codex entered review mode', 'Codex exited review mode', 'Codex slept for 125 ms', 'Codex image generation: completed (/tmp/generated.png)',
+        'Codex compacted context',
       ])
-      assert.ok(!items.some(i => /image.?view/i.test(i.type)))
+      for (const type of ['image_view', 'image_generation', 'entered_review_mode', 'exited_review_mode', 'sleep']) assert.ok(items.some(i => i.type === type))
       assert.ok(!lines.some(l => l.type === 'codexmod.protocol'))
     })
   } finally { r.cleanup() }
@@ -444,7 +519,7 @@ test('batch 1 wire: all 19 public source variants, lifecycle replay and notifica
       assert.deepEqual(lines.find(l => l.source?.item?.id === 'future').source.item, { type: 'futureItem', id: 'future', payload: { exact: true } })
       assert.ok(!JSON.stringify(lines).includes('PRIVATE_RAW_REASONING'))
       assert.ok(!lines.some(l => l.type === 'turn.failed'))
-      assert.deepEqual(r.sent().find(m => m.id === 101 && !m.method).error, { code: -32601, message: 'unsupported by codex-mod' })
+      assert.equal(r.sent().find(m => m.id === 101 && !m.method).error.code, -32601)
     })
   } finally { r.cleanup() }
 })
