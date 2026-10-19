@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- R6: add per-role lean, selective capabilities and fallbackModels with user-level allowProjectNonLean/projectCapabilityAllowlist limits. Snapshot canonical overrides, role instructions and Codex home with an effective-config fingerprint for both transports; warn on model/effort continuity changes.
+- Add an explicit no-subagents instruction and spawn detection when multiAgent is off. Preserve real child rows/mirrors and document native v2 feature-gate limits, MCP discovery limits and unverified history-output caps.
+- Correct exec resumed accounting with persisted full-thread deltas, duplicate-total replacement, partial/unknown interruption baselines and full footer thread IDs. Keep final app-server direct/tree accounting consistent without counting response and cumulative copies twice.
+- Retry capacity failures once on the same thread with a catalog-validated capacityFallback candidate (default gpt-6-sol, then gpt-5.6-sol), preserving supported effort and counting the attempt within the launch guard. Add visible switch notes and an R6 headless harness.
+
 - Fix steering on CLI 2.1.302 when a long Codex step delays native inbox drain: route successful SendMessage calls from their persisted parent source UUID/tool ID and confirmed recipient pin, reconcile delayed receive/append copies without replay, and emit the receipt card at a settled acknowledgment boundary. Preserve append-only 1.1 steering and keep steer-v2 fake scenarios free of unrelated command/patch output.
 
 - Steer bridge v2: per-run private HTTP/Unix control with health/generation negotiation and file fallback, durable stable message IDs, exact-turn acceptance, raw RPC rejections and explicit uncertain outcomes without replay. Exec retains a durable after-turn FIFO with the same outcome records.

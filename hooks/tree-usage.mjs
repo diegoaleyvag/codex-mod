@@ -35,7 +35,7 @@ export class TreeUsage {
     this.turns.set(key, { thread, turn, root, baseline, usage: {
       input: Math.max(previous?.usage.input ?? 0, delta.input), cached: Math.max(previous?.usage.cached ?? 0, delta.cached),
       output: Math.max(previous?.usage.output ?? 0, delta.output),
-    }, partial: !u.last })
+    }, partial: previous?.partial || !u.last })
   }
 
   response(thread, turn, root, responseId, usage) {

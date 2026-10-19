@@ -13,6 +13,7 @@ import batch6Items, { PNG, questionParams, ANSWER } from './fixtures/batch6-item
 import batch6Images from './fixtures/batch6-images.mjs'
 import { imageFile, captureImage, generationAction, findingsAction, literalReceipt, IMAGE_MAX } from '../hooks/images-modes.ts'
 import batch7Models from './fixtures/batch7-models.mjs'
+import { resolvePolicy, canonicalOverrides, configHash, policyTask, capacityFallback } from '../hooks/run-policy.ts'
 import { RECORD_BUDGET } from '../hooks/store-state.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
 import { PARENT as N_PARENT, CHILD as N_CHILD, PARENT_TURN as N_PT, CHILD_TURN as N_CT, nestedCommand, nestedFile, nestedActivity } from './fixtures/nested-items.mjs'
@@ -145,6 +146,7 @@ type WorldOpts = {
   availableTools?: string[]
   toolListThrows?: boolean
   stdout?: string
+  runs?: { stdout: string; code?: number }[]
   stderr?: string
   code?: number
   task?: string
@@ -284,6 +286,7 @@ function world(on: On, opts: WorldOpts = {}) {
   on('process.spawn', async function* (_$, e, next) {
     if (opts.reject) throw new Error('spawn ENOENT')
     spawned.push({ argv: e.argv, input: e.input, cwd: e.cwd, env: e.env })
+    const fixture = opts.runs?.[spawned.length - 1]
     try {
       if (opts.pieces) {
         for (const p of opts.pieces) {
@@ -302,14 +305,14 @@ function world(on: On, opts: WorldOpts = {}) {
           yield p
         }
       } else {
-        const out = opts.stdout ?? CODEX_JSONL
+        const out = fixture?.stdout ?? opts.stdout ?? CODEX_JSONL
         // split mid-line to prove the hook reassembles lines
         const cut = Math.floor(out.length / 2)
         if (out.slice(0, cut)) yield { stream: 'stdout' as const, text: out.slice(0, cut) }
         if (out.slice(cut)) yield { stream: 'stdout' as const, text: out.slice(cut) }
         if (opts.stderr) yield { stream: 'stderr' as const, text: opts.stderr }
       }
-      return { value: { code: opts.code ?? 0, signal: null } }
+      return { value: { code: fixture?.code ?? opts.code ?? 0, signal: null } }
     } finally {
       if (next.signal.aborted) kills.count++
     }
@@ -493,6 +496,8 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   expect(w.spawned.length).toBe(1)
   expect(w.modelCalls).toEqual([])
   expect(w.core).toEqual([])
+  expect(w.spawned[0].input).toContain('Do not spawn sub-agents.')
+  expect(w.logs.some(l => l.includes('multiAgent=false: Codex child spawn observed'))).toBe(true)
   const identity: any = w.store.get(`mirror:sess-1:${N_CHILD}`)
   expect(identity.host).toBe(host)
   expect(identity.parentHost).toBe('agent-progress')
@@ -825,7 +830,7 @@ test('a failed codex run still answers without the model: "codex failed:" first,
   const m = handback(result)
   expect(firstLine(m)).toBe('codex failed: exit 1: not logged in')
   expect(m).toContain('stderr tail line')
-  expect(lastLine(m)).toBe('codex · gpt-6.1-sol · medium · workspace-write · 0 actions · thread t-1')
+  expect(lastLine(m)).toBe('codex · gpt-6.1-sol · medium · workspace-write · 0 actions · direct usage partial/unknown · thread t-1')
   expect(result.stopReason).toBe('tool_use')
 })
 
@@ -839,7 +844,7 @@ test('a leading codex-model line picks the model and is stripped', async ($, on)
   const w = world(on, { task: 'codex-model: gpt-mini-test\nSay hi' })
   await step($, 'agent-codex')
   expect(w.spawned[0]!.argv).toContain('gpt-mini-test')
-  expect(w.spawned[0]!.input).toBe('Say hi')
+  expect(w.spawned[0]!.input).toBe('Do not spawn sub-agents.\n\n' + 'Say hi')
 })
 
 test('project roles: each agent maps to its declared profile and instructions', async ($, on) => {
@@ -855,7 +860,7 @@ test('project roles: each agent maps to its declared profile and instructions', 
     expect(argOf(argv, '-m')).toBe(model)
     expect(argv).toContain(`model_reasoning_effort="${effort}"`)
     const instructions = name === 'implementer' ? 'Keep the change bounded.\n\n' : name === 'auditor' ? 'Never edit files.\n\n' : ''
-    expect(w.spawned.at(-1)!.input).toBe(`${instructions}Reply with the single word PONG`)
+    expect(w.spawned.at(-1)!.input).toBe(`${instructions}Do not spawn sub-agents.\n\nReply with the single word PONG`)
     expect(handback(result)).not.toContain('Keep the change bounded.')
     expect(handback(result)).not.toContain('Never edit files.')
     expect(lastLine(handback(result)).startsWith(`${name} · ${model} · ${effort} · ${sandbox} · 0 actions`)).toBe(true)
@@ -867,7 +872,7 @@ test('codex-effort and codex-model lines override the defaults', async ($, on) =
   const { result } = await step($, 'agent-normal')
   expect(w.spawned[0]!.argv).toContain('model_reasoning_effort="low"')
   expect(w.spawned[0]!.argv).toContain('gpt-mini-test')
-  expect(w.spawned[0]!.input).toBe('Hi')
+  expect(w.spawned[0]!.input).toBe('Do not spawn sub-agents.\n\n' + 'Hi')
   expect(lastLine(handback(result))).toContain('codex · gpt-mini-test · low')
 })
 
@@ -924,7 +929,7 @@ test('follow-up message resumes the thread; the tool-result step ends the turn',
   expect(argv).toContain('sandbox_mode="workspace-write"')
   expect(argv.at(-1)).toBe('-')
   expect(argv.at(-2)).toBe('t-1')
-  expect(w.spawned[1]!.input).toBe('second task')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'second task')
   expect(lastLine(handback(result))).toContain('thread t-1')
 })
 
@@ -953,7 +958,7 @@ test('(b) a follow-up with a new codex-effort line uses it and persists it', asy
   const second = await step($, 'agent-new-effort', 0, 'turn-2')
   expect(w.spawned[1]!.argv).toContain('model_reasoning_effort="low"')
   expect(argOf(w.spawned[1]!.argv, '-m')).toBe('gpt-pinned')
-  expect(w.spawned[1]!.input).toBe('second')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'second')
   expect(lastLine(handback(second.result))).toContain('gpt-pinned · low')
   expect(w.store.get('agent:sess-1:agent-new-effort')).toMatchObject({ model: 'gpt-pinned', effort: 'low', thread: 't-1' })
   conv = [...conv, ...toolResult('SubagentHandback'), user('third')]
@@ -1064,7 +1069,7 @@ test('a command is a Bash call, interim message as text before it, answered with
   expect(w.core).toEqual([])
   expect(w.checks).toEqual([])
   const s2 = await step($, 'agent-progress', 1)
-  expect(handback(s2.result)).toBe('Two files.\n\ncodex · gpt-6.1-sol · medium · workspace-write · 1 action · 277 new tokens (21K cached, 46 out) · thread 01a14f50')
+  expect(handback(s2.result)).toBe('Two files.\n\ncodex · gpt-6.1-sol · medium · workspace-write · 1 action · 277 new tokens (21K cached, 46 out) · thread 01a14f50-c51c-7370')
   expect(s2.result.usage).toBe(null)
   expect(w.spawned.length).toBe(1)
   expect(w.modelCalls).toEqual([])
@@ -1156,7 +1161,7 @@ test('a follow-up folded into the turn mid-run runs (resumed) after the handback
   expect(w.spawned.length).toBe(2)
   expect(w.spawned[1]!.argv.slice(1, 3)).toEqual(['exec', 'resume'])
   expect(w.spawned[1]!.argv).toContain('t-12')
-  expect(w.spawned[1]!.input).toBe('also run the linter')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'also run the linter')
   expect(s3.result.toolUses[0]!.name).toBe('Bash')
 })
 
@@ -1334,7 +1339,7 @@ test('lean (default): -c overrides for features, web search, skills and each MCP
   expect(overrides).toContain('web_search="disabled"')
   expect(overrides).toContain('skills.include_instructions=false')
   expect(overrides.filter(o => o.startsWith('mcp_servers.'))).toEqual([
-    'mcp_servers.node_repl.enabled=false', 'mcp_servers.computer-use.enabled=false', 'mcp_servers.quoted_ok.enabled=false',
+    'mcp_servers.computer-use.enabled=false', 'mcp_servers.node_repl.enabled=false', 'mcp_servers.quoted_ok.enabled=false',
   ])
   expect(argv.at(-1)).toBe('-')
 })
@@ -1368,7 +1373,7 @@ test('helpers: shell unwrapping, descriptions, footer numbers, MCP names, diffs'
   expect(describeCommand('frobnicate')).toBe('Run frobnicate')
   expect([compact(950), compact(37412), compact(154000), compact(1250000), compact(2000)]).toEqual(['950', '37.4K', '154K', '1.3M', '2K'])
   expect(footer({ agent: 'codex', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', actions: 3, usage: { input: 192000, cached: 154000, output: 631 }, thread: '01a14f50-c51c' }))
-    .toBe('codex · gpt-6-luna · low · workspace-write · 3 actions · 38K new tokens (154K cached, 631 out) · thread 01a14f50')
+    .toBe('codex · gpt-6-luna · low · workspace-write · 3 actions · 38K new tokens (154K cached, 631 out) · thread 01a14f50-c51c')
   expect(mcpServerNames(CONFIG_TOML)).toEqual(['node_repl', 'computer-use', 'quoted_ok'])
 })
 
@@ -1596,7 +1601,7 @@ test('text route: a follow-up folded in mid-run runs in the same step after the 
   const s2 = await step($, 'agent-text-follow', 1)
   // the second run starts at once; its first action carries the first answer before it
   expect(w.spawned.length).toBe(2)
-  expect(w.spawned[1]!.input).toBe('also lint')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'also lint')
   expect(w.spawned[1]!.argv).toContain('t-31')
   expect(s2.chunks[0].kind).toBe('text')
   // the note about the queued message precedes the first answer, never replaces it
@@ -1659,7 +1664,7 @@ const WRAPPED = 'The coordinator sent a message while you were working:\nNext ra
 test('the coordinator framing is stripped: Codex gets the message body only', async ($, on) => {
   const w = world(on, { messages: () => [user(WRAPPED)] })
   await step($, 'agent-wrapped')
-  expect(w.spawned[0]!.input).toBe('Next range: 10 to 15, print each number and its square, run it, and show me the output and the final file.')
+  expect(w.spawned[0]!.input).toBe('Do not spawn sub-agents.\n\n' + 'Next range: 10 to 15, print each number and its square, run it, and show me the output and the final file.')
   expect(stripCoordinator('plain task')).toBe('plain task')
   expect(stripCoordinator('The coordinator sent a message while you were working:\nbody only')).toBe('body only')
 })
@@ -1719,7 +1724,7 @@ test('exec: a delivery in the API form (beside the tool results) is a follow-up;
   await step($, 'agent-api-deliver', 3)
   expect(w.spawned.length).toBe(2)
   expect(w.spawned[1]!.argv.slice(1, 3)).toEqual(['exec', 'resume'])
-  expect(w.spawned[1]!.input).toBe('also lint')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'also lint')
 })
 
 // The row the engine appends for that delivery, as `session.append` carries it (the kit puts the pinned fields back).
@@ -1749,7 +1754,7 @@ test('exec: a coordinator delivery appended as an attachment (not in the API for
   const s4 = await step($, 'agent-exec-deliver', 3)
   expect(w.spawned.length).toBe(2)
   expect(w.spawned[1]!.argv.slice(1, 3)).toEqual(['exec', 'resume'])
-  expect(w.spawned[1]!.input).toBe('also lint')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'also lint')
   expect(s4.result.toolUses[0]!.name).toBe('Bash')
   // the transcript's task stays the record's: after this run the first message is not new again
   expect(savedState(w, 'agent:sess-1:agent-exec-deliver')).toMatchObject({ lastTask: 'first', userCount: 1, launchKey: '1:row-1:also lint' })
@@ -2337,14 +2342,14 @@ test('project roles: follow-ups prepend instructions once; file and cwd edits do
   let conv: any[] = [user('codex-effort: high\nfirst')]
   const w = await startProject($, on, { messages: () => conv })
   await step($, 'agent-project')
-  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nfirst')
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nDo not spawn sub-agents.\n\nfirst')
   w.files.set('.claude/codex-mod.json', '{"roles":{}}')
   w.location.cwd = '/tmp/elsewhere'
   conv = [...conv, ...toolResult('SubagentHandback'), user('second')]
   const second = await step($, 'agent-project', 0, 'turn-2')
   expect(w.spawned[1]!.argv).toContain('resume')
   expect(w.spawned[1]!.argv).toContain('model_reasoning_effort="high"')
-  expect(w.spawned[1]!.input).toBe('Keep the change bounded.\n\nsecond')
+  expect(w.spawned[1]!.input).toBe('Keep the change bounded.\n\nDo not spawn sub-agents.\n\nsecond')
   expect(w.spawned[1]!.cwd).toBe('/tmp/elsewhere')
   expect(w.reads.filter(p => p === '.claude/codex-mod.json').length).toBe(1)
   expect(handback(second.result)).not.toContain('Keep the change bounded.')
@@ -2360,7 +2365,7 @@ test('project roles: a removed role resumes from its persisted profile', async (
   expect(w.spawned[0]!.argv).toContain('resume')
   expect(w.spawned[0]!.argv).toContain('sandbox_mode="read-only"')
   expect(argOf(w.spawned[0]!.argv, '-m')).toBe('gpt-pinned')
-  expect(w.spawned[0]!.input).toBe('follow-up')
+  expect(w.spawned[0]!.input).toBe('Do not spawn sub-agents.\n\n' + 'follow-up')
 })
 
 test('model catalog: listed models by priority with their efforts; profile checks', async () => {
@@ -2436,7 +2441,7 @@ test('globalRules off: Codex runs with a plugin-owned CODEX_HOME linking only au
 test('globalRules on (default): no CODEX_HOME, nothing prepared', async ($, on) => {
   const w = world(on)
   await step($, 'agent-wrapped-mid')
-  expect(w.spawned[0]!.env).toBe(undefined)
+  expect(w.spawned[0]!.env).toEqual({ CODEX_HOME: '/home/t/.codex' })
 })
 
 test('launch argv (pure): new and resumed runs, extra -c last before the prompt', async () => {
@@ -2487,7 +2492,7 @@ test('live sequence: 1 Codex launch for the task, 1 for the coordinator follow-u
   const w = world(on, opts)
   const s1 = await step($, 'agent-live', 0)
   expect(w.spawned.length).toBe(1)
-  expect(w.spawned[0]!.input).toBe(LIVE_TASK.split('\n').slice(2).join('\n'))
+  expect(w.spawned[0]!.input).toBe('Do not spawn sub-agents.\n\n' + LIVE_TASK.split('\n').slice(2).join('\n'))
   const answer1 = handback(s1.result)
   expect(answer1.startsWith(first)).toBe(true)
   // the transcript as the live run had it: the answer as text, then the engine's two nudges, four times
@@ -2503,7 +2508,7 @@ test('live sequence: 1 Codex launch for the task, 1 for the coordinator follow-u
   conv = [...conv, said(answer1), meta(LIVE_COORDINATOR)]
   const s2 = await step($, 'agent-live', 0, 'turn-2')
   expect(w.spawned.length).toBe(2)
-  expect(w.spawned[1]!.input).toBe('Range 20 to 23 with squares; run it and show the output.')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'Range 20 to 23 with squares; run it and show the output.')
   expect(w.spawned[1]!.argv).toContain('01a14f89')
   const answer2 = handback(s2.result)
   expect(answer2.startsWith(second)).toBe(true)
@@ -2844,11 +2849,11 @@ test('app-server: session start checks node, the runner and codex app-server; a 
   const configs = argv.filter((_, i) => argv[i - 1] === '--config')
   expect(configs).toContain('features.plugins=false')
   expect(configs).toContain('mcp_servers.node_repl.enabled=false')
-  expect(configs.at(-1)).toBe('tools.view_image=false')
+  expect(configs).toContain('tools.view_image=false')
   expect(configs.some(c => c.startsWith('model_reasoning_effort'))).toBe(false)
   expect(argv.at(-2)).toBe('--control')
   expect(argv.at(-1)).toMatch(CONTROL)
-  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nReply with the single word PONG')
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nDo not spawn sub-agents.\n\nReply with the single word PONG')
   // the stale-dir guard removed the control dir before the launch
   expect(w.runs.some(r => r[0] === 'rm' && r[1] === '-rf' && r[2] === argv.at(-1))).toBe(true)
   expect(handback(result)).toBe('PONG\n\nimplementer · gpt-6.1-sol · medium · workspace-write · app-server · 0 actions · 277 new tokens (21K cached, 46 out) · thread t-60')
@@ -2891,7 +2896,7 @@ test('app-server steer: a message arriving mid-run is written as a steer file; a
   const s2 = await step($, 'agent-app-steer', 1)
   const control = w.spawned[0]!.argv.at(-1)!
   expect(w.writes.map(x => x.path)).toEqual([`${control}/steer-000002.json`])
-  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'also add tests', expectedTurnId: 'tu-1' })
+  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'Do not spawn sub-agents.\n\nalso add tests', expectedTurnId: 'tu-1' })
   // the control dir was created private before any steer file went into it
   expect(w.runs.some(r => r[0] === 'mkdir' && r.slice(1, 4).join(' ') === '-p -m 700' && r.includes('/home/t/.cache/codex-mod/runs') && r.at(-1) === control)).toBe(true)
   // the status note precedes Codex's answer without repeating the message
@@ -2925,7 +2930,7 @@ test('app-server steer: a rejected steer runs after the handback, resuming the t
   expect(w.spawned.length).toBe(2)
   const argv = w.spawned[1]!.argv
   expect(argOf(argv, '--thread')).toBe('t-63')
-  expect(w.spawned[1]!.input).toBe('also lint')
+  expect(w.spawned[1]!.input).toBe('Do not spawn sub-agents.\n\n' + 'also lint')
   // each run gets its own control dir
   expect(argv.at(-1)).not.toBe(w.spawned[0]!.argv.at(-1))
   expect(argv.at(-1)!.endsWith('-2')).toBe(true)
@@ -2961,8 +2966,8 @@ test('app-server mid-step: while a step waits on the runner, a new message is st
   conv = [...conv, user('change of plan')]
   const { result } = await pending
   expect(w.timers.filter(ms => ms === 2000).length >= 1).toBe(true)
-  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nlong task')
-  expect(w.writes.map(x => JSON.parse(x.text))).toMatchObject([{ text: 'Keep the change bounded.\n\nchange of plan' }])
+  expect(w.spawned[0]!.input).toBe('Keep the change bounded.\n\nDo not spawn sub-agents.\n\nlong task')
+  expect(w.writes.map(x => JSON.parse(x.text))).toMatchObject([{ text: 'Keep the change bounded.\n\nDo not spawn sub-agents.\n\nchange of plan' }])
   // the pull that was pending when the checks ran was read on, nothing lost; the
   // accepted steer is announced before Codex's answer
   expect(handback(result).startsWith(`${steerNote('accepted')}\n\ndone, steered`)).toBe(true)
@@ -3002,7 +3007,7 @@ test('app-server: a coordinator delivery appended as an attachment mid-step is s
   const { result } = await pending
   const control = w.spawned[0]!.argv.at(-1)!
   expect(w.writes.map(x => x.path)).toEqual([`${control}/steer-000001-row-7.json`])
-  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'change of plan', messageId: 'row-7' })
+  expect(JSON.parse(w.writes[0].text)).toMatchObject({ text: 'Do not spawn sub-agents.\n\nchange of plan', messageId: 'row-7' })
   expect(handback(result).split('\n\n').slice(0, 2)).toEqual([steerNote('accepted'), 'steered, done'])
   expect(lastLine(handback(result))).toContain('app-server · 1 steer · 0 actions')
   expect(w.store.get('agent:sess-1:agent-app-deliver')).toMatchObject({ lastTask: 'long task', userCount: 1, launchKey: '1:codex-effort: high\nchange of plan' })
@@ -5444,7 +5449,7 @@ test('steer v2: HTTP control acceptance reaches SendMessage context and never pu
   expect(result.context[0]).toBe('original')
   expect(result.context[1]).toContain('Accepted into turn turn-X')
   expect(posts.length).toBe(1)
-  expect(posts[0]).toMatchObject({ messageId: 'sess-1:send-http', expectedTurnId: 'turn-X', text: 'Keep every literal line.' })
+  expect(posts[0]).toMatchObject({ messageId: 'sess-1:send-http', expectedTurnId: 'turn-X', text: 'Do not spawn sub-agents.\n\nKeep every literal line.' })
   expect(w.writes).toEqual([])
   const rec = savedState(w, 'agent:sess-1:agent-coordinator')
   expect(rec.coordinator.outcomes['sess-1:send-http']).toMatchObject({ sourceUuid: 'http-source', status: 'accepted' })
@@ -5503,7 +5508,7 @@ test('steer v2 live order: two identical named sends precede receive/append whil
   expect(replies.map(r => r.context[0])).toEqual(['existing', 'existing'])
   expect(replies.every(r => r.context[1].includes('Accepted into turn turn-X'))).toBe(true)
   expect(posts.map(p => p.messageId)).toEqual(ids.map(id => `sess-1:${id}`))
-  expect(posts.every(p => p.text === 'Keep waiting; include MARKER in your answer.')).toBe(true)
+  expect(posts.every(p => p.text === 'Do not spawn sub-agents.\n\nKeep waiting; include MARKER in your answer.')).toBe(true)
   const displayed = await held
   const cards = coordinatorCalls(displayed.chunks)
   expect(cards.map(c => c.input)).toEqual(ids.map(() => ({ sourceUuid: 'parent-source', text: body })))
@@ -5554,3 +5559,178 @@ for (const pin of [undefined, 'agent-gp']) test(`steer v2: native failure or mis
   expect(w.writes).toEqual([])
   expect(w.spawned.length).toBe(1)
 })
+
+// R6 policies and accounting. These fixtures do not call a model or provider.
+const cacheThread = '01a14f50-c51c-7370-9bca-f123456789ab'
+const cacheJsonl = (events: any[]) => events.map(e => JSON.stringify(e)).join('\n') + '\n'
+const cacheUsageEvent = (u: any) => ({ type: 'turn.completed', usage: { input_tokens: u.input, cached_input_tokens: u.cached, output_tokens: u.output } })
+const cacheFirst = { input: 53880, cached: 42112, output: 284 }
+const cacheTotal = { input: 98934, cached: 86016, output: 651 }
+const cacheRole = { model: 'gpt-6.1-sol', effort: 'medium', description: 'Cache fixture' }
+const cacheCatalog = JSON.stringify({ models: [...batch7Models.models,
+  { slug: 'gpt-6-sol', visibility: 'list', supported_reasoning_levels: ['medium', 'xhigh'], default_reasoning_level: 'medium' },
+  { slug: 'gpt-5.6-sol', visibility: 'list', supported_reasoning_levels: ['low'], default_reasoning_level: 'low' },
+] })
+const cacheFiles = (role?: any) => new Map([
+  ['/home/t/.codex/models_cache.json', cacheCatalog],
+  ['.claude/codex-mod.json', JSON.stringify({ roles: { implementer: { ...cacheRole, ...role } } })],
+  ['/home/t/.codex/config.toml', '[mcp_servers.rea]\ncommand="rea"\n[mcp_servers.other]\ncommand="other"'],
+])
+
+for (const value of [{ lean: 1 }, { capabilities: [] }, { capabilities: { webSearch: true } },
+  { capabilities: { multiAgent: 'false' } }, { capabilities: { unknown: true } },
+  { capabilities: { mcpServers: ['rea', 'rea'] } }, { capabilities: { mcpServers: ['rea.enabled=true'] } },
+  { fallbackModels: ['gpt-6-sol', 'gpt-6-sol'] }, { fallbackModels: 'gpt-6-sol' }]) {
+  test(`R6 schema rejects ${JSON.stringify(value)}`, () => {
+    const parsed = parseProjectRoles(JSON.stringify({ roles: { implementer: { ...cacheRole, ...value } } }))
+    expect(Object.keys(parsed.roles)).toEqual([])
+    expect(parsed.warnings[0]).toContain('schema')
+  })
+}
+
+test('R6 schema retains strict optional capabilities, lean and fallbackModels; user options validate', () => {
+  const capabilities = { webSearch: 'live', mcpServers: ['rea'], multiAgent: false, skillsInstructions: false, apps: false, plugins: false, images: true }
+  const role = { ...cacheRole, lean: true, capabilities, fallbackModels: [] }
+  expect(parseProjectRoles(JSON.stringify({ roles: { implementer: role } })).roles.implementer).toMatchObject(role)
+  expect(parseConfig({})).toMatchObject({ allowProjectNonLean: false, projectCapabilityAllowlist: [], capacityFallback: ['gpt-6-sol', 'gpt-5.6-sol'] })
+  expect(parseConfig({ projectCapabilityAllowlist: ['*', 'mcp:rea'], capacityFallback: ['bad name'] })).toMatchObject({
+    projectCapabilityAllowlist: ['mcp:rea'], capacityFallback: ['gpt-6-sol', 'gpt-5.6-sol'],
+  })
+})
+
+test('R6 policy authority, canonical precedence and fingerprints', () => {
+  const lean = ['features.multi_agent=false', 'features.apps=false', 'web_search="disabled"']
+  const user = parseConfig({})
+  const denied = resolvePolicy(user, { lean: false, capabilities: { webSearch: 'live', multiAgent: true } }, lean, [], '/real')
+  expect(denied.policy).toMatchObject({ leanRequested: false, lean: true, multiAgent: false })
+  expect(denied.warnings.length).toBe(3)
+  const allowed = resolvePolicy(parseConfig({ projectCapabilityAllowlist: ['webSearch:live', 'mcp:rea', 'multiAgent'] }),
+    { capabilities: { webSearch: 'live', mcpServers: ['rea'], multiAgent: true } }, lean, ['rea', 'other'], '/real')
+  expect(allowed.policy.overrides).toContain('mcp_servers.rea.enabled=true')
+  expect(allowed.policy.overrides).toContain('mcp_servers.other.enabled=false')
+  expect(allowed.policy.multiAgent).toBe(true)
+  const explicit = resolvePolicy(parseConfig({ allowProjectNonLean: true, extraConfig: ['features.multi_agent=false', 'web_search="disabled"'] }),
+    { lean: false, capabilities: { webSearch: 'live', multiAgent: true } }, lean, [], '/real')
+  expect(explicit.policy.multiAgent).toBe(false)
+  expect(explicit.policy.overrides).toContain('web_search="disabled"')
+  expect(resolvePolicy(parseConfig({ lean: false }), { lean: true }, lean, [], '/real').policy.lean).toBe(true)
+  expect(resolvePolicy(parseConfig({ lean: false }), { capabilities: { apps: true } }, lean, [], '/real').policy.overrides).not.toContain('features.apps=true')
+  expect(resolvePolicy(parseConfig({ allowProjectNonLean: true }), { lean: false }, lean, [], '/real').policy.lean).toBe(false)
+  expect(canonicalOverrides(['z=1', 'a=false', 'z=2'])).toEqual(['a=false', 'z=2'])
+  const again = resolvePolicy(user, undefined, [...lean].reverse(), [], '/real').policy
+  const original = resolvePolicy(user, undefined, lean, [], '/real').policy
+  expect(again.fingerprint).toBe(original.fingerprint)
+  expect(resolvePolicy(user, { instructions: 'Different' }, lean, [], '/real').policy.fingerprint).not.toBe(original.fingerprint)
+  expect(resolvePolicy(user, undefined, lean, [], '/shadow').policy.fingerprint).not.toBe(original.fingerprint)
+  expect(policyTask(original, 'task')).toBe('Do not spawn sub-agents.\n\ntask')
+  expect(policyTask({ ...original, multiAgent: true }, 'task')).toBe('task')
+})
+
+for (const transport of ['exec', 'app-server'] as const) test(`R6 ${transport} resolves a selective role once and keeps the snapshot on follow-up`,
+  { options: { transport, projectCapabilityAllowlist: ['multiAgent', 'webSearch:live', 'mcp:rea'] } }, async ($, on) => {
+    let conv: any[] = [user('first')]
+    const opts = { files: cacheFiles({ capabilities: { multiAgent: true, webSearch: 'live', mcpServers: ['rea'] } }), messages: () => conv }
+    const w = transport === 'exec' ? await startProject($, on, opts) : appWorld(on, opts)
+    if (transport === 'app-server') await startSession($)
+    await step($, 'agent-project')
+    const first = savedState(w, 'agent:sess-1:agent-project')
+    const flag = transport === 'exec' ? '-c' : '--config'
+    expect(w.spawned[0].argv.filter((_, i, a) => a[i - 1] === flag)).toContain('features.multi_agent=true')
+    expect(w.spawned[0].argv).toContain('web_search="live"')
+    expect(w.spawned[0].input).toBe('first')
+    expect(first.effectiveConfig.multiAgent).toBe(true)
+    expect(first.effectiveFingerprint).toBe(configHash({ policy: first.effectiveConfig.fingerprint, model: first.model, effort: first.effort, sandbox: first.sandbox }))
+    w.files.set('/home/t/.codex/config.toml', '[mcp_servers.changed]\ncommand="changed"')
+    w.files.set('.claude/codex-mod.json', '{"roles":{}}')
+    conv = [...conv, ...toolResult('SubagentHandback'), user('codex-effort: xhigh\nsecond')]
+    const second = await step($, 'agent-project', 0, 'cache-follow')
+    expect(savedState(w, 'agent:sess-1:agent-project').effectiveConfig).toEqual(first.effectiveConfig)
+    expect(w.spawned[1].input).toBe('second')
+    expect(w.spawned[1].argv).toContain('mcp_servers.rea.enabled=true')
+    expect(w.spawned[1].argv).not.toContain('mcp_servers.changed.enabled=false')
+    expect(handback(second.result)).toContain('cold start possible')
+  })
+
+test('R6 exec follow-up subtracts a persisted cumulative baseline; duplicate totals replace rather than add', async ($, on) => {
+  let conv: any[] = [user('first')]
+  const stream = (u: any) => cacheJsonl([{ type: 'thread.started', thread_id: cacheThread }, { type: 'item.completed', item: { type: 'agent_message', text: 'done' } }, cacheUsageEvent({ input: u.input - 10, cached: u.cached - 10, output: u.output - 1 }), cacheUsageEvent(u), cacheUsageEvent(u)])
+  const w = world(on, { messages: () => conv, runs: [{ stdout: stream(cacheFirst) }, { stdout: stream(cacheTotal) }] })
+  await step($, 'agent-codex')
+  conv = [...conv, ...toolResult('SubagentHandback'), user('second')]
+  const second = await step($, 'agent-codex', 0, 'cache-second')
+  expect(handback(second.result)).toContain('1.1K new tokens (43.9K cached, 367 out)')
+  expect(handback(second.result)).toContain(`thread ${cacheThread}`)
+  expect(savedState(w, 'agent:sess-1:agent-codex').threadUsage).toEqual({ thread: cacheThread, total: cacheTotal, valid: true })
+  expect(w.spawned[1].argv).toContain(cacheThread)
+})
+
+test('R6 unknown exec baseline is labeled instead of charging cumulative history to a new run', async ($, on) => {
+  const store = new Map<string, unknown>([['agent:sess-1:agent-codex', { ...PERSISTED, agentName: 'codex', thread: cacheThread }]])
+  const w = world(on, { store, task: 'new', stdout: cacheJsonl([{ type: 'thread.started', thread_id: cacheThread },
+    { type: 'item.completed', item: { type: 'agent_message', text: 'done' } }, cacheUsageEvent(cacheTotal)]) })
+  const result = await step($, 'agent-codex')
+  expect(handback(result.result)).toContain('direct usage partial/unknown')
+  expect(handback(result.result)).not.toContain('86K cached')
+  expect(savedState(w, 'agent:sess-1:agent-codex').threadUsage.valid).toBe(true)
+})
+
+const capacityError = cacheJsonl([{ type: 'thread.started', thread_id: cacheThread },
+  { type: 'turn.failed', error: { message: 'Selected model is at capacity. Please try a different model.' } }])
+for (const transport of ['exec', 'app-server'] as const) test(`R6 ${transport} capacity fallback resumes once, notes the switch and counts both launches`,
+  { options: { transport } }, async ($, on) => {
+    const opts = { files: cacheFiles(), runs: [{ stdout: capacityError, code: 1 }, { stdout: cacheJsonl([
+      { type: 'thread.started', thread_id: cacheThread }, { type: 'item.completed', item: { type: 'agent_message', text: 'recovered' } }, cacheUsageEvent(cacheFirst),
+    ]) }] }
+    const w = transport === 'exec' ? await startProject($, on, opts) : appWorld(on, opts)
+    if (transport === 'app-server') await startSession($)
+    const result = await step($, 'agent-project')
+    expect(w.spawned.length).toBe(2)
+    expect(w.spawned[1].argv).toContain(cacheThread)
+    expect(w.spawned[1].argv).toContain('gpt-6-sol')
+    expect(w.spawned[1].argv).toContain(transport === 'exec' ? 'model_reasoning_effort="medium"' : 'medium')
+    expect(handback(result.result)).toContain('gpt-6.1-sol at capacity; continued on gpt-6-sol')
+    expect(handback(result.result)).toContain('recovered')
+    const rec = savedState(w, 'agent:sess-1:agent-project')
+    expect(rec.launches.length).toBe(2)
+    expect(rec.launchesSinceNew).toBe(2)
+    expect(rec.capacityRetryKey).toBe(rec.launchKey)
+    expect(rec.effectiveConfig).toMatchObject({ multiAgent: false })
+    expect(w.core).toEqual([])
+  })
+
+for (const mode of ['twice', 'guard', 'invalid', 'role', 'empty'] as const) test(`R6 capacity fallback ${mode}: bounded retry and validated per-role choices`,
+  { options: { maxRunsPerWindow: mode === 'guard' ? 1 : 3, capacityFallback: mode === 'invalid' ? ['gpt-hidden', 'missing'] : ['gpt-6-sol', 'gpt-5.6-sol'] } }, async ($, on) => {
+    const role = mode === 'role' ? { fallbackModels: ['missing', 'gpt-5.6-sol'] } : mode === 'empty' ? { fallbackModels: [] } : {}
+    const w = await startProject($, on, { files: cacheFiles(role), runs: [{ stdout: capacityError, code: 1 }, { stdout: capacityError, code: 1 }] })
+    const result = await step($, 'agent-project')
+    expect(w.spawned.length).toBe(['twice', 'role'].includes(mode) ? 2 : 1)
+    if (mode === 'role') {
+      expect(w.spawned[1].argv).toContain('gpt-5.6-sol')
+      expect(w.spawned[1].argv).toContain('model_reasoning_effort="low"')
+    }
+    if (mode === 'guard') expect(handback(result.result)).toContain('launch guard tripped')
+    if (mode === 'invalid') expect(handback(result.result)).toContain('no different model validated')
+  })
+
+test('R6 capacity selection requires a visible catalog, skips self and keeps effort when supported', () => {
+  const current = { model: 'gpt-6.1-sol', effort: 'xhigh', sandbox: 'read-only' }
+  expect(capacityFallback(undefined, ['gpt-6-sol'], current)).toBe(undefined)
+  expect(capacityFallback(parseModelsCache(cacheCatalog), ['missing', current.model, 'gpt-6-sol'], current)).toEqual({ ...current, model: 'gpt-6-sol' })
+  expect(footer({ ...current, agent: 'a', actions: 0, thread: cacheThread })).toContain(cacheThread)
+  expect(footer({ ...current, agent: 'a', actions: 0, thread: cacheThread.replace('89ab', '90cd') })).not.toBe(footer({ ...current, agent: 'a', actions: 0, thread: cacheThread }))
+})
+
+test('R6 exec multiAgent off detects a spawn and preserves its honest source report with unknown child usage',
+  { options: { nativeActions: false, richRows: true } }, async ($, on) => {
+    const w = world(on, { stdout: cacheJsonl([{ type: 'thread.started', thread_id: cacheThread },
+      { type: 'item.completed', item: { type: 'collab_tool_call', id: 'spawn-r6', tool: 'spawn_agent', status: 'completed',
+        receiver_thread_ids: ['child-r6'], prompt: 'bounded fixture', agents_states: { 'child-r6': { status: 'completed' } } } },
+      { type: 'item.completed', item: { type: 'agent_message', text: 'parent done' } }, cacheUsageEvent(cacheFirst)]) })
+    const result = await step($, 'agent-codex')
+    expect(w.spawned[0].input).toContain('Do not spawn sub-agents.')
+    expect(w.logs.filter(l => l.includes('multiAgent=false: Codex child spawn observed')).length).toBe(1)
+    expect(handback(result.result)).toContain('multiAgent=false: Codex child spawn observed')
+    expect(handback(result.result)).toContain('1 missing')
+    expect(handback(result.result)).toContain('parent done')
+    expect(w.core).toEqual([])
+  })

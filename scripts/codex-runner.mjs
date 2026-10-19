@@ -286,7 +286,7 @@ async function main() {
     writeFileSync(join(args.control, 'usage.json'), JSON.stringify({ version: 1, generation, edges: [...usage.edges], turns: [...usage.turns], responses: [...usage.responses] }), { mode: 0o600 })
     for (const state of threads.values()) {
       const snapshot = usage.snapshot(state.id, state.rootTurnId)
-      if (state.id === threadId && !final) emit({ type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
+      if (state.id === threadId) emit({ type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
       else if (state.id !== threadId && !state.attaching && !state.failed) childEmit(state, { type: 'codexmod.directUsage', usage: snapshot.direct, partial: snapshot.directPartial })
       if (!snapshot.children) continue
       const event = { type: 'codexmod.treeUsage', ...snapshot,
@@ -294,6 +294,10 @@ async function main() {
       if (state.id === threadId) emit(event)
       else childEmit(state, event)
     }
+    const total = threads.get(threadId)?.lastTotal
+    if (total) emit({ type: 'codexmod.threadUsage', thread_id: threadId, total: {
+      input: total.inputTokens ?? 0, cached: total.cachedInputTokens ?? 0, output: total.outputTokens ?? 0,
+    } })
   }
   const maybeFinish = () => {
     clearTimeout(drainTimer)
@@ -624,20 +628,9 @@ async function main() {
     switch (m.method) {
       case 'thread/tokenUsage/updated': {
         const u = p.tokenUsage
+        if (u?.total) state.lastTotal = u.total
         usage.cumulative(threadId, turnId, state?.rootTurnId ?? rootTurn(), u)
         usageSnapshot()
-        if (u?.total) {
-          if (state.baseline === undefined) {
-            // total before this turn's first model call = first total - first last
-            const l = u.last ?? {}
-            state.baseline = {
-              inputTokens: (u.total.inputTokens ?? 0) - (l.inputTokens ?? 0),
-              cachedInputTokens: (u.total.cachedInputTokens ?? 0) - (l.cachedInputTokens ?? 0),
-              outputTokens: (u.total.outputTokens ?? 0) - (l.outputTokens ?? 0),
-            }
-          }
-          state.lastTotal = u.total
-        }
         break
       }
       case 'rawResponse/completed':
@@ -678,14 +671,13 @@ async function main() {
         state.done = true
         if (threadId === rootThread()) { turnDone = true; rootCode = t.status === 'completed' ? 0 : 1 }
         if (t.status === 'completed') {
-          const tot = state.lastTotal ?? {}
-          const b = state.baseline ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }
+          const direct = usage.direct(threadId, state.rootTurnId)
           emit({
             type: 'turn.completed',
             usage: {
-              input_tokens: Math.max(0, (tot.inputTokens ?? 0) - b.inputTokens),
-              cached_input_tokens: Math.max(0, (tot.cachedInputTokens ?? 0) - b.cachedInputTokens),
-              output_tokens: Math.max(0, (tot.outputTokens ?? 0) - b.outputTokens),
+              input_tokens: direct.input,
+              cached_input_tokens: direct.cached,
+              output_tokens: direct.output,
             },
           })
         } else if (t.status === 'interrupted') {
@@ -799,7 +791,7 @@ async function main() {
       const tid = p.turnId ?? p.turn?.id
       if (m.method === 'turn/started') {
         if (p.turn.rootTurnId && p.turn.rootTurnId !== state.rootTurnId) return
-        if (state.turnId !== tid) { state.baseline = undefined; state.lastTotal = undefined }
+        if (state.turnId !== tid) state.lastTotal = undefined
         state.turnId = tid
         state.done = false
         childEmit(state, { type: 'codexmod.turn', turn_id: tid })

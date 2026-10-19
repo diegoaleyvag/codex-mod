@@ -120,6 +120,9 @@ import { QUESTION_METHOD, choiceQuestions, answeredQuestion, validAnsweredQuesti
 import { controlRequest, queryOutcome, publishOutcome, messageStatus } from './steer.ts'
 import type { MessageOutcome } from './steer.ts'
 import { compactStoreState, flushStoreMigrations, readStoreState, writeStoreState } from './store-state.ts'
+import { boundedNames, validCapabilities, resolvePolicy, policyTask, configHash, capacityFallback } from './run-policy.ts'
+import type { RolePolicy, EffectiveConfig } from './run-policy.ts'
+import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
@@ -232,7 +235,7 @@ const INTERRUPT_GRACE_MS = 1500
 // ---- roles -----------------------------------------------------------------
 
 type Profile = { model: string; effort: string; sandbox: string }
-type ProjectRole = Profile & { description: string; instructions?: string }
+type ProjectRole = Profile & RolePolicy & { description: string }
 const PROJECT_FILE = '.claude/codex-mod.json'
 
 /** Validates an untrusted project file without I/O; catalog checks happen at registration. */
@@ -265,7 +268,7 @@ export function parseProjectRoles(text: string, { allowFullAccess = false } = {}
       bad('expected an object')
       continue
     }
-    unknown(value, ['model', 'effort', 'sandbox', 'description', 'instructions'], `role ${name}`)
+    unknown(value, ['model', 'effort', 'sandbox', 'description', 'instructions', 'lean', 'capabilities', 'fallbackModels'], `role ${name}`)
     const { model, effort, description, instructions } = value
     const sandbox = value.sandbox === undefined ? 'workspace-write' : value.sandbox
     if (typeof model !== 'string' || model.trim() === '' || typeof effort !== 'string' || effort.trim() === '' || typeof description !== 'string') {
@@ -284,7 +287,14 @@ export function parseProjectRoles(text: string, { allowFullAccess = false } = {}
       bad('danger-full-access requires the user-level allowProjectFullAccess option')
       continue
     }
-    roles[name] = { model, effort, sandbox, description, ...(instructions !== undefined ? { instructions } : {}) }
+    if (value.lean !== undefined && typeof value.lean !== 'boolean' || value.capabilities !== undefined && !validCapabilities(value.capabilities) || value.fallbackModels !== undefined && !boundedNames(value.fallbackModels)) {
+      bad('invalid lean, capabilities or fallbackModels schema')
+      continue
+    }
+    roles[name] = { model, effort, sandbox, description, ...(instructions !== undefined ? { instructions } : {}),
+      ...(value.lean !== undefined ? { lean: value.lean as boolean } : {}),
+      ...(value.capabilities !== undefined ? { capabilities: value.capabilities as RolePolicy['capabilities'] } : {}),
+      ...(value.fallbackModels !== undefined ? { fallbackModels: value.fallbackModels as string[] } : {}) }
   }
   return { roles, warnings }
 }
@@ -308,6 +318,9 @@ export type Config = {
   projectRoles: boolean
   modelAgents: boolean
   allowProjectFullAccess: boolean
+  allowProjectNonLean: boolean
+  projectCapabilityAllowlist: string[]
+  capacityFallback: string[]
   extraConfig: string[]
   intervalMs: number
   maxActionsPerStep: number
@@ -391,6 +404,16 @@ export function parseConfig(raw: unknown): Config {
     projectRoles: bool('projectRoles', true),
     modelAgents: bool('modelAgents', true),
     allowProjectFullAccess: bool('allowProjectFullAccess', false),
+    allowProjectNonLean: bool('allowProjectNonLean', false),
+    projectCapabilityAllowlist: list('projectCapabilityAllowlist', []).filter((s, i) => {
+      const valid = i < 32 && /^(?:webSearch:(?:cached|live)|mcp:[A-Za-z0-9_-]{1,64}|multiAgent|skillsInstructions|apps|plugins|images)$/.test(s)
+      if (!valid) warnings.push(`projectCapabilityAllowlist: invalid grant ${JSON.stringify(s)} ignored`)
+      return valid
+    }),
+    capacityFallback: (() => {
+      const names = list('capacityFallback', ['gpt-6-sol', 'gpt-5.6-sol'])
+      return boundedNames(names) ? names : (bad('capacityFallback', 'expected at most 32 unique model names'), ['gpt-6-sol', 'gpt-5.6-sol'])
+    })(),
     extraConfig,
     intervalMs: int('progressIntervalMs', 1000, 0, 60000),
     maxActionsPerStep: int('maxActionsPerStep', 10, 1, 50),
@@ -415,6 +438,12 @@ export type AgentRecord = Profile & {
   selection?: { session: string; toolUseId: string; type: string; launchModel: string; launchEffort: string; note?: string }
   modelRowIds?: string[]
   thread?: string
+  effectiveConfig?: EffectiveConfig
+  effectiveFingerprint?: string
+  fallbackModels?: string[]
+  capacityRetryKey?: string
+  // A missing total after interruption invalidates the next exec baseline.
+  threadUsage?: { thread: string; total: Usage; valid: boolean }
   lastTask?: string
   handedBack?: boolean
   // true when the host delivers this agent's report through SubagentHandback
@@ -974,12 +1003,12 @@ export function compact(n: number): string {
 }
 
 /**
- * The footer line of every handback: `codex · gpt-6-luna · low · workspace-write · 3 actions · ... · thread 01a14f50`;
+ * The footer line retains the full thread ID; token counts are rounded for display.
  * an app-server run adds `app-server` (and `N steers`) after the sandbox, a fallback run why it is exec.
  */
-export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number; usagePartial?: boolean; treeUsage?: TreeSnapshot }, mode: FooterMode = 'full'): string {
+export function footer(p: Profile & { agent: string; actions: number; usage?: Usage; thread?: string; transport?: string; steers?: number; patches?: number; patchRows?: number; usagePartial?: boolean; treeUsage?: TreeSnapshot; configNote?: string }, mode: FooterMode = 'full'): string {
   if (mode === 'off') return ''
-  if (mode === 'short') return [p.agent, p.model, p.effort].join(' · ')
+  if (mode === 'short') return [p.agent, p.model, p.effort, p.configNote].filter(Boolean).join(' · ')
   const parts = [p.agent, p.model, p.effort, p.sandbox]
   if (p.transport !== undefined) parts.push(p.transport)
   if (p.steers !== undefined && p.steers > 0) parts.push(`${p.steers} steer${p.steers === 1 ? '' : 's'}`)
@@ -995,7 +1024,8 @@ export function footer(p: Profile & { agent: string; actions: number; usage?: Us
     const exact = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
     parts.push(`tree ${exact(t.tree.input + t.tree.output)} tokens (direct ${exact(t.direct.input + t.direct.output)}; children ${exact(t.tree.input + t.tree.output - t.direct.input - t.direct.output)}) · new ${compact(t.tree.input - t.tree.cached)} / cached ${compact(t.tree.cached)} / out ${compact(t.tree.output)}${t.active || t.missing ? ` (partial: ${t.active} active, ${t.missing} missing)` : ''}`)
   }
-  if (p.thread !== undefined) parts.push(`thread ${p.thread.slice(0, 8)}`)
+  if (p.thread !== undefined) parts.push(`thread ${p.thread}`)
+  if (p.configNote) parts.push(p.configNote)
   return parts.join(' · ')
 }
 
@@ -1388,6 +1418,16 @@ type Run = {
   treeUsage?: TreeSnapshot
   usageCanonical?: boolean
   usagePartial?: boolean
+  execBaseline?: Usage
+  execTotal?: Usage
+  policy?: EffectiveConfig
+  configNote?: string
+  capacityRetried?: boolean
+  rawTask?: string
+  messageCount?: number
+  delivery?: string
+  spawnDetected?: Set<string>
+  observedChildren?: Set<string>
   childSources?: Map<string, SourceRecord>
   compactions?: Map<string, { notification: boolean; items: string[] }>
 }
@@ -1590,10 +1630,8 @@ async function agentRowProfile($: EngineInterface, id: string): Promise<{ model:
 }
 
 /** Shared by launches and live steers; instructions never enter task records or rendered notes. */
-const roleTask = (name: string, text: string): string => {
-  const instructions = projectRoles.get(name)?.instructions
-  return instructions ? `${instructions}\n\n${text}` : text
-}
+const roleTask = (name: string, text: string, policy?: EffectiveConfig): string =>
+  policyTask(policy ?? { instructions: projectRoles.get(name)?.instructions, multiAgent: !cfg.lean }, text)
 
 type TreeSnapshot = { direct: Usage; tree: Usage; children: number; missing: number; active: number }
 type ChildMirror = {
@@ -1947,7 +1985,7 @@ async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): 
         sessionId: m.session, agentId: m.host!, runId: m.control, threadId: m.thread,
         expectedTurnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn, status: 'pending', receivedAt: Date.now() }
       await recordOutcome($, m.host!, o)
-      const outcome = await controlRequest($, m.control, '/messages', { ...o, text: roleTask(rec.agentName, parseOverrides(message.text).rest.trim()), turnId: o.expectedTurnId }, `steer-${m.thread}-${id}.json`)
+      const outcome = await controlRequest($, m.control, '/messages', { ...o, text: roleTask(rec.agentName, parseOverrides(message.text).rest.trim(), rec.effectiveConfig), turnId: o.expectedTurnId }, `steer-${m.thread}-${id}.json`)
       if (outcome) { await recordOutcome($, m.host!, outcome); delivery.status = ['accepted', 'observed'].includes(outcome.status) ? 'accepted' : outcome.status === 'rejected' ? 'rejected' : outcome.status === 'unknown' ? 'unknown' : 'submitted' }
       $.ui.log(`codex-mod: mirror steer submitted: host=${m.host}; thread=${m.thread}; id=${delivery.id}`, { to: 'debug' })
     } catch (err) {
@@ -3213,7 +3251,7 @@ async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> 
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
     run.pendingSteers.push(f)
     try {
-      const outcome = await controlRequest($, run.control, '/messages', { ...o, id: steerFileId(f), text: roleTask(run.name, text),
+      const outcome = await controlRequest($, run.control, '/messages', { ...o, id: steerFileId(f), text: roleTask(run.name, text, run.policy),
         ...(run.mirror ? { threadId: run.mirror.thread } : {}) }, `steer-${steerFileId(f)}.json`)
       if (outcome) await handle($, run, { kind: 'steer', id: String(outcome.id), accepted: ['accepted', 'observed'].includes(outcome.status), reason: outcome.reason, outcome })
       else await recordOutcome($, run.agentId, { ...o, status: 'pending' })
@@ -3253,10 +3291,12 @@ async function* startRun(
   // the row id of a coordinator delivery: the transcript's newest user message
   // stays the record's task, so that message is not judged new after this run
   delivery?: string,
+  retry?: { profile: Profile; key: string; note: string },
 ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const agentId = e.agentId!
   await loadCatalog($)
-  const resolved = resolveProfile(base, rawTask, catalog ?? undefined)
+  const resolved = retry ? { profile: retry.profile, rest: parseOverrides(rawTask).rest, invalid: checkProfile(catalog ?? undefined, retry.profile.model, retry.profile.effort) }
+    : resolveProfile(base, rawTask, catalog ?? undefined)
   const lastTask = delivery !== undefined && base.lastTask !== undefined ? base.lastTask : rawTask
   const rec: AgentRecord = {
     ...base,
@@ -3289,7 +3329,8 @@ async function* startRun(
   const recent = (base.launches ?? []).filter(t => now - t < WINDOW_MS)
   const trip =
     base.guardTrip?.key === key ? base.guardTrip.reason
-    : base.launchKey === key && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
+    : retry && (retry.key !== key || base.capacityRetryKey === key) ? 'capacity retry already used or message changed'
+    : !retry && base.launchKey === key && (base.launchesSinceNew ?? 0) >= 1 ? 'this message already had its Codex run'
     : recent.length >= config.maxRunsPerWindow ? `${recent.length} launches in the last ${WINDOW_MS / 60000} min (maxRunsPerWindow ${config.maxRunsPerWindow})`
     : undefined
   if (trip !== undefined) {
@@ -3304,22 +3345,39 @@ async function* startRun(
   rec.launchesSinceNew = base.launchKey === key ? (base.launchesSinceNew ?? 0) + 1 : 1
   rec.launchKey = key
   rec.guardTrip = undefined
+  if (retry) rec.capacityRetryKey = key
+  rec.fallbackModels ??= projectRoles.get(name)?.fallbackModels ?? config.capacityFallback
   await saveRecord($, agentId, rec)
   $.ui.invalidate('ui.render')
   if (base.lastTask === undefined && base.selection?.note) carry = [carry, `↪ ${base.selection.note}`].filter(Boolean).join('\n\n')
-  const task = roleTask(name, resolved.rest)
-
   const cwd = await $.session.cwd()
-  const lean = config.lean ? await leanArgs($) : []
-  let env: Record<string, string> | undefined
-  if (!config.globalRules) {
-    try {
-      env = { CODEX_HOME: await shadowHome($) }
-    } catch (err) {
-      const body = [carry, `codex failed: could not prepare the CODEX_HOME without global rules (${errText(err)})`].filter(Boolean).join('\n\n')
-      return yield* handBack($, e, body, footer({ ...prof, agent: name, actions: 0, thread: rec.thread }, config.footer), handback)
+  let configNote = base.thread && (base.model !== rec.model || base.effort !== rec.effort)
+    ? 'model/effort changed on follow-up; cold start possible' : undefined
+  if (!rec.effectiveConfig) {
+    if (rec.effectiveFingerprint) {
+      return yield* handBack($, e, 'codex failed: saved thread policy unavailable; restore its private state cache before resuming', '', handback)
     }
+    const overrides = await leanArgs($)
+    let home: string
+    try {
+      home = config.globalRules ? await codexHome($) : await shadowHome($)
+    } catch (err) {
+      return yield* handBack($, e, `codex failed: could not prepare the CODEX_HOME without global rules (${errText(err)})`, '', handback)
+    }
+    const policy = resolvePolicy(config, projectRoles.get(name), overrides.filter((_, i) => overrides[i - 1] === '-c'),
+      overrides.flatMap(s => /^mcp_servers\.([A-Za-z0-9_-]+)\.enabled=/.exec(s)?.[1] ?? []),
+      home)
+    rec.effectiveConfig = policy.policy
+    for (const warning of policy.warnings) $.ui.log(`codex-mod: agent ${agentId}: ${warning}`, { to: 'debug' })
+    if (policy.warnings.length) configNote = [configNote, ...policy.warnings].filter(Boolean).join('; ')
+    if (base.thread) configNote = [configNote, 'legacy thread policy baseline unknown; snapshot retained from this turn'].filter(Boolean).join('; ')
   }
+  rec.effectiveFingerprint = configHash({ policy: rec.effectiveConfig.fingerprint, ...prof })
+  await saveRecord($, agentId, rec)
+  const task = roleTask(name, resolved.rest, rec.effectiveConfig)
+  const lean = rec.effectiveConfig.overrides.flatMap(kv => ['-c', kv])
+  const env = { CODEX_HOME: rec.effectiveConfig.home }
+  if (retry) carry = [carry, `↪ ${retry.note}`].filter(Boolean).join('\n\n')
   const via = await transportFor($, config)
   let argv: string[]
   let control: string | undefined
@@ -3339,11 +3397,11 @@ async function* startRun(
     // into it: `$.fs.write` would create missing directories with the default mode
     await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
     const questionTool = displayTools.codex_question
-    const questions = config.nativeActions && !config.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
-    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig, control, questions, nestedAgents: config.nestedAgents })
+    const questions = config.nativeActions && !rec.effectiveConfig.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [], control, questions, nestedAgents: config.nestedAgents })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   } else {
-    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: config.extraConfig })
+    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [] })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   }
 
@@ -3383,8 +3441,17 @@ async function* startRun(
     steers: 0,
     unknown: 0,
     unknownTypes: [],
+    policy: rec.effectiveConfig,
+    configNote,
+    capacityRetried: !!retry,
+    rawTask,
+    messageCount: count,
+    delivery,
+    execBaseline: rec.thread ? rec.threadUsage?.thread === rec.thread && rec.threadUsage.valid ? rec.threadUsage.total : undefined : zeroUsage(),
   }
+  if (rec.thread) rec.threadUsage = { thread: rec.thread, total: rec.threadUsage?.total ?? zeroUsage(), valid: false }
   rec.wire = { records: run.ledger.records, rows: run.rows }
+  await saveRecord($, agentId, rec)
   if (config.timeoutMs > 0) {
     try {
       run.timer = $.clock.after(config.timeoutMs, () => {
@@ -3428,6 +3495,11 @@ async function killRun(run: Run, interrupted = false): Promise<void> {
  * turn interrupted) and read for up to INTERRUPT_GRACE_MS within this call.
  */
 async function stopRun($: EngineInterface, run: Run): Promise<void> {
+  const record = records.get(run.agentId)
+  if (record && run.thread && !run.ended && !run.mirror) {
+    record.threadUsage = { thread: run.thread, total: run.execTotal ?? record.threadUsage?.total ?? zeroUsage(), valid: false }
+    await saveRecord($, run.agentId, record)
+  }
   await stopMirrorDescendants($, run.agentId)
   if (run.mirror) { await stopMirror($, run.mirror); return killRun(run) }
   if (run.killed || run.transport !== 'app-server' || run.control === undefined || run.ended) return killRun(run)
@@ -3537,14 +3609,36 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
   let envelope: any
   try { envelope = JSON.parse(line) } catch {}
   if (envelope?.type === 'codexmod.childEvent') return
-  if (envelope?.type === 'codexmod.treeUsage') { run.treeUsage = envelope; run.usage = envelope.direct; run.usageCanonical = true; return }
+  if (envelope?.type === 'codexmod.treeUsage') { run.treeUsage = envelope; run.usage = envelope.direct; run.usagePartial = envelope.directPartial; run.usageCanonical = true; return }
   if (envelope?.type === 'codexmod.directUsage') { run.usage = envelope.usage; run.usageCanonical = true; run.usagePartial = envelope.partial; return }
-  if (envelope?.type === 'codexmod.child') { await launchMirror($, run, envelope); return }
+  if (envelope?.type === 'codexmod.threadUsage') {
+    const rec = records.get(run.agentId)
+    if (rec && envelope.thread_id === run.thread && validUsage(envelope.total)) {
+      rec.threadUsage = { thread: run.thread!, total: envelope.total, valid: true }
+      await saveRecord($, run.agentId, rec)
+    }
+    return
+  }
+  if (envelope?.type === 'codexmod.child') {
+    detectSpawn($, run, envelope.thread_id, envelope.thread_id)
+    await launchMirror($, run, envelope)
+    return
+  }
   const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
   if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
   const captured = source ? run.ledger.capture(source) : undefined
-  if (captured?.render === false) return
+  if (captured?.render === false) {
+    if (run.transport === 'exec' && envelope?.type === 'turn.completed') await handle($, run, parseCodexLine(line), source)
+    return
+  }
   const item = captured?.record.item
+  if (item && (item.type === 'subAgentActivity' && item.kind === 'started' ||
+      item.type === 'collabAgentToolCall' && String(item.tool).replace(/_/g, '').toLowerCase() === 'spawnagent')) {
+    const receivers = item.receiverThreadIds ?? item.receiver_thread_ids
+    const ids = Array.isArray(receivers) ? receivers : typeof item.agentThreadId === 'string' ? [item.agentThreadId] : []
+    if (ids.length) for (const id of ids) detectSpawn($, run, id, id)
+    else detectSpawn($, run, `${source?.threadId}:${item.id}`)
+  }
   const complete = ['item.completed', 'item/completed'].includes(source?.event ?? '')
   if (item?.type === 'imageGeneration' && !complete && ['item.started', 'item/started', 'item.updated'].includes(source?.event ?? '')) {
     run.queue.push({ kind: 'interim', text: `Codex image generation status:\n${JSON.stringify(item)}` })
@@ -3633,6 +3727,18 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
   await handle($, run, ev, captured?.record)
 }
 
+function detectSpawn($: EngineInterface, run: Run, key: string, child?: string): void {
+  if (child) (run.observedChildren ??= new Set()).add(child)
+  if (run.policy?.multiAgent !== false || (run.spawnDetected ??= new Set()).has(key)) return
+  run.spawnDetected.add(key)
+  const note = 'multiAgent=false: Codex child spawn observed despite instruction; tool removal is unsupported'
+  $.ui.log(`codex-mod: agent ${run.agentId}, thread ${run.thread ?? 'unknown'}: ${note} (${key})`, { to: 'debug' })
+  if (!run.configNote?.includes(note)) {
+    run.configNote = [run.configNote, note].filter(Boolean).join('; ')
+    run.queue.push({ kind: 'note', text: `↪ ${note}; preserving real child rows and mirrors` })
+  }
+}
+
 export const absolute = (cwd: string, path: string) => {
   const parts: string[] = []
   for (const part of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
@@ -3664,6 +3770,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     const rec = records.get(run.agentId)
     if (rec !== undefined && rec.thread !== ev.id) {
       rec.thread = ev.id
+      rec.threadUsage = { thread: ev.id, total: zeroUsage(), valid: false }
       await saveRecord($, run.agentId, rec)
     }
   } else if (ev.kind === 'message') {
@@ -3706,7 +3813,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     if (q.status === 'pending' && q.method === QUESTION_METHOD && choiceQuestions(q.params)) {
       const tool = displayTools.codex_question
       const ownTools = agentTools.get(run.name)
-      if (!cfg.nativeActions || cfg.lean || !tool || ownTools && !ownTools.has(tool)) {
+      if (!cfg.nativeActions || (run.policy?.lean ?? cfg.lean) || !tool || ownTools && !ownTools.has(tool)) {
         await $.fs.write(`${run.control}/response-${q.token}.json`, JSON.stringify({ token: q.token, requestId: q.requestId,
           threadId: q.params.threadId, turnId: q.params.turnId, itemId: q.params.itemId, unsupported: true }))
         run.queue.push({ kind: 'interim', text: 'Codex question unsupported: owned question UI unavailable; no answer or consent supplied.' })
@@ -3778,8 +3885,18 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     if (run.unknownTypes.length < 3 && !run.unknownTypes.includes(ev.type)) run.unknownTypes.push(ev.type)
   } else if (ev.kind === 'usage') {
     if (run.usageCanonical) return
-    const u = run.usage ?? { input: 0, cached: 0, output: 0 }
-    run.usage = { input: u.input + ev.input, cached: u.cached + ev.cached, output: u.output + ev.output }
+    const total = { input: ev.input, cached: ev.cached, output: ev.output }
+    if (run.transport === 'exec' && !run.mirror) {
+      run.execTotal = total
+      const delta = execDelta(total, run.execBaseline)
+      run.usage = delta.usage
+      run.usagePartial = delta.partial
+      const rec = records.get(run.agentId)
+      if (rec && run.thread && validUsage(total)) {
+        rec.threadUsage = { thread: run.thread, total, valid: true }
+        await saveRecord($, run.agentId, rec)
+      }
+    } else run.usage = total
   } else if (ev.kind === 'command') {
     run.actions++
     if (source?.item?.status === 'inProgress') return
@@ -4174,6 +4291,36 @@ async function* complete(
     }
   }
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
+  const record = records.get(run.agentId)
+  const atCapacity = reason !== undefined && [reason, detail, ...run.errors, run.fatal ?? '', tail].some(s => s.includes('Selected model is at capacity'))
+  const capacityBeforeWork = run.actions === 0 && run.texts.length === 0 && !run.ledger.records.some(r => r.item)
+  if (record && run.thread && atCapacity && run.transport === 'exec' && !run.execTotal && run.execBaseline && capacityBeforeWork) {
+    record.threadUsage = { thread: run.thread, total: run.execBaseline, valid: true }
+    await saveRecord($, run.agentId, record)
+  }
+  if (atCapacity && run.transport === 'exec' && !run.execTotal && !capacityBeforeWork) run.usagePartial = true
+  if (record && run.thread && reason !== undefined && !atCapacity) {
+    // Failed/interrupted exec can incur unreported calls after its last total.
+    // Do not attribute those tokens to a later successful follow-up.
+    if (run.transport === 'exec') record.threadUsage = { thread: run.thread, total: run.execTotal ?? record.threadUsage?.total ?? zeroUsage(), valid: false }
+    run.usagePartial = true
+    await saveRecord($, run.agentId, record)
+  }
+  if (atCapacity && !run.mirror && !run.capacityRetried && !signal.aborted && !run.killed && record && run.thread && run.rawTask !== undefined) {
+    const next = capacityFallback(catalog ?? undefined, record.fallbackModels ?? cfg.capacityFallback, run.prof)
+    if (next) {
+      const note = `${run.prof.model} at capacity; continued on ${next.model}`
+      const previous = run.usage || run.usagePartial ? footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage,
+        thread: run.thread, usagePartial: run.usagePartial, treeUsage: run.treeUsage, configNote: [run.configNote, 'capacity attempt usage'].filter(Boolean).join('; ') }, cfg.footer) : undefined
+      for (const f of run.followUps) if (!followUpsOf(record).some(sameFollowUp(f))) (record.followUps ??= []).push(f)
+      const carry = [run.carry, previous].filter(Boolean).join('\n\n')
+      const resumed = startRun($, e, signal, cfg, run.name, record, run.rawTask, run.handback, run.messageCount!, carry || undefined, run.delivery,
+        { profile: next, key: record.launchKey!, note })
+      if (streamed !== undefined) return yield* prefixed(streamed, resumed)
+      return yield* resumed
+    }
+    run.configNote = [run.configNote, 'capacity fallback unavailable: no different model validated in models_cache.json'].filter(Boolean).join('; ')
+  }
   if (run.mirror) for (const message of run.mirror.messages ?? []) if (message.status === 'submitted') {
     message.status = 'unknown'
     run.queue.push({ kind: 'note', text: `↪ child message ${message.id}: outcome unknown; no automatic retry or relaunch` })
@@ -4200,7 +4347,11 @@ async function* complete(
     for (const f of run.followUps) if (!queued.some(sameFollowUp(f))) queued.push(f)
     rec.followUps = queued.length > 0 ? queued : undefined
   }
-  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, usagePartial: run.usagePartial, treeUsage: run.treeUsage, steers: run.steers, patches: run.patches, patchRows: run.patchRows }, cfg.footer)
+  if (run.transport === 'exec' && run.observedChildren?.size && !run.treeUsage) {
+    const direct = run.usage ?? zeroUsage()
+    run.treeUsage = { direct, tree: direct, children: run.observedChildren.size, missing: run.observedChildren.size + (run.usagePartial ? 1 : 0), active: 0 }
+  }
+  const foot = footer({ ...run.prof, agent: run.name, actions: run.actions, usage: run.usage, thread: run.thread, transport: run.transportNote, usagePartial: run.usagePartial, treeUsage: run.treeUsage, steers: run.steers, patches: run.patches, patchRows: run.patchRows, configNote: run.configNote }, cfg.footer)
   const shown = [run.carry, body].filter(Boolean).join('\n\n')
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile

@@ -109,9 +109,24 @@ test('an already oversized store can be compacted without losing temporarily rem
 
 test('cache write failures still permit bounded metadata writes', async () => {
   const h = host({ diskFails: true })
-  assert.equal(await writeStoreState(h.$, 'agent:s:a', { ...record(), wire: { records: ['x'.repeat(900_000)] } }), true)
+  // Metadata success is not a complete lossless checkpoint. Callers need the
+  // false result to avoid replaying control operations whose bodies were lost.
+  assert.equal(await writeStoreState(h.$, 'agent:s:a', { ...record(), wire: { records: ['x'.repeat(900_000)] } }), false)
+  assert.equal(h.store.get('agent:s:a').thread, 'resume-me')
   assert.equal(h.store.get('agent:s:a').cachedState, undefined)
   assert.ok(h.logs.some(line => line.includes('state cache write failed')))
+})
+
+test('R6 large effective policy recovers outside the store while its fingerprint remains bounded', async () => {
+  const h = host()
+  const value = { ...record(), effectiveFingerprint: '0123456789abcdef', threadUsage: { thread: 'resume-me', total: { input: 100, cached: 80, output: 5 }, valid: true },
+    effectiveConfig: { overrides: Array.from({ length: 32 }, (_, i) => `mcp_servers.server${i}.enabled=false`), instructions: 'x'.repeat(2000), fingerprint: 'policy-hash' } }
+  assert.equal(await writeStoreState(h.$, 'agent:s:r6', value), true)
+  const metadata = h.store.get('agent:s:r6')
+  assert.equal(metadata.effectiveConfig, undefined)
+  assert.equal(metadata.effectiveFingerprint, value.effectiveFingerprint)
+  assert.ok(JSON.stringify(metadata).length <= RECORD_BUDGET)
+  assert.deepEqual((await readStoreState(h.$, 'agent:s:r6', metadata)).effectiveConfig, value.effectiveConfig)
 })
 
 test('small handback memos need no cache file or cache marker', async () => {

@@ -197,9 +197,71 @@ This registers `codex-mod:implementer`, `codex-mod:implementer-high` and `codex-
 - A role whose model or effort is absent from Codex's `models_cache.json` is skipped with a debug message. If the catalog cannot be read, profiles are not validated, as before. Agent descriptions list the available models when known.
 - A missing file silently leaves only the generic agent. Malformed JSON or a wrong file shape produces a debug message and one user-visible notice per session; the generic agent remains available. Set `projectRoles: false` to skip reading the file entirely.
 
-Roles load at session start (and again if agent registration must be retried). Start a new session after editing the file; a cwd change mid-session does not reload it. Running agents retain the model, effort and sandbox in their records even if their role disappears. Instructions are looked up from the loaded role snapshot for every launch and live steer, rather than stored in the agent record: edits on disk do not change them until registration reloads the file. If a role is removed on reload, its existing agents continue without role instructions.
+Roles load at session start (and again if agent registration must be retried). Start a new session after editing the file; a cwd change mid-session does not reload it. Running agents retain the model, effort and sandbox in their records even if their role disappears. The first launch saves the role instructions, resolved override map, real/shadow Codex home identity, and an effective-config fingerprint in the agent record. Follow-ups and live steers keep that snapshot, including after a role is removed or the hooks worker restarts. Legacy threads without a snapshot adopt the current bounded policy with an unknown-baseline note. Model/effort overrides still work; their footer warns that a follow-up may start cold. Host-store metadata remains bounded to 32 Ki characters per record; larger snapshots recover from the private run cache.
 
 Role instructions are prepended to the task with a blank line on first runs, resumed runs, follow-ups and live steers, after prompt override lines are removed. They are never added to rendered action rows, delivery notes or footers.
+
+### Role capabilities and cache continuity
+
+Roles accept optional `lean` (boolean), `capabilities` and `fallbackModels`.
+Omitted `lean` inherits the global preset. Capability keys are:
+
+| Key | Values | Lean default |
+| --- | --- | --- |
+| `webSearch` | `"disabled"`, `"cached"`, `"live"` | disabled |
+| `mcpServers` | Up to 32 unique configured bare server names | none |
+| `multiAgent` | boolean | false |
+| `skillsInstructions`, `apps`, `plugins` | booleans | false |
+| `images` | boolean, image generation | false |
+
+Rich roles preserve the user's baseline when a capability is omitted. An empty
+`mcpServers` list disables discovered servers; an empty `fallbackModels` list
+disables capacity retries for that role. Lists are bounded to 32 unique entries;
+invalid capability types, unknown capability keys and invalid names skip the role.
+
+With global `lean=true`, repository `lean=false` requires the user option
+`allowProjectNonLean=true`. Selective expansions instead require user
+`projectCapabilityAllowlist` grants, for example `["webSearch:live", "mcp:rea",
+"multiAgent"]`. A repository cannot grant itself authority. With global
+`lean=false`, roles inherit the user's rich baseline and may restrict it. Explicit
+positive capability overrides still need a user grant, so repository settings
+cannot turn on a tool independently disabled in the user's Codex config.
+Explicit user `extraConfig` overrides win on both transports; a conflicting
+lean request is logged as partial. Capabilities are launch presets, not a
+security boundary: MCP discovery reads supported bare names from the user's
+config.toml and cannot enumerate every layered/project/plugin server. MCP and
+app actions can have external effects even with a read-only filesystem sandbox.
+
+For example, a role may request `"lean": true, "capabilities": {"webSearch":
+"live", "mcpServers": ["rea"], "multiAgent": false}`. Only the corresponding
+user-approved grants expand lean; other optional families remain disabled.
+
+`multiAgent=false` sends `features.multi_agent=false` and prepends **Do not
+spawn sub-agents.** to tasks and steers. R6 found no supported universal tool-removal
+key: gpt-6.x native v2 can still expose `collaboration.spawn_agent` with feature
+flags off. Observed spawns produce a debug log, visible warning and footer note;
+real child rows and nested mirrors remain available. This is a behavioral
+restriction with detection, not an enforced removal of the spawning tool.
+`nestedAgents` controls observation independently; it does not authorize spawning.
+
+Both transports use the same canonical override snapshot. Changes to on-disk
+Codex configuration, AGENTS files or the CLI itself can still affect the prompt;
+a fingerprint describes plugin-controlled settings, not the full wire context.
+No supported history tool-output limit was verified by R6, so codex-mod adds no
+speculative limit or display truncation. Bound large searches and command output
+at their source. Model compaction defaults and cache routing are unchanged.
+
+### Model capacity fallback
+
+A failed run containing `Selected model is at capacity` may resume its existing
+thread once with the first different, visible model in `capacityFallback`
+(default `["gpt-6-sol", "gpt-5.6-sol"]`). A role's `fallbackModels` replaces that
+list. Unknown/hidden models are skipped; an unreadable catalog or missing thread
+prevents retry. The effort is retained when supported, otherwise the model's
+supported default (or first supported effort) is used. A visible note says
+`gpt-6.1-sol at capacity; continued on gpt-6-sol`. The retry counts as another
+launch within `maxRunsPerWindow`, retains the policy and sandbox, and never
+tries a second fallback. Other failures do not trigger this recovery.
 
 ## Options
 
@@ -214,7 +276,10 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `modelAgents` | `true` | Register an agent type for each listed Codex model; project roles win name collisions. |
 | `projectRoles` | `true` | Load roles from `.claude/codex-mod.json` at session start. Off: do not read the file. |
 | `allowProjectFullAccess` | `false` | Allow project roles to request `danger-full-access`. User-level opt-in. |
-| `lean` | `true` | Turn off Codex plugins, apps, skills instructions, web search, multi-agent and configured MCP servers per launch. |
+| `lean` | `true` | Remove optional context/tool families; multi-agent off uses an instruction plus detection, with native v2 limits. |
+| `allowProjectNonLean` | `false` | Permit project roles to expand the lean preset. |
+| `projectCapabilityAllowlist` | `[]` | Selective user grants such as `webSearch:live`, `mcp:rea`, `multiAgent`. |
+| `capacityFallback` | `["gpt-6-sol", "gpt-5.6-sol"]` | Ordered catalog-validated candidates for one same-thread capacity retry. |
 | `globalRules` | `true` | Off (experimental): run Codex with a plugin-owned `CODEX_HOME` so your user-level `AGENTS.md` is not loaded. |
 | `extraConfig` | none | Raw `key=value` entries passed as `-c` to every launch. `model`, `model_reasoning_effort` and `sandbox_mode` are refused. |
 | `handbackMode` | `auto` | `auto`: `SubagentHandback`, plain text only if the tool is not active for the agent. `tool` or `text` force one. |
@@ -267,8 +332,8 @@ and may make an auxiliary `agent_summary` provider request; the plugin does
 not enable it or substitute paid API billing. See the
 [task/card contract and limits](docs/codex-ui-map.md#agents-and-task-cards-batch-8).
 
-Full footers show direct usage plus `tree` usage when descendants exist.
-Responses and cumulative turn snapshots are deduplicated; cache and reasoning
+Full footers retain the full thread ID and show direct usage plus `tree` usage when descendants exist. Exec follow-ups subtract the last known cumulative full-thread baseline; duplicate completion totals replace each other. Unknown or interrupted baselines are labeled partial/unknown instead of charging historical totals to the next run. App-server uses response IDs or guarded turn deltas, including final usage arriving after completion. Transport switches share the persisted thread total when available.
+Tree counts already include direct usage: never add the two. Exec reports known direct usage as a lower bound with missing descendant usage; app-server adds observed descendants once by source identity. Failed capacity-attempt usage, when known, is shown separately before the resumed launch. Responses and cumulative turn snapshots are deduplicated; cache and reasoning
 subtotals are not added twice. Missing observations are labeled partial.
 Codex counts stay out of host provider counters. The parent currently waits
 for observed children to drain before handing back its final tree snapshot.
@@ -325,7 +390,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 
 - Codex usage counts against your ChatGPT/Codex plan, not your Claude usage. The footer shows Codex's own token counts: new input, cached input and output.
 - No Anthropic request is made for the agent's own work. Claude still spends tokens writing the prompt and reading the answer.
-- `lean` (on by default) roughly halves the input tokens of each Codex call.
+- `lean` (on by default) removes optional context/tool families. R6 did not establish a universal percentage saving; high cache reuse can still accompany excessive total input.
 
 ## Limitations and known behaviours
 

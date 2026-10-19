@@ -180,6 +180,29 @@ createInterface({ input: process.stdin }).on('line', line => {
     case 'thread/unsubscribe':
       return reply({ status: 'unsubscribed' })
     case 'turn/start':
+      if (scenario.startsWith('cache-')) {
+        reply({ turn: { id: TURN, status: 'inProgress' } })
+        turnActive = true
+        note('turn/started', { threadId: THREAD, turn: { id: TURN, status: 'inProgress' } })
+        if (scenario === 'cache-capacity' && m.params.model === 'gpt-6.1-sol') {
+          turnActive = false
+          note('turn/completed', { threadId: THREAD, turn: { id: TURN, status: 'failed', error: { message: 'Selected model is at capacity. Please try a different model.' } } })
+          return
+        }
+        const token = (total, last) => note('thread/tokenUsage/updated', { threadId: THREAD, turnId: TURN, tokenUsage: { total, last } })
+        const before = { inputTokens: 5000, cachedInputTokens: 4000, outputTokens: 500 }
+        const first = { inputTokens: 6000, cachedInputTokens: 4600, outputTokens: 550 }
+        const last = { inputTokens: 1000, cachedInputTokens: 600, outputTokens: 50 }
+        token(before, { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 })
+        // A stale notification bound to another turn must never enter this ledger.
+        note('thread/tokenUsage/updated', { threadId: THREAD, turnId: 'stale', tokenUsage: nestedUsage(999999, 900000, 9000) })
+        if (scenario === 'cache-missing-last') token(first, undefined)
+        else token(first, last)
+        for (let i = 0; i < 2; i++) note('rawResponse/completed', { threadId: THREAD, turnId: TURN, responseId: 'cache-response', usage: last })
+        token(first, last)
+        note('item/completed', { threadId: THREAD, turnId: TURN, item: { type: 'agentMessage', id: 'cache-final', text: 'cache fixture done' } })
+        return complete(scenario === 'cache-interrupt' ? 'interrupted' : 'completed')
+      }
       if (scenario.startsWith('nested-')) {
         if (m.params.threadId !== PARENT) throw new Error('duplicate source child turn/start')
         reply({ turn: { id: TURN, status: 'inProgress' } })

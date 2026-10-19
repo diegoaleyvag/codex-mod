@@ -397,3 +397,21 @@ an earlier model result. Query calls refuse child/synthetic callers and never
 send, append, wake or execute a Codex action. HTTP responses are finite and
 bounded; stdout keeps the existing per-step ownership. See the [steer v2
 harness](../tests/fixtures/steer-v2-harness.md) for host ordering and live gates.
+
+
+### R6 policy and accounting notes
+
+- Tasks/steers with effective multiAgent off include `Do not spawn sub-agents.`;
+  native v2 capability removal is unsupported. Unexpected source spawns produce
+  a log, visible warning and footer note while retaining real rows and mirrors.
+- Full footers use full thread IDs, exec per-launch deltas and explicit unknown
+  baselines. Tree usage includes direct usage; missing exec descendants and
+  app-server attachment gaps are partial lower bounds, never zero-cost claims.
+- A model/effort follow-up change warns about a possible cold start. Policy,
+  instruction hash and real/shadow home snapshot remain stable for that thread.
+- A capacity recovery says `<model> at capacity; continued on <fallback>`.
+  It resumes the same thread at most once, counts another guarded launch, and
+  validates the fallback/effort against the visible model catalog.
+- Automated fixtures are evidence of routing/accounting only. Use a new Desktop
+  session after plugin reload for native controls and real capability checks;
+  follow `tests/fixtures/cache-harness.md` for headless reproduction.

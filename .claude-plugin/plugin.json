@@ -67,7 +67,7 @@
     "lean": {
       "type": "boolean",
       "title": "Lean Codex launches",
-      "description": "Turn off Codex plugins, apps, skills instructions, web search, multi-agent and the MCP servers of the Codex config for each launch (about half the input tokens per model call).",
+      "description": "Remove optional Codex context and tool families. Multi-agent off also adds an instruction and detects spawns; native v2 tool removal is not guaranteed. Roles can restrict this preset or request user-approved capabilities.",
       "default": true
     },
     "globalRules": {
@@ -150,7 +150,7 @@
     "maxRunsPerWindow": {
       "type": "number",
       "title": "Launch guard (runs per 10 min)",
-      "description": "The most Codex launches per agent in 10 minutes (1 to 100); beyond it the agent hands back codex failed: launch guard tripped. A message never gets more than one launch.",
+      "description": "The most Codex launches per agent in 10 minutes (1 to 100); beyond it the agent hands back codex failed: launch guard tripped. One launch per message, with at most one counted capacity retry.",
       "default": 3,
       "min": 1,
       "max": 100
@@ -178,6 +178,29 @@
       "default": 2,
       "min": 1,
       "max": 365
+    },
+    "allowProjectNonLean": {
+      "type": "boolean",
+      "title": "Allow project rich capabilities",
+      "description": "Allow repository roles to request lean=false or expand the lean preset. Explicit user extraConfig still wins. Prefer selective grants for routine research.",
+      "default": false
+    },
+    "projectCapabilityAllowlist": {
+      "type": "string",
+      "title": "Project capability grants",
+      "description": "User grants for lean project roles: webSearch:cached, webSearch:live, mcp:<configured-name>, multiAgent, skillsInstructions, apps, plugins, images (image generation). No wildcards.",
+      "multiple": true,
+      "default": []
+    },
+    "capacityFallback": {
+      "type": "string",
+      "title": "Capacity fallback models",
+      "description": "Ordered fallback candidates validated against models_cache.json. Retry at most once on the same thread after a capacity failure, within the launch guard. Empty disables retries; roles may override with fallbackModels.",
+      "multiple": true,
+      "default": [
+        "gpt-6-sol",
+        "gpt-5.6-sol"
+      ]
     }
   }
 }

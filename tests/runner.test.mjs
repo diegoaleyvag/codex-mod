@@ -341,7 +341,7 @@ test('normal turn: exec-compatible lines, turn-scoped usage, exit 0', async () =
   assert.deepEqual(done.item.changes, [{ path: '/x/a.txt', kind: { type: 'add' }, diff: '' }, { path: '/x/b.txt', kind: { type: 'update', move_path: null }, diff: '' }])
   assert.deepEqual(l.filter(x => x.item?.type === 'agent_message').map(x => x.item.text), ['all done'])
   // baseline = first total - first last (992,98,48); final total 1500/300/80
-  assert.deepEqual(l.at(-1), { type: 'turn.completed', usage: { input_tokens: 508, cached_input_tokens: 202, output_tokens: 32 } })
+  assert.deepEqual(l.findLast(e => e.type === 'turn.completed'), { type: 'turn.completed', usage: { input_tokens: 508, cached_input_tokens: 202, output_tokens: 32 } })
   const s = r.sent()
   assert.deepEqual(s.map(m => m.method), ['initialize', 'initialized', 'thread/start', 'turn/start'])
   assert.equal(s[0].params.clientInfo.name, 'codex-mod')
@@ -464,7 +464,7 @@ test('interrupt file -> turn/interrupt, turn.failed interrupted, exit 1', async 
   writeFileSync(join(r.control, 'interrupt'), '')
   const { code } = await r.exit
   assert.equal(code, 1)
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().findLast(e => e.type === 'turn.failed'), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
   const it = r.sent().find(m => m.method === 'turn/interrupt')
   assert.deepEqual(it.params, { threadId: 'thr-1', turnId: 'turn-1' })
   r.cleanup()
@@ -479,7 +479,7 @@ test('interrupt with an unresponsive server still ends within the 5 s window', a
   const { code } = await r.exit
   assert.equal(code, 1)
   assert.ok(Date.now() - t < 12000)
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().findLast(e => e.type === 'turn.failed'), { type: 'turn.failed', error: { message: 'interrupted' } })
   r.cleanup()
 })
 
@@ -489,7 +489,7 @@ test('interrupt written before the turn id is known is sent once the turn starts
   writeFileSync(join(r.control, 'interrupt'), '')
   const { code } = await r.exit
   assert.equal(code, 1)
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().findLast(e => e.type === 'turn.failed'), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
   const methods = r.sent().map(m => m.method)
   assert.ok(methods.indexOf('turn/start') < methods.indexOf('turn/interrupt'))
   assert.deepEqual(r.sent().find(m => m.method === 'turn/interrupt').params, { threadId: 'thr-1', turnId: 'turn-1' })
@@ -505,7 +505,7 @@ test('interrupt before the turn id with an unresponsive server still ends the ru
   assert.equal(code, 1)
   assert.ok(Date.now() - t < 12000)
   assert.ok(r.sent().some(m => m.method === 'turn/interrupt'))
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().findLast(e => e.type === 'turn.failed'), { type: 'turn.failed', error: { message: 'interrupted' } })
   r.cleanup()
 })
 
@@ -524,7 +524,7 @@ test('a malformed line is reported once and skipped', async () => {
   const { code } = await r.exit
   assert.equal(code, 0)
   assert.equal(r.lines().filter(l => l.type === 'error').length, 1)
-  assert.equal(r.lines().at(-1).type, 'turn.completed')
+  assert.ok(r.lines().some(e => e.type === 'turn.completed'))
   r.cleanup()
 })
 
@@ -972,4 +972,39 @@ for (const scenario of ['steer-v2-accepted', 'steer-v2-rejected', 'steer-v2-late
   await r.exit
   assert.equal(r.sent().filter(m => m.method === 'turn/steer').length, 1)
   assert.ok(!r.lines().some(l => l.item?.type === 'command_execution' || l.item?.type === 'file_change'))
+})
+
+test('R6 exec cumulative fixture: delta, unknown baseline, reset and malformed counts', async () => {
+  const { execDelta, zeroUsage } = await import('../hooks/exec-usage.mjs')
+  const fixture = JSON.parse(readFileSync(join(here, 'fixtures/cache-exec-cumulative.json'), 'utf8'))
+  assert.deepEqual(execDelta(fixture.first, zeroUsage()), { usage: fixture.first, partial: false })
+  for (let i = 0; i < 3; i++) assert.deepEqual(execDelta(fixture.followUpTotal, fixture.first), { usage: fixture.followUpDelta, partial: false })
+  assert.deepEqual(execDelta(fixture.followUpTotal, undefined), { partial: true })
+  assert.deepEqual(execDelta(fixture.first, fixture.followUpTotal), { partial: true })
+  assert.deepEqual(execDelta({ input: NaN, cached: 0, output: 0 }, zeroUsage()), { partial: true })
+})
+
+for (const scenario of ['cache-accounting', 'cache-missing-last', 'cache-interrupt']) test(`R6 ${scenario}: resumed zero baseline, stale turns, duplicate responses and final direct totals`, async () => {
+  const r = start(scenario, { extra: ['--thread', 'same-thread'] })
+  try {
+    assert.equal((await r.exit).code, scenario === 'cache-interrupt' ? 1 : 0)
+    const direct = r.lines().filter(e => e.type === 'codexmod.directUsage').at(-1)
+    assert.deepEqual(direct.usage, { input: 1000, cached: 600, output: 50 })
+    assert.equal(direct.partial, scenario === 'cache-missing-last')
+    const total = r.lines().filter(e => e.type === 'codexmod.threadUsage').at(-1)
+    assert.deepEqual(total, { type: 'codexmod.threadUsage', thread_id: 'same-thread', total: { input: 6000, cached: 4600, output: 550 } })
+    const stored = JSON.parse(readFileSync(join(r.control, 'usage.json'), 'utf8'))
+    assert.equal(stored.responses.length, 1)
+    assert.equal(stored.turns.length, 1)
+  } finally { r.cleanup() }
+})
+
+test('R6 app-server capacity text is retained for the hook retry; sidecar itself never retries', async () => {
+  const r = start('cache-capacity', { extra: ['--model', 'gpt-6.1-sol', '--thread', 'same-thread'] })
+  try {
+    assert.equal((await r.exit).code, 1)
+    assert.ok(r.lines().some(e => e.type === 'turn.failed' && e.error.message === 'Selected model is at capacity. Please try a different model.'))
+    assert.equal(r.sent().filter(m => m.method === 'turn/start').length, 1)
+    assert.equal(r.sent().find(m => m.method === 'thread/resume').params.threadId, 'same-thread')
+  } finally { r.cleanup() }
 })
