@@ -33,6 +33,10 @@ let turnActive = false
 let childActive = false
 let childAttached = false
 const childNote = (method, params) => note(method, { threadId: CHILD, turnId: CHILD_TURN, ...params })
+const extraChildren = new Map([
+  ['55555555-5555-4555-8555-555555555555', { parent: CHILD, turn: '77777777-7777-4777-8777-777777777777', active: true }],
+  ['66666666-6666-4666-8666-666666666666', { parent: PARENT, turn: '88888888-8888-4888-8888-888888888888', active: true }],
+])
 const childComplete = (status = 'completed') => {
   if (!childActive) return
   childActive = false
@@ -43,6 +47,10 @@ const childComplete = (status = 'completed') => {
 const childWork = () => {
   if (scenario === 'nested-early') note('thread/started', { thread: { id: CHILD, parentThreadId: PARENT, model: 'gpt-6.1-sol' } })
   childNote('turn/started', { turn: { id: CHILD_TURN, rootTurnId: PARENT_TURN, status: 'inProgress' } })
+  if (scenario === 'nested-tree-controls') for (const [id, child] of extraChildren) note('item/completed', {
+    threadId: child.parent, turnId: child.parent === CHILD ? CHILD_TURN : PARENT_TURN,
+    item: { ...nestedActivity, id: `spawn-${id}`, agentThreadId: id },
+  })
   childNote('item/completed', { item: nestedCommand })
   childNote('item/completed', { item: nestedCommand })
   childNote('item/commandExecution/outputDelta', { itemId: nestedCommand.id, delta: 'child' })
@@ -55,7 +63,7 @@ const childWork = () => {
     childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) })
     childNote('thread/tokenUsage/updated', { tokenUsage: nestedUsage(2000, 1500, 100) })
   }
-  if (scenario !== 'nested-controls') setTimeout(() => childComplete(scenario === 'nested-failure' ? 'failed' : 'completed'), Number(process.env.FAKE_CHILD_DELAY_MS ?? 350))
+  if (!['nested-controls', 'nested-tree-controls'].includes(scenario)) setTimeout(() => childComplete(scenario === 'nested-failure' ? 'failed' : 'completed'), Number(process.env.FAKE_CHILD_DELAY_MS ?? 350))
 }
 let reqId = 100
 const usage = (i, c, o) => ({ total: { totalTokens: i + o, inputTokens: i, cachedInputTokens: c, cacheWriteInputTokens: 0, outputTokens: o, reasoningOutputTokens: 0 }, last: { totalTokens: 10, inputTokens: 8, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0 }, modelContextWindow: null })
@@ -126,6 +134,27 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (m.id !== undefined && m.method === undefined) {
     if (scenario.startsWith('batch6-question') && m.id === 201) finishNormally()
     return
+  }
+  const extraChild = scenario === 'nested-tree-controls' && extraChildren.get(m.params?.threadId)
+  if (extraChild) {
+    const id = m.params.threadId
+    if (m.method === 'thread/resume') {
+      reply({ thread: { id, parentThreadId: extraChild.parent, historyMode: 'paginated' } })
+      setTimeout(() => note('turn/started', { threadId: id, turn: { id: extraChild.turn, rootTurnId: PARENT_TURN, status: 'inProgress' } }), 10)
+      return
+    }
+    if (m.method === 'thread/turns/list') return reply({ data: [{ id: extraChild.turn, rootTurnId: PARENT_TURN, status: 'inProgress' }], nextCursor: null })
+    if (m.method === 'thread/items/list') return reply({ data: [], nextCursor: null })
+    if (m.method === 'thread/unsubscribe') return reply({})
+    if (m.method === 'turn/start') throw new Error('duplicate descendant execution')
+    if (m.method === 'turn/interrupt') {
+      reply({})
+      if (extraChild.active) {
+        extraChild.active = false
+        setTimeout(() => note('turn/completed', { threadId: id, turn: { id: extraChild.turn, status: 'interrupted' } }), 10)
+      }
+      return
+    }
   }
   switch (m.method) {
     case 'initialize':
@@ -307,6 +336,7 @@ createInterface({ input: process.stdin }).on('line', line => {
     case 'turn/steer':
       if (scenario.startsWith('nested-') && m.params.threadId === CHILD) {
         if (!childActive || m.params.expectedTurnId !== CHILD_TURN) return out({ id: m.id, error: { code: -32000, message: 'stale child turn' } })
+        if (scenario === 'nested-steer-wrong-ack') return reply({ turnId: 'foreign-turn' })
         return reply({ turnId: CHILD_TURN })
       }
       if (!turnActive) return out({ id: m.id, error: { code: -32600, message: 'no active turn' } })

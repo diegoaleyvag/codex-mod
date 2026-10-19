@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Batch 8 mirror lifecycle: explicit parent relation in child titles and parent observation links for CLI 2.1.302's parentless depth-1 API spawns. Deduplicate message UUIDs in the owning runner, validate steer turn acknowledgements, persist delivery outcomes, distinguish stop requests from confirmed source interruption, and cascade stops through source descendants across hooks-worker recovery. Document native background-task support and unsupported reparenting, status/summary setters and separate-session adoption; add a stop/SendMessage headless harness. Desktop controls/progress and auxiliary summary traffic remain live checks.
+
 - Add `modelAgents` (default true): register each listed Codex model as `codex-mod:<slug>`, with catalog effort defaults and supported efforts in its description. The current host rejects dots in type names, so `gpt-6.1-sol` falls back to `gpt-6-1-sol` with a log note and exact executing model ID. Project roles win collisions; unreadable catalogs retain generic/role types only.
 - Resolve native Agent `effort` from the scoped tool input and detect spawn-field support; prompt lines take precedence, then native effort, then defaults. Unsupported native efforts fall back with a visible note; invalid prompt overrides still fail before launch.
 - Show actual model and effort in owned launch titles (including nested observers) and alongside the parent's native Agent row, retaining native controls and failure fallback. Row/footer profiles follow later changes through the same resolver used by Codex launch. Keep the unused `haiku` execution placeholder; native GPT badges remain unsupported.

@@ -434,7 +434,7 @@ export type AgentRecord = Profile & {
   // user messages folded into the turn while a run was active, run next
   followUps?: FollowUp[]
   // Receipt IDs are bounded in the store; bodies recover from private cache files.
-  coordinator?: { received: string[]; pending: { uuid: string; text: string }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string }> }
+  coordinator?: { received: string[]; pending: { uuid: string; text: string; mirrorClaimed?: true }[]; rows?: Record<string, { tool: string; text: string; sourceUuid: string }> }
   // app-server runs launched so far: the <n> of each run's control dir
   runSeq?: number
   // Runtime/cache only: never put lossless source evidence in the host store.
@@ -1592,7 +1592,8 @@ type ChildMirror = {
   control: string; generation: string; token: string; inputDigest: string; node: string; reader: string; activeTurn?: string; cwd?: string
   depth: number; model: string; effort: string; sandbox: string; path?: string
   launch: 'reserved' | 'launching' | 'bound' | 'refused' | 'uncertain'
-  state: 'waiting' | 'running' | 'completed' | 'failed' | 'aborted'
+  state: 'waiting' | 'running' | 'stopping' | 'completed' | 'failed' | 'aborted'
+  messages?: { id: string; status: 'submitted' | 'accepted' | 'rejected' | 'unknown' }[]
   reason?: string; stopSent?: boolean; updatedAt: number
 }
 const mirrors = new Map<string, ChildMirror>()
@@ -1611,7 +1612,9 @@ async function hydrateMirrors($: EngineInterface): Promise<void> {
     if (!key.startsWith(`mirror:${sid}:`) || mirrors.has(key)) continue
     const stored = await $.store.get(key)
     const value = stored && await readStoreState($, key, stored)
-    if (isMirror(value)) mirrors.set(key, value)
+    // A simultaneous abort/receipt may have published a newer reservation
+    // while this store read was in flight. Never overwrite that live state.
+    if (isMirror(value) && !mirrors.has(key)) mirrors.set(key, value)
   }
 }
 
@@ -1628,6 +1631,7 @@ async function saveMirror($: EngineInterface, m: ChildMirror): Promise<boolean> 
 }
 
 async function bindMirror($: EngineInterface, m: ChildMirror, host: string): Promise<void> {
+  const firstBind = m.launch !== 'bound'
   const info = (await $.agent.list()).find(a => a.id === host)
   const verdict = mirrorHostMatches(m, host, info, mirrorAuthorities.get(m.token)?.spawned === true)
   if (verdict !== 'admit') {
@@ -1644,6 +1648,7 @@ async function bindMirror($: EngineInterface, m: ChildMirror, host: string): Pro
   rec.mirror = m
   records.set(host, rec)
   await saveMirror($, m)
+  if (firstBind) $.ui.log(`codex-mod: mirror bound: host=${host}; sourceParent=${m.parentHost}; thread=${m.thread}`, { to: 'debug' })
 }
 
 /** An API launch may traverse tool guards. Only its exact held capability
@@ -1718,7 +1723,10 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
     parent = list.find(a => a.id === parent!.parentId)
     if (!parent) return mirrorFallback($, run, data, 'host ancestry unavailable')
   }
-  const description = modelTitle({ model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort }, oneLine(data.path ?? data.thread_id, 120))
+  // Plugin API spawns in 2.1.302 use the session context (depth 1, no
+  // parent). Preserve the source relation in both supported title surfaces.
+  const parentTitle = oneLine(list.find(a => a.id === run.agentId)?.description || run.agentId, 100)
+  const description = modelTitle({ model: data.model ?? run.prof.model, effort: data.effort ?? run.prof.effort }, `Codex child of ${parentTitle} · ${oneLine(data.path ?? data.thread_id, 120)}`)
   const token = `codex-mirror:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}:${Math.random().toString(36).slice(2)}`
   const input = { subagentType: `${$.plugin.name}:codex-child`, prompt: token, description, name: `codex-${data.thread_id}`, cwd: run.cwd }
   m = { version: 1, session: run.sessionId, thread: data.thread_id, parentThread: run.thread!, parentHost: run.agentId,
@@ -1728,7 +1736,7 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
     path: data.path, launch: 'reserved', state: 'waiting', updatedAt: 0 }
   if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror identity checkpoint unavailable; no host launched')
   if (m.depth > 3) {
-    m.launch = 'refused'; m.reason = 'host depth cap 3'
+    m.launch = 'refused'; m.reason = 'observer dispatch depth limit 3'
     await saveMirror($, m)
     return mirrorFallback($, run, data, m.reason)
   }
@@ -1736,8 +1744,8 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
   if (!await saveMirror($, m)) return mirrorFallback($, run, data, 'mirror launch checkpoint unavailable; no host launched')
   mirrorAuthorities.set(token, { parentHost: run.agentId, session: run.sessionId })
   try {
-    // This call is in the source parent's turn.step context. It creates only
-    // a host observer; the Codex child has already been spawned by Codex.
+    // Only the source relation is ours: core chooses host parent/depth.
+    // This creates an observer for the already running Codex child.
     const result = await $.agent.spawn(input)
     // turn.start may bind a core identity before the launch call resolves.
     // Reconcile that verified identity when a host omits it from the ack.
@@ -1766,20 +1774,63 @@ async function launchMirror($: EngineInterface, run: Run, data: any): Promise<vo
   const prompt = `Observe existing Codex child ${m.thread}`
   const action: Action = { tool: 'Agent', mirror: key, input: { description, prompt, subagent_type: 'codex-mod:codex-child' }, source,
     result: { agentId: m.host, agentType: 'codex-mod:codex-child', status: 'completed', prompt, canContinueAgent: false,
-      content: [{ type: 'text', text: `Observation link to real host agent ${m.host} for Codex child ${m.thread}. Host launch ${m.hostToolId ?? 'ID unavailable'}; child lifecycle and transcript belong to that host task. This completed link operation reports no host usage; Codex source usage is in the direct/tree footer.` }],
+      content: [{ type: 'text', text: `Observation link to real host agent ${m.host} for Codex child ${m.thread}, child of ${parentTitle} (host ${run.agentId}). Host launch ${m.hostToolId ?? 'ID unavailable'}; child lifecycle and transcript belong to that host task. Plugin API spawns may appear at depth 1 without a native parent. This completed link operation reports no host usage; Codex source usage is in the direct/tree footer.` }],
       resolvedModel: m.model, totalToolUseCount: 0, totalDurationMs: 0, totalTokens: 0,
       usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, server_tool_use: null, service_tier: null, cache_creation: null } } }
   run.queue.push({ kind: 'action', action })
 }
 
 async function stopMirror($: EngineInterface, m: ChildMirror): Promise<void> {
-  if (m.stopSent || m.state !== 'running') return
+  m = mirrors.get(mirrorKey(m.session, m.thread)) ?? m
+  if (m.stopSent || !['waiting', 'running'].includes(m.state)) return
   const run = m.host ? runs.get(m.host) : undefined
   const turnId = run?.turnId ?? (m.host ? records.get(m.host)?.playback?.turnId : undefined) ?? m.activeTurn
   m.stopSent = true
-  m.state = 'aborted'
-  await saveMirror($, m)
-  if (turnId) await $.fs.write(`${m.control}/interrupt-${m.thread}.json`, JSON.stringify({ threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }))
+  m.state = 'stopping'
+  // Reserve before awaiting: abort and turn.complete can arrive together.
+  if (!await saveMirror($, m)) {
+    $.ui.log(`codex-mod: mirror stop unknown: checkpoint unavailable; thread=${m.thread}; no retry`, { to: 'debug' })
+    return
+  }
+  if (!turnId) {
+    $.ui.log(`codex-mod: mirror stop unknown: active turn unavailable; thread=${m.thread}; no retry`, { to: 'debug' })
+    return
+  }
+  try {
+    await $.fs.write(`${m.control}/interrupt-${m.thread}.json`, JSON.stringify({ threadId: m.thread, turnId, operationId: `host-stop:${m.host}` }))
+    $.ui.log(`codex-mod: mirror stop submitted: host=${m.host}; thread=${m.thread}; turn=${turnId}; awaiting source terminal`, { to: 'debug' })
+  } catch (err) {
+    $.ui.log(`codex-mod: mirror stop unknown: thread=${m.thread}; ${errText(err)}; no retry`, { to: 'debug' })
+  }
+}
+
+/** Host tasks can be siblings. Cascade by our verified source ownership,
+ * including recovered observers, rather than trusting native host nesting. */
+async function stopMirrorDescendants($: EngineInterface, parentHost: string): Promise<void> {
+  try {
+    await hydrateMirrors($)
+  } catch (err) {
+    // Store recovery must not prevent cancellation of already known targets
+    // or the owning runner. Unknown descendants remain explicitly unresolved.
+    $.ui.log(`codex-mod: mirror cascade recovery unavailable: ${errText(err)}; stopping known descendants`, { to: 'debug' })
+  }
+  const sid = await sessionId($)
+  const hosts = new Set([parentHost])
+  const targets = new Set<ChildMirror>()
+  for (let changed = true; changed;) {
+    changed = false
+    for (const m of mirrors.values()) {
+      if (m.session !== sid || !hosts.has(m.parentHost) || targets.has(m)) continue
+      targets.add(m)
+      if (m.host) hosts.add(m.host)
+      changed = true
+    }
+  }
+  for (const m of targets) try {
+    await stopMirror($, m)
+  } catch (err) {
+    $.ui.log(`codex-mod: mirror cascade stop unknown: thread=${m.thread}; ${errText(err)}`, { to: 'debug' })
+  }
 }
 
 /** A journal consumer owns no process. Every pull settles inside one step;
@@ -1809,13 +1860,19 @@ function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessS
           cursor = nl + 1
           prefix = text.slice(Math.max(0, cursor - 160), cursor)
           const ev = JSON.parse(line)
-          if (ev.thread_id !== m.thread && ev.type !== 'codexmod.child') throw new Error('foreign child journal identity')
+          if (ev.type === 'codexmod.child' ? ev.parent_thread_id !== m.thread : ev.thread_id !== m.thread) throw new Error('foreign child journal identity')
           if (ev.type === 'turn.failed') code = 1
-          if (ev.type === 'codexmod.turn' && m.state !== 'aborted') m.state = 'running'
+          if (ev.type === 'codexmod.turn' && !m.stopSent) m.state = 'running'
           const run = m.host ? runs.get(m.host) : undefined
           if (run && ['turn.completed', 'turn.failed'].includes(ev.type)) {
             // Source terminal evidence settles the observer; do not echo a stop.
-            m.state = code ? 'failed' : 'completed'
+            m.state = ev.status === 'interrupted' || ev.error?.message === 'interrupted' ? 'aborted' : code ? 'failed' : 'completed'
+            $.ui.log(`codex-mod: mirror source terminal: host=${m.host}; thread=${m.thread}; state=${m.state}`, { to: 'debug' })
+          }
+          if (ev.type === 'codexmod.steer') {
+            const message = m.messages?.find(message => message.id === String(ev.id))
+            if (message && message.status === 'submitted') message.status = ev.status === 'accepted' ? 'accepted' : ev.status === 'rejected' ? 'rejected' : 'unknown'
+            $.ui.log(`codex-mod: mirror steer acknowledgement: host=${m.host}; thread=${m.thread}; id=${ev.id}; status=${message?.status ?? 'unmatched'}`, { to: 'debug' })
           }
           rec.playback = { cursor, prefix, texts: run?.texts ?? [], queue: run?.queue ?? [], actions: run?.actions ?? 0, usage: run?.usage, usageCanonical: run?.usageCanonical, usagePartial: run?.usagePartial, turnId: ev.turn_id ?? run?.turnId }
           return { done: false as const, value: { stream: 'stdout' as const, text: line + '\n' } }
@@ -1826,8 +1883,8 @@ function mirrorStream($: EngineInterface, rec: AgentRecord): HookStream<ProcessS
           return done()
         }
         const run = m.host ? runs.get(m.host) : undefined
-        if (['completed', 'failed'].includes(m.state) && ++quiet >= 2) return done()
-        if (run?.killed || m.state === 'aborted') return done()
+        if (['completed', 'failed', 'aborted'].includes(m.state) && ++quiet >= 2) return done()
+        if (run?.killed || m.state === 'stopping') return done()
         await mirrorMessages($, rec, run)
         // A bounded read-only wait in the host keeps polling out of the
         // dispatch's CPU/sleep budget. It starts no Codex or provider work.
@@ -1843,10 +1900,15 @@ async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): 
   const c = await conversation($, m.host!)
   const read = readConversation(c.items)
   const count = read.latest?.count ?? rec.userCount ?? 0
-  const received = [...(rec.coordinator?.pending ?? []).map(p => ({ ...p, count })), ...takeDeliveries(m.host!, count)]
+  // Presentation owns this queue and removes a receipt only after emission.
+  // Claim delivery separately so a long pending display cannot resend it
+  // after the bounded received-ID window has rolled over.
+  const received = [...(rec.coordinator?.pending ?? []).filter(p => !p.mirrorClaimed).map(p => ({ ...p, count })), ...takeDeliveries(m.host!, count)]
   const latest = read.latest
   if (latest && latest.text !== m.token && latest.text !== rec.lastTask && latest.count > (rec.userCount ?? 0)) received.push({ text: latest.text, count: latest.count })
   for (const message of received) {
+    const receipt = rec.coordinator?.pending.find(p => p.uuid === message.uuid)
+    if (receipt) receipt.mirrorClaimed = true
     const id = steerFileId(message)
     const control = (rec.coordinator ??= { received: [], pending: [] })
     const key = `mirror:${id}`
@@ -1862,8 +1924,22 @@ async function mirrorMessages($: EngineInterface, rec: AgentRecord, run?: Run): 
       await saveRecord($, m.host!, rec)
       continue
     }
-    await saveRecord($, m.host!, rec)
-    await $.fs.write(`${m.control}/steer-${m.thread}-${id}.json`, JSON.stringify({ text: message.text, messageId: message.uuid ?? id, threadId: m.thread, turnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn }))
+    const delivery: NonNullable<ChildMirror['messages']>[number] = { id: `${m.thread}-${id}`, status: 'submitted' }
+    m.messages = [...(m.messages ?? []).slice(-127), delivery]
+    if (!await saveRecord($, m.host!, rec)) {
+      delivery.status = 'unknown'
+      $.ui.log(`codex-mod: mirror steer unknown: checkpoint unavailable; thread=${m.thread}; id=${delivery.id}; no retry`, { to: 'debug' })
+      continue
+    }
+    try {
+      await $.fs.write(`${m.control}/steer-${m.thread}-${id}.json`, JSON.stringify({ text: message.text, messageId: message.uuid ?? id, threadId: m.thread, turnId: run?.turnId ?? rec.playback?.turnId ?? m.activeTurn }))
+      $.ui.log(`codex-mod: mirror steer submitted: host=${m.host}; thread=${m.thread}; id=${delivery.id}`, { to: 'debug' })
+    } catch (err) {
+      delivery.status = 'unknown'
+      await saveRecord($, m.host!, rec)
+      $.ui.log(`codex-mod: mirror steer unknown: thread=${m.thread}; id=${delivery.id}; ${errText(err)}; no retry`, { to: 'debug' })
+      continue
+    }
     if (run) run.queue.push({ kind: 'note', text: `↪ child message submitted (${message.uuid ?? id}); awaiting Codex acknowledgement` })
   }
 }
@@ -2184,7 +2260,8 @@ export const register: Register = (on, options) => {
     const run = e.agentId === undefined ? undefined : runs.get(e.agentId)
     const mirror = e.agentId ? (await loadRecord($, e.agentId))?.mirror : undefined
     if (mirror && !run && e.isAborted && !['completed', 'failed', 'aborted'].includes(mirror.state)) await stopMirror($, mirror)
-    if (run?.mirror && e.reason === 'end_turn' && !e.isAborted) {
+    if (e.agentId && e.isAborted) await stopMirrorDescendants($, e.agentId)
+    if (run?.mirror && !e.isAborted && (e.reason === 'answer' || (e.reason as string) === 'end_turn')) {
       await killRun(run)
       return next(e)
     }
@@ -2240,7 +2317,8 @@ export const register: Register = (on, options) => {
   })
 
   // A spawning hook is skipped by the loop it creates. Separate consumers
-  // for the two admitted host depths keep grandchildren intercepted too.
+  // for two source child generations keep grandchildren intercepted too;
+  // these dispatch depths do not assert native host nesting.
   for (const depth of [2, 3]) on('turn.step', { agentId: depth === 2 ? /.+/ : /[\s\S]+/ }, async function* ($, e, next) {
     if (!e.agentId) return yield* next(e)
     const saved = await loadRecord($, e.agentId)
@@ -2686,7 +2764,7 @@ async function loadRecord($: EngineInterface, agentId: string): Promise<AgentRec
   return records.get(agentId)
 }
 
-async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord, currentOnly = false): Promise<void> {
+async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord, currentOnly = false): Promise<boolean> {
   let now: number | undefined
   try {
     now = await $.clock.now()
@@ -2702,9 +2780,10 @@ async function saveRecord($: EngineInterface, agentId: string, rec: AgentRecord,
   records.set(agentId, rec)
   try {
     const key = recordKey(await sessionId($), agentId)
-    await writeStoreState($, key, records.get(agentId) ?? rec)
+    return await writeStoreState($, key, records.get(agentId) ?? rec)
   } catch (err) {
     $.ui.log(`codex-mod: store write failed: ${errText(err)}`, { to: 'debug' })
+    return false
   }
 }
 
@@ -3105,6 +3184,7 @@ async function killRun(run: Run, interrupted = false): Promise<void> {
  * turn interrupted) and read for up to INTERRUPT_GRACE_MS within this call.
  */
 async function stopRun($: EngineInterface, run: Run): Promise<void> {
+  await stopMirrorDescendants($, run.agentId)
   if (run.mirror) { await stopMirror($, run.mirror); return killRun(run) }
   if (run.killed || run.transport !== 'app-server' || run.control === undefined || run.ended) return killRun(run)
   // marked killed first: the step pulling meanwhile ends, and no second stop starts
@@ -3821,6 +3901,10 @@ async function* complete(
     }
   }
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
+  if (run.mirror) for (const message of run.mirror.messages ?? []) if (message.status === 'submitted') {
+    message.status = 'unknown'
+    run.queue.push({ kind: 'note', text: `↪ child message ${message.id}: outcome unknown; no automatic retry or relaunch` })
+  }
   // Commentary, proposed plans and summaries are emitted before the handback,
   // never used as a substitute for a missing final message.
   // the answer: the messages not shown yet (those after the last action), else the last
@@ -3847,7 +3931,10 @@ async function* complete(
   run.carry = undefined
   // Text mode ends the turn with this step, so a follow-up folded in meanwhile
   // runs now, in the same step, after this answer.
-  if (run.mirror) { run.mirror.state = reason ? 'failed' : 'completed'; await saveMirror($, run.mirror) }
+  if (run.mirror) {
+    if (!['aborted', 'stopping'].includes(run.mirror.state)) run.mirror.state = reason ? 'failed' : 'completed'
+    await saveMirror($, run.mirror)
+  }
   if (!run.mirror && !run.handback && rec !== undefined && rec.followUps !== undefined && rec.followUps.length > 0) {
     const next = rec.followUps.shift()!
     if (rec.followUps.length === 0) rec.followUps = undefined

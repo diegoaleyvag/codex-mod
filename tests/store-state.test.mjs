@@ -57,7 +57,8 @@ test('saving excludes wire regardless of its size and preserves replay cursors a
 
 test('nested identities, launch input, coordinator sets, bodies and replay queues remain bounded', async () => {
   const h = host()
-  const mirror = { version: 1, session: 's', thread: 'child', parentHost: 'parent', control: '/runs/one', generation: 'g', token: 'capability', depth: 2, updatedAt: 100, inputDigest: 'prompt'.repeat(100_000) }
+  const mirror = { version: 1, session: 's', thread: 'child', parentHost: 'parent', control: '/runs/one', generation: 'g', token: 'capability', depth: 2, updatedAt: 100, inputDigest: 'prompt'.repeat(100_000),
+    messages: Array.from({ length: DEDUP_LIMIT }, (_, i) => ({ id: `child-source-message-${i}`, status: i % 2 ? 'accepted' : 'unknown' })) }
   const received = Array.from({ length: 5000 }, (_, i) => `source-${i}`)
   const value = { ...record(), mirror, coordinator: { received, pending: [{ uuid: 'latest', text: 'x'.repeat(900_000) }], rows: Object.fromEntries(received.map(id => [id, { text: 'body' }])) },
     display: { children: Object.fromEntries(received.map(id => [id, { message: 'body' }])) },
@@ -73,6 +74,8 @@ test('nested identities, launch input, coordinator sets, bodies and replay queue
   assert.equal(h.store.get('mirror:s:child').inputDigest, undefined)
   const restored = await readStoreState(h.$, 'agent:s:a', metadata)
   assert.equal(restored.mirror.inputDigest, mirror.inputDigest)
+  assert.deepEqual(restored.mirror.messages, mirror.messages)
+  assert.deepEqual((await readStoreState(h.$, 'mirror:s:child', h.store.get('mirror:s:child'))).messages, mirror.messages)
   assert.equal(restored.coordinator.received.length, DEDUP_LIMIT)
   assert.equal(Object.keys(restored.coordinator.rows).length, DEDUP_LIMIT)
   assert.equal(restored.playback.queue.length, 5000)

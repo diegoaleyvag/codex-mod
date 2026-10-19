@@ -414,6 +414,17 @@ async function main() {
     else emit(event)
   }
   const interrupted = new Set()
+  const submittedSteers = new Set()
+  const stoppedThreads = new Set()
+  const stoppedAncestor = state => {
+    const seen = new Set()
+    while (state && !seen.has(state.id)) {
+      if (stoppedThreads.has(state.id)) return true
+      seen.add(state.id)
+      state = threads.get(state.parent)
+    }
+    return false
+  }
   const interruptThread = async (target, operationId) => {
     const key = JSON.stringify([target.id, target.turnId])
     if (!target.turnId || target.done || target.failed || interrupted.has(key)) return
@@ -468,12 +479,19 @@ async function main() {
 
   const handleSteer = async (name, path, text, target = { id: threadId, turnId }, messageId) => {
     const id = fileId(name)
+    // Notifications can advance the live thread while the RPC is in flight.
+    const destination = { id: target.id, turnId: target.turnId }
     remove(path)
+    // A hooks worker can replay a receipt after its bounded dedup window.
+    // The owning server lives longer: never resubmit the same source UUID.
+    const key = JSON.stringify([destination.id, messageId ?? id])
+    if (submittedSteers.has(key)) return
+    submittedSteers.add(key)
     try {
-      await send('turn/steer', { threadId: target.id, expectedTurnId: target.turnId, input: [{ type: 'text', text, text_elements: [] }], ...(messageId ? { clientUserMessageId: messageId } : {}) })
-      ack(id, 'accepted', undefined, target)
+      const result = await send('turn/steer', { threadId: destination.id, expectedTurnId: destination.turnId, input: [{ type: 'text', text, text_elements: [] }], ...(messageId ? { clientUserMessageId: messageId } : {}) })
+      ack(id, result?.turnId === destination.turnId ? 'accepted' : 'unknown', result?.turnId === destination.turnId ? undefined : 'steer acknowledgement did not match the source turn', destination)
     } catch (e) {
-      ack(id, e?.code === -32000 || e?.code === -2 ? 'unknown' : 'rejected', String(e?.message ?? 'turn/steer failed'), target)
+      ack(id, e?.code === -32000 || e?.code === -2 ? 'unknown' : 'rejected', String(e?.message ?? 'turn/steer failed'), destination)
     }
   }
 
@@ -496,7 +514,10 @@ async function main() {
         try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { continue }
         remove(path)
         const target = threads.get(body.threadId)
-        if (!final && target && target.id !== threadId && target.turnId === body.turnId) void interruptThread(target, body.operationId)
+        if (!final && target && target.id !== threadId && target.turnId === body.turnId) {
+          stoppedThreads.add(target.id)
+          for (const state of threads.values()) if (stoppedAncestor(state)) void interruptThread(state, body.operationId)
+        }
         continue
       }
       if (name === 'interrupt') {
@@ -662,9 +683,9 @@ async function main() {
             },
           })
         } else if (t.status === 'interrupted') {
-          emit({ type: 'turn.failed', error: { message: 'interrupted' } })
+          emit({ type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
         } else {
-          emit({ type: 'turn.failed', error: { message: t.error?.message ?? 'turn failed' } })
+          emit({ type: 'turn.failed', status: 'failed', error: { message: t.error?.message ?? 'turn failed' } })
         }
         if (threadId === rootThread()) for (const w of turnWaiters.splice(0)) w()
         maybeFinish()
@@ -721,6 +742,7 @@ async function main() {
         source_turn_id: state.spawnTurn, source_item_id: state.spawnItem, root_turn_id: state.rootTurnId, turn_id: state.turnId ?? state.buffer.find(m => m.method === 'turn/started')?.params?.turn?.id,
         path: state.path, model: state.model, effort: state.effort, status: 'attached', generation })
       for (const m of state.buffer.splice(0)) route(m)
+      if (parentStopping || stoppedAncestor(state)) void interruptThread(state, 'ancestor stop during attachment')
       maybeFinish()
     } catch (e) {
       state.failed = true
@@ -774,7 +796,7 @@ async function main() {
         state.turnId = tid
         state.done = false
         childEmit(state, { type: 'codexmod.turn', turn_id: tid })
-        if (parentStopping) void interruptThread(state, 'parent stop')
+        if (parentStopping || stoppedAncestor(state)) void interruptThread(state, 'ancestor stop')
       }
       if (tid && !state.turnId) state.turnId = tid
       if (tid && state.turnId !== tid) return

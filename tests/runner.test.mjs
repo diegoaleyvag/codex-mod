@@ -123,7 +123,40 @@ test('nested controls: root completion keeps owner alive; child steer/stop targe
     assert.equal(steers[0].params.threadId, CHILD)
     const stops = r.sent().filter(m => m.method === 'turn/interrupt')
     assert.deepEqual(stops.map(s => s.params), [{ threadId: CHILD, turnId: CHILD_TURN }])
+    assert.ok(r.lines().some(l => l.event?.type === 'turn.failed' && l.event.status === 'interrupted'))
     assert.equal(r.sent().filter(m => m.method === 'turn/start').length, 1)
+  } finally { r.cleanup() }
+})
+
+test('batch 8 replayed message UUIDs never steer twice, while distinct UUIDs with identical text still deliver', async () => {
+  const r = start('nested-controls')
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.child' && l.status === 'attached'))
+    const body = { threadId: CHILD, turnId: CHILD_TURN, text: 'same text', messageId: 'source-one' }
+    writeFileSync(join(r.control, 'steer-receipt-1.json'), JSON.stringify(body))
+    await r.waitFor(() => r.lines().some(l => l.event?.type === 'codexmod.steer' && l.event.status === 'accepted'))
+    writeFileSync(join(r.control, 'steer-receipt-1.json'), JSON.stringify(body))
+    writeFileSync(join(r.control, 'steer-receipt-replayed.json'), JSON.stringify(body))
+    writeFileSync(join(r.control, 'steer-receipt-2.json'), JSON.stringify({ ...body, messageId: 'source-two' }))
+    await r.waitFor(() => r.lines().filter(l => l.event?.type === 'codexmod.steer' && l.event.status === 'accepted').length === 2)
+    writeFileSync(join(r.control, 'interrupt'), '')
+    await r.exit
+    const steers = r.sent().filter(m => m.method === 'turn/steer')
+    assert.equal(steers.length, 2)
+    assert.deepEqual(steers.map(s => s.params.clientUserMessageId).sort(), ['source-one', 'source-two'])
+    assert.ok(steers.every(s => s.params.threadId === CHILD && s.params.expectedTurnId === CHILD_TURN))
+  } finally { r.cleanup() }
+})
+
+test('batch 8 a steer acknowledgement for another turn is unknown and never retried', async () => {
+  const r = start('nested-steer-wrong-ack', { env: { FAKE_CHILD_DELAY_MS: '1500' } })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.event?.type === 'codexmod.turn'))
+    writeFileSync(join(r.control, 'steer-wrong-ack.json'), JSON.stringify({ threadId: CHILD, turnId: CHILD_TURN, text: 'one submission', messageId: 'source-wrong-ack' }))
+    await r.waitFor(() => r.lines().some(l => l.event?.type === 'codexmod.steer' && l.event.status === 'unknown'))
+    await r.exit
+    assert.equal(r.sent().filter(m => m.method === 'turn/steer').length, 1)
+    assert.ok(!r.lines().some(l => l.event?.type === 'codexmod.steer' && l.event.status === 'accepted'))
   } finally { r.cleanup() }
 })
 
@@ -134,6 +167,25 @@ test('parent stop interrupts active descendants even after its own turn complete
     writeFileSync(join(r.control, 'interrupt'), '')
     await r.exit
     assert.equal(r.sent().filter(m => m.method === 'turn/interrupt' && m.params.threadId === CHILD).length, 1)
+  } finally { r.cleanup() }
+})
+
+test('batch 8 stopping one mirror cascades its source subtree and leaves a sibling running until parent stop', async () => {
+  const r = start('nested-tree-controls')
+  const grandchild = '55555555-5555-4555-8555-555555555555'
+  const sibling = '66666666-6666-4666-8666-666666666666'
+  try {
+    await r.waitFor(() => r.sent().filter(m => m.method === 'thread/resume').length === 3 && r.lines().some(l => l.type === 'turn.completed'))
+    writeFileSync(join(r.control, 'interrupt-mirror.json'), JSON.stringify({ threadId: CHILD, turnId: CHILD_TURN, operationId: 'native-mirror-stop' }))
+    await r.waitFor(() => r.lines().some(l => l.event?.thread_id === grandchild && l.event.type === 'turn.failed'))
+    let targets = r.sent().filter(m => m.method === 'turn/interrupt').map(m => m.params.threadId).sort()
+    assert.deepEqual(targets, [CHILD, grandchild].sort())
+    assert.equal(JSON.parse(readFileSync(join(r.control, 'owner.json'), 'utf8')).ended, false)
+    writeFileSync(join(r.control, 'interrupt'), '')
+    await r.exit
+    targets = r.sent().filter(m => m.method === 'turn/interrupt').map(m => m.params.threadId).sort()
+    assert.deepEqual(targets, [CHILD, grandchild, sibling].sort())
+    assert.equal(r.sent().filter(m => m.method === 'turn/start').length, 1)
   } finally { r.cleanup() }
 })
 
@@ -408,7 +460,7 @@ test('interrupt file -> turn/interrupt, turn.failed interrupted, exit 1', async 
   writeFileSync(join(r.control, 'interrupt'), '')
   const { code } = await r.exit
   assert.equal(code, 1)
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
   const it = r.sent().find(m => m.method === 'turn/interrupt')
   assert.deepEqual(it.params, { threadId: 'thr-1', turnId: 'turn-1' })
   r.cleanup()
@@ -433,7 +485,7 @@ test('interrupt written before the turn id is known is sent once the turn starts
   writeFileSync(join(r.control, 'interrupt'), '')
   const { code } = await r.exit
   assert.equal(code, 1)
-  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', error: { message: 'interrupted' } })
+  assert.deepEqual(r.lines().at(-1), { type: 'turn.failed', status: 'interrupted', error: { message: 'interrupted' } })
   const methods = r.sent().map(m => m.method)
   assert.ok(methods.indexOf('turn/start') < methods.indexOf('turn/interrupt'))
   assert.deepEqual(r.sent().find(m => m.method === 'turn/interrupt').params, { threadId: 'thr-1', turnId: 'turn-1' })

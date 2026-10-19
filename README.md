@@ -236,7 +236,11 @@ Nested agents use the parent's app-server connection to rejoin an existing child
 with `thread/resume`, without starting a child turn or changing its settings.
 The hidden `codex-mod:codex-child` host loop only reads that child's public
 journal. The parent Agent link references the actual host agent ID; commands
-and changes still use the display guards. Host nesting stops at depth 3.
+and changes still use the display guards. CLI 2.1.302 places plugin API spawns
+at depth 1 without a parent. There is no supported parent selector, so the
+child title says `Codex child of <parent title>` and the parent's observation
+link names both host IDs. This provides separate real tasks, not native nesting.
+The observer implementation supports two source child generations.
 Launch ownership uses the spawning step's recorded parent and a one-time
 token/tool ID, including hosts that omit parent/cwd fields from spawn events.
 Debug logs retain phase/reason codes and non-secret field summaries for refused
@@ -244,17 +248,35 @@ launches, and call/check admissions with their tool ID. Nested re-entry logs
 flush when the parent's spawn call settles; prompt tokens are never logged.
 Exec, failed rejoin, unavailable history and host admission failures keep the
 Batch 5 view and log the reason. A lost mirror or owner is never relaunched
-automatically. Running child messages use child-specific steering; idle or
-stale messages are rejected explicitly rather than starting new work.
+automatically. Native stop targets the exact child and its source descendants;
+parent stop also cascades after a hooks-worker restart. A stop request remains
+`stopping` until source termination confirms interruption; a killed observer
+may retain that pending state until its journal is read again. Running child
+messages steer once per source UUID, with acknowledged/rejected/unknown
+outcomes. Missing acknowledgements are never retried. Idle or stale messages
+are rejected explicitly rather than starting new work.
+
+All Codex agent types register as background subagents, so core can supply
+background task status, stop/send controls, description, prompt/report and
+progress derived from emitted transcript/tool rows. They do not become separate
+Desktop sessions. The public API has no task status/progress-summary setter:
+source failure/interruption is explicit in the mirror transcript and saved
+state, but a normally ended observer can still have a host Completed badge.
+Host-generated one-line progress summaries require `agentProgressSummaries`
+and may make an auxiliary `agent_summary` provider request; the plugin does
+not enable it or substitute paid API billing. See the
+[task/card contract and limits](docs/codex-ui-map.md#agents-and-task-cards-batch-8).
 
 Full footers show direct usage plus `tree` usage when descendants exist.
 Responses and cumulative turn snapshots are deduplicated; cache and reasoning
 subtotals are not added twice. Missing observations are labeled partial.
 Codex counts stay out of host provider counters. The parent currently waits
 for observed children to drain before handing back its final tree snapshot.
-Native Desktop navigation/live forwarding, GPT badges and auxiliary host
-summary requests still need a new-session check using the
-[nested harness](tests/fixtures/nested-harness.md).
+Owner-supplied headless results confirm real observer creation, depth 1 with
+no parent, and no observed `agent_summary` (only MCP fetch/telemetry Anthropic
+traffic). They do not establish Desktop's summary settings. Native Desktop
+navigation, controls, progress paint/history and auxiliary summary requests
+still need a new-session check using the [Batch 8 harness](tests/fixtures/batch8-harness.md).
 
 To set `transport` from a settings file:
 
@@ -308,7 +330,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - In `workspace-write`, Codex usually cannot commit inside a git worktree or use the network; let the caller commit and push.
 - Only finished actions, messages and available reasoning summaries are shown; raw reasoning is never shown. Exact patch adapters preserve empty content, CRLF and missing final newlines; they never clip Write/Edit inputs. Binary, oversized, ambiguous and missing/racing-snapshot patches retain a Bash diff/report. Normal exec payloads without per-file diffs cannot establish exact Write/Edit inputs. Typed Bash patch mapper acceptance and Desktop paint still require the headless/new-session checks in `tests/fixtures/batch3-harness.md`.
 - With `app-server`, a steer is applied at Codex's next step boundary, not instantly.
-- A run does not survive a restart of the plugin worker: the agent reports `codex failed: run lost`, and a follow-up resumes its thread.
+- A root driver run does not survive a restart of the plugin worker: it reports `codex failed: run lost`, and a follow-up resumes its thread. A mirror can re-adopt its existing live broker/journal; missing ownership degrades without relaunch.
 
 ## Safety model
 

@@ -37,7 +37,7 @@ because the engine refuses any other tool before the guard sees it.
 | `mcp_tool_call` / `mcpToolCall` | "Calling" / "Called" plus tool and result | Connector-specific verb or generic tool row; result blocks; raw `server.tool` output | Display-only `codex_tool` row | 1.2 | `server`, `tool`, nested `arguments`, full `result.content`/`structuredContent`/`_meta`, errors/status/timing |
 | — / `dynamicToolCall` | Tool call cell | "{toolName}" row | Display-only `codex_tool` row | 1.2 | Original `namespace`, `tool`, nested `arguments`, text/image/audio `contentItems`, success/status/timing |
 | `collab_tool_call` / `collabAgentToolCall` | "Spawned", "Sent input to", "Waiting for agents", agent states | "Created {agent} with the instructions…", "Messaged", "Closed"; wait calls hidden; Subagents panel | With `richRows`: guarded completed/error `Agent`, `SendMessage` for full sends, `TaskStop` for close/interrupt; `codex_tool` fallback and resume/list; waits show state transitions only | 1.2 | `tool`, `prompt`, `receiver_thread_ids`, `agents_states`, `status`, `model` |
-| — / `subAgentActivity` | (agent status lines) | "{name} finished", "Sent message to {agent}" | Deduplicated lifecycle text; no extra spawn or mirror | 1.2 | `kind`, full `agentThreadId`, `agentPath`, `model`, `reasoningEffort` |
+| — / `subAgentActivity` | (agent status lines) | "{name} finished", "Sent message to {agent}" | Deduplicated lifecycle text; app-server can attach one observer, without a duplicate spawn/mirror | 1.2 | `kind`, full `agentThreadId`, `agentPath`, `model`, `reasoningEffort` |
 | — / `imageView` | "Viewed image" | "Viewed an image" with preview | Guarded Read image from bounded, stable filesystem bytes; explicit later-preview/unavailable report | 1.2 | `path` |
 | — / `imageGeneration` | "Generated an image" | Generated image in a gallery | Full `codex_tool` generation result/error, plus guarded Read of a real saved output | 1.2 | `status`, `revisedPrompt`, `result`, `savedPath`, `transparentBackground`, `failure` |
 | — / `contextCompaction` | "Compacted context" | "Compacting context" -> "Context automatically compacted" | Deduplicated status text | 1.2 |  — |
@@ -63,7 +63,7 @@ Every other row in the table needs the `app-server` transport.
 - **Plan updates -> display-only `codex_plan`.** Input `{ explanation?, steps: [{ step, status }] }`.
   `richRows` selects guarded `TodoWrite` when admitted, otherwise paired `TaskCreate`/`TaskUpdate`. Previous snapshots, occurrence-matched IDs and statuses persist per agent/thread. Ambiguous reorders/renames are removed/created; clears delete only shadow IDs. The full checklist/empty state and explanation remain in the registered fallback input/result and owned ToolUse checkbox card. No host task persistence, hooks, assignments or dependencies execute. Actual main-panel isolation requires child parent scope to survive stream/reload/resume (Q1 evidence); Task* paint and synthetic-link affordances still need Desktop acceptance.
 - **Proposed plan** (`plan` item) -> a text block headed "Proposed plan:".
-- **Codex child operations** -> guarded completed Agent for successful completed spawn calls, denial for failed/declined spawns. Reports distinguish spawn completion from child status, disclose unreported metrics, use synthetic IDs and disable continuation. Full message bodies map to admitted SendMessage with the probed `{status,agentsStates}` acknowledgement object; null fails the real mapper despite its unknown declaration. Close/interrupt map to admitted TaskStop `{message,task_id,task_type:"codex"}`. Resume/list, missing facts/tools and ambiguous targets use full codex_tool; registration failure retains text. Waits show only changed child state/report (reported duration when present); subAgentActivity is deduplicated against known operation state. Durable child identities retain full source IDs/path/model/effort; no real host mirror or child task exists.
+- **Codex child operations** -> guarded completed Agent for successful completed spawn calls, denial for failed/declined spawns. Reports distinguish spawn completion from child status, disclose unreported metrics, use synthetic IDs and disable continuation. Full message bodies map to admitted SendMessage with the probed `{status,agentsStates}` acknowledgement object; null fails the real mapper despite its unknown declaration. Close/interrupt map to admitted TaskStop `{message,task_id,task_type:"codex"}`. Resume/list, missing facts/tools and ambiguous targets use full codex_tool; registration failure retains text. Waits show only changed child state/report (reported duration when present); subAgentActivity is deduplicated against known operation state. With app-server and `nestedAgents`, the separate observer path below creates real host tasks; exec, disabled nesting and attachment/admission failures retain this report-only view.
 - **Commentary** (app-server `agentMessage` with phase `commentary`) -> text between rows; the final
   answer is still the handback.
 - **Compaction** -> source-keyed status text, deduplicated with deprecated thread/compacted notifications. **Review** -> full text, never Claude plan mode. **Sleep** -> elapsed status without creating a timer.
@@ -179,7 +179,70 @@ Desktop preview/history, live thinking versus reopen, owned question controls
 and coordinator rendering need a NEW Desktop session. See
 [Batch 6 harness](../tests/fixtures/batch6-harness.md).
 
-## Nested observation loops
+## Agents and task cards (Batch 8)
+
+### Host contract and placement verdict
+
+CLI **2.1.302** supports real background subagents, but its plugin spawn API
+cannot choose a parent. The owner's headless run created the child with
+`spawnDepth:1`, no parent field, `pluginSteered:true` and
+`requestShape:background`; the spawn event omitted `parentAgentId` and `effort`.
+This is a real sibling task, not successful native nesting.
+
+Evidence, verified locally against the installed host:
+
+- Research `hooks-api/types/claude-code.d.ts:251` restricts `AgentSpawnArgs`
+  to prompt, description, subagentType, model, name and cwd. At line 319,
+  `parentAgentId` on the observed spawn event is pinned. `AgentInfo.parentId`
+  is read-only (line 168). There is no reparent/adopt argument or method.
+- `strings -n 8 "$(readlink -f "$(which claude)")"`: the session engine's
+  `toolContext` builds from main-session messages and `mainLoopModel`; the
+  headless `toolContext` likewise uses its session builder. The `rdn` adapter
+  adds plugin origin/caller, without an arbitrary agent identity. Agent
+  launch computes depth from that context and core creates a `local_agent`
+  through `Pse`. In this strings output these appear near offsets 44,976,342,
+  50,631,585, 24,996,340, 30,843,625 and 27,235,342 respectively.
+- REA `inspect-artifact` authenticated the installed Mach-O (SHA-256
+  `5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37`,
+  evidence `ev_1ae0f8689a2202cf198132bbca25df345c22a5b071f314060f4d685eefc6e58d`).
+  REA establishes artifact identity; the contract and bounded strings reads
+  establish the API conclusions, not live Desktop rendering.
+
+Consequently the title includes `Codex child of <parent title>` and the
+parent's completed observation-link Agent row names the source parent and
+both real host IDs. No pinned fields, task snapshots or transcript files are
+rewritten to simulate hierarchy. The Batch 8 unsupported-parent stop condition
+is reached; another spawn route/provider is not attempted.
+
+### Supported cards and remaining limits
+
+All registered Codex types already have `background:true`. A real Agent/API
+spawn creates the host `local_agent` task, which supplies status and native
+stop/send controls through core task events and `background_tasks_changed`.
+The title comes from supported `agent.spawn.description`; prompt/report come
+from the real loop. Core progress accounting (`cLn`/`slt`/`rco` in CLI `DQ`,
+near strings offset 30,768,666) consumes emitted transcript/tool rows. The
+plugin does not set task fields. Unit tests check background registration,
+model/title text, guarded rows and reports; Desktop paint remains unverified.
+
+| Capability | Verdict |
+|---|---|
+| Top-level Codex task/card | Supported as an actual background subagent; no extra session creation is necessary. |
+| Mirror task/card | Supported as a real `codex-mod:codex-child` observation task, separate from its source parent in this host. |
+| Native running/completed/stopped | Core controls its own worker/task state. Native TaskStop/abort maps to the source adapter below. |
+| Source failed/interrupted | Journal and saved mirror state retain `failed`/`aborted`, and the report says `codex failed`. A normally ended observer may still have a host Completed badge. `TurnStepResult` has no error/task-status field (`d.ts:13963`), and `turn.complete` only returns text/usage (`13804`). No supported Failed/Killed badge setter for an external source was found. |
+| One-line summary/progress text | No public task summary setter. SDK `agentProgressSummaries` enables host-generated summaries (an auxiliary `agent_summary` inference); `task_progress.summary` describes that host output, not a plugin input. Use title, transcript actions and final report without enabling inference for decoration. |
+| Separate Desktop session card | Unsupported adoption here. Conditional `mcp__ccd_session__start_session` starts a new session and has no Codex agent selector/adopt-thread field. This plugin intercepts subagent steps; its main steps pass through. Calling that tool would start ordinary provider work. |
+
+The supplied headless network audit saw MCP fetch and telemetry requests to
+Anthropic, with no `agent_summary` observed. It does not prove Desktop's
+initialization flags or a long-running summary timer. There is no public
+per-agent summary opt-out in this contract. Keep saved subscription auth;
+never switch billing/provider to work around this boundary. A NEW Desktop
+session must confirm background-list/sidebar presence, stop/send controls,
+progress rendering, navigation/history and auxiliary-request behavior.
+
+### Observer implementation
 
 `nestedAgents:true` on app-server discovers verified source UUID edges from
 SubAgentActivity and legacy spawn items. The owning connection rejoins with
@@ -192,8 +255,9 @@ new source execution repairs a missing stream.
 
 The actual parent's step reserves and persists a launch capability before
 calling `$.agent.spawn`. A separate spawn observer records the core tool ID;
-turn.start can bind the host ID before the API resolves. Distinct depth 2/3
-mirror step registrations avoid the calling handler's inherited exclusion.
+turn.start can bind the host ID before the API resolves. Distinct source-depth
+2/3 mirror step registrations avoid the calling handler's inherited exclusion;
+these are dispatch/source-generation guards, not native host placement.
 CLI 2.1.302 can omit parentAgentId and report cwd as undefined in agent.spawn.
 Admission therefore uses the active spawning step's recorded parent/session,
 exact one-time prompt token, expected type/name/description and one core tool
@@ -212,11 +276,23 @@ with the returned real host agentId and a separately recorded host launch ID.
 It is not the core virtual launch row, and makes no native token/task-state
 projection. Native Desktop linkage between these rows is an acceptance gate.
 The host task owns its own transcript and completion. Child source terminal
-events end the mirror without interrupt echo. Host child stop writes only a
-child-addressed interrupt, while parent stop snapshots all observed live
-descendants. Steering preserves message UUIDs and intent before submission;
-ambiguous delivery is never retried or converted to new inference. Idle child
-continuation is rejected in this slice.
+events end the mirror without interrupt echo. Host child stop writes a
+child-addressed interrupt, and the broker cancels that source subtree while
+leaving unrelated siblings running. Explicit parent abort snapshots owned
+descendants even after hooks-worker restart or root-turn completion. Both
+paths deduplicate per thread/turn. A request checkpoints `stopping`; only
+source terminal evidence confirms `aborted`, and an RPC acknowledgement alone
+does not. A killed observer's saved state can remain `stopping` until its
+journal is read again; it does not claim successful source cancellation.
+
+Steering claims each coordinator receipt separately from its pending display,
+preserves UUID and submission intent before writing a control, and records
+accepted/rejected/unknown outcomes. The full receipt remains available until
+the transcript renderer emits it.
+The broker retains UUID dedup for its lifetime even after a hooks receipt
+window is evicted. Acceptance requires a matching turn ID. Missing/ambiguous
+acks or checkpoint failures are never retried or converted to new inference.
+Idle child continuation is rejected in this slice.
 
 Private mirror records (`mirror:<session>:<child UUID>`) retain parent/source
 IDs, launch token/digest, broker generation, actual host ID, core launch ID,
@@ -227,6 +303,9 @@ partial/lost observer. Reserved, uncertain and evicted identities are never
 automatically spawned again. Journal truncation/replacement is a gap. Cursor
 and host transcript writes are not atomic; ambiguous text delivery is not
 claimed exactly once.
+
+Run [Batch 8 harness](../tests/fixtures/batch8-harness.md) for real headless
+SendMessage/TaskStop checks and the remaining Desktop acceptance cases.
 
 The source usage ledger counts each reachable thread once, scoped by root
 turn, and deduplicates response IDs and cumulative turn snapshots. Full

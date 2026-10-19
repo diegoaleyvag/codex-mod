@@ -155,6 +155,8 @@ type WorldOpts = {
    */
   pieces?: readonly (Piece | 'block' | (() => boolean))[]
   store?: Map<string, unknown>
+  storeKeysThrows?: boolean
+  storeSnapshots?: boolean
   storeReject?: (key: string, value: unknown) => boolean
   /** What `$.fs.read` finds, by the requested path (mutable between steps). */
   files?: Map<string, string>
@@ -243,7 +245,10 @@ function world(on: On, opts: WorldOpts = {}) {
     if (text === undefined) throw new Error(`ENOENT ${e.path}`)
     return { value: text }
   })
-  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.get', (_$, e) => {
+    const value = store.get(e.key)
+    return { value: opts.storeSnapshots && value !== undefined ? JSON.parse(JSON.stringify(value)) : value }
+  })
   on('store.set', (_$, e) => {
     if (opts.storeReject?.(e.key, e.value)) throw new Error('store limit exceeded')
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -253,7 +258,10 @@ function world(on: On, opts: WorldOpts = {}) {
     store.delete(e.key)
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.keys', () => {
+    if (opts.storeKeysThrows) throw new Error('store recovery unavailable')
+    return { value: [...store.keys()] }
+  })
   on('tool.call', (_$, e: any) => {
     core.push({ tool: e.tool, id: e.tool_use_id, agentId: e.agentId })
     return { result: { stdout: 'REALLY RAN', stderr: '', interrupted: false } } as any
@@ -435,7 +443,7 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
     readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? nestedJournal : path.endsWith('/owner.json') ? JSON.stringify({ generation: 'fake-generation', updatedAt: Date.now(), ended: true }) : text,
     registeredAgents: registered, agentList: () => [
     { id: 'agent-progress', type: 'codex-mod:codex', description: 'parent', status: 'running' as const },
-    { id: host, type: 'codex-mod:codex-child', description: 'observer', parentId: 'agent-progress', status: 'running' as const, spawnedBy: 'codex-mod' },
+    { id: host, type: 'codex-mod:codex-child', description: 'observer', parentId: 'agent-progress', status: 'running' as const, spawnedBy: 'codex-mod@codex-mod' },
   ] })
   let childFinal = ''
   on('turn.start', (_$, e: any) => ({ turnId: e.turnId }))
@@ -443,6 +451,7 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   on('agent.spawn', async (_$, e: any) => {
     actual.push(e)
     expect(e.description).toContain('Codex gpt-6.1-sol · medium · ')
+    expect(e.description).toContain('Codex child of parent')
     // Re-enter before the API resolves, as core can do. This is an API-chain
     // test, not evidence that the testing kit created a native task record.
     prompt = e.prompt
@@ -460,6 +469,7 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   const hidden = registered.find(a => a.name === 'codex-child')
   expect(hidden.prompt).toContain('hook not active')
   expect(hidden.background).toBe(true)
+  expect(registered.every(a => a.background === true)).toBe(true)
   expect(await $.agent.offer({ agent: 'codex-mod:codex-child', description: '', source: 'plugin', provider: { plugin: 'codex-mod', tier: 'project' } } as any)).toEqual({ isOffered: false })
   const parent = await step($, 'agent-progress')
   const link = callsOf(parent.chunks).find(c => c.name === 'Agent')!
@@ -470,6 +480,7 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
   expect(label).toContain('Codex gpt-6.1-sol · medium')
   expect(label).toContain('NESTED HOST CONTROLS')
   expect(answer.result.content[0].text).toContain('Observation link')
+  expect(answer.result.content[0].text).toContain('child of parent (host agent-progress)')
   expect(childFinal).toContain('child checked the fixture')
   expect(childFinal).toContain('500 new tokens (1.5K cached, 100 out)')
   expect(actual.length).toBe(1)
@@ -499,6 +510,7 @@ for (const refusal of ['deny', 'depth', 'attachment', 'uncertain']) test(`nested
   const s = await step($, 'agent-progress')
   const text = s.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n') + (s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer)
   expect(text).toContain('mirror unavailable')
+  if (refusal === 'depth') expect(text).toContain('observer dispatch depth limit 3')
   expect(w.spawned.length).toBe(1)
   expect(calls.length).toBe(refusal === 'deny' || refusal === 'uncertain' ? 1 : 0)
   expect(w.modelCalls).toEqual([])
@@ -547,10 +559,10 @@ test('nested recovery: persisted mirror cursor resumes public events with no sta
   expect(rec.mirror.host).toBe(m.host)
 })
 
-for (const gap of ['owner-lost', 'truncated', 'invalid-depth', 'malformed']) test(`nested recovery ${gap}: fail closed with no execution, inference or relaunch`, async ($, on) => {
+for (const gap of ['owner-lost', 'truncated', 'invalid-depth', 'malformed', 'foreign-child']) test(`nested recovery ${gap}: fail closed with no execution, inference or relaunch`, async ($, on) => {
   const m = savedMirror('host-broken-child', gap === 'invalid-depth' ? { depth: 9 } : {})
   const store = mirrorStore(m, gap === 'truncated' ? { playback: { cursor: 99, prefix: 'old-file', texts: [], queue: [], actions: 0 } } : {})
-  const w = world(on, { task: m.token, store, readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? gap === 'malformed' ? 'bad json\n' : '' : path.endsWith('/owner.json') ? '{}' : text })
+  const w = world(on, { task: m.token, store, readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? gap === 'malformed' ? 'bad json\n' : gap === 'foreign-child' ? JSON.stringify({ type: 'codexmod.child', parent_thread_id: N_PARENT }) + '\n' : '' : path.endsWith('/owner.json') ? '{}' : text })
   const s = await step($, m.host)
   const body = s.result.toolUses.some(u => u.name === 'SubagentHandback') ? handback(s.result) : s.result.answer
   expect(body).toContain('codex failed:')
@@ -574,15 +586,15 @@ test('nested host stop writes one child interrupt and never returns/kills a pare
   expect(w.kills.count).toBe(0)
   expect(w.writes.some(w => w.path.endsWith('/interrupt'))).toBe(false)
   expect(w.modelCalls).toEqual([])
+  const stopped: any = w.store.get(`mirror:sess-1:${N_CHILD}`)
+  expect(stopped.state).toBe('stopping')
+  expect(stopped.stopSent).toBe(true)
 })
 
 test('nested SendMessage receipts steer the exact child once per UUID; identical bodies with distinct UUIDs remain distinct', async ($, on) => {
   const m = savedMirror('host-message-child')
-  const w = world(on, { task: m.token, store: mirrorStore(m) })
-  for (const uuid of ['delivery-one', 'delivery-one', 'delivery-two']) await $.session.append({
-    agentId: m.host, uuid, origin: { kind: 'coordinator' }, door: 'attachment',
-    message: { role: 'system', content: `<system-reminder>The coordinator sent a message while you were working:\nSame body\nAddress this before completing your current task.</system-reminder>` },
-  } as any)
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? nestedJournal : text })
+  for (const uuid of ['delivery-one', 'delivery-one', 'delivery-two']) await $.session.append(deliveryRow(m.host, uuid, 'Same body'))
   const steers = w.writes.filter(w => w.path.includes('/steer-'))
   expect(steers.length).toBe(2)
   expect(steers.every(w => JSON.parse(w.text).threadId === N_CHILD)).toBe(true)
@@ -590,6 +602,99 @@ test('nested SendMessage receipts steer the exact child once per UUID; identical
   expect(new Set(steers.map(w => w.path)).size).toBe(2)
   expect(w.spawned).toEqual([])
   expect(w.modelCalls).toEqual([])
+  // Pending text is deliberately absent from compact store metadata.
+  const checkpoint = `/home/t/.cache/codex-mod/runs/state-${encodeURIComponent(`agent:sess-1:${m.host}`)}/record.json`
+  let rec: any = JSON.parse(w.files.get(checkpoint)!)
+  expect(rec.coordinator.pending.length).toBe(2)
+  expect(rec.coordinator.pending.every((p: any) => p.mirrorClaimed === true)).toBe(true)
+  expect(rec.mirror.messages.map((message: any) => message.status)).toEqual(['submitted', 'submitted'])
+  const s = await step($, m.host)
+  const receipts = callsOf(s.chunks).filter(call => call.name.endsWith('__coordinator_message'))
+  expect(receipts.map(call => call.input.sourceUuid)).toEqual(['delivery-one', 'delivery-two'])
+  expect(receipts.every(call => String(call.input.text).includes('Same body'))).toBe(true)
+  await runCalls($, s.chunks, m.host)
+  expect(w.writes.filter(w => w.path.includes('/steer-')).length).toBe(2)
+  rec = JSON.parse(w.files.get(checkpoint)!)
+  expect(rec.coordinator.pending).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('batch 8 parent abort after restart cascades source descendants once without native nesting or a live parent run', async ($, on) => {
+  const child = savedMirror()
+  const grandchild = savedMirror('host-grandchild', { thread: '55555555-5555-4555-8555-555555555555', parentHost: child.host, parentThread: N_CHILD, depth: 3 })
+  const unrelated = savedMirror('host-unrelated', { thread: '66666666-6666-4666-8666-666666666666', parentHost: 'unrelated-parent' })
+  const store = mirrorStore(child)
+  for (const m of [grandchild, unrelated]) store.set(`mirror:sess-1:${m.thread}`, m)
+  const w = world(on, { store, storeSnapshots: true })
+  on('turn.complete', () => ({ text: '' }))
+  const ended: any = { answer: '', durationMs: 1, isAborted: true, turnId: 'aborted-parent', agentId: child.parentHost, reason: 'aborted' }
+  await Promise.all([$.turn.complete(ended), $.turn.complete(ended)])
+  const stops = w.writes.filter(w => w.path.includes('/interrupt-')).map(w => JSON.parse(w.text).threadId).sort()
+  expect(stops).toEqual([child.thread, grandchild.thread].sort())
+  expect(w.writes.some(w => w.path.endsWith('/interrupt'))).toBe(false)
+  expect(w.spawned).toEqual([])
+  expect(w.core).toEqual([])
+})
+
+test('batch 8 store recovery failure still stops a known mirror on parent abort', async ($, on) => {
+  const m = savedMirror()
+  const journal = nestedJournal.split('\n').slice(0, 2).join('\n') + '\n'
+  const w = world(on, { task: m.token, store: mirrorStore(m), storeKeysThrows: true,
+    readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? journal : text })
+  on('turn.complete', () => ({ text: '' }))
+  await step($, m.host)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'turn-1', agentId: m.parentHost, reason: 'aborted' } as any)
+  expect(w.writes.filter(w => w.path.includes('/interrupt-')).length).toBe(1)
+  expect(w.logs.some(line => line.includes('mirror cascade recovery unavailable'))).toBe(true)
+  expect(w.spawned).toEqual([])
+})
+
+for (const state of ['completed', 'failed', 'interrupted']) test(`batch 8 source ${state} settles once without an interrupt echo`, { options: { progressIntervalMs: 0 } }, async ($, on) => {
+  const m = savedMirror()
+  const terminal = state === 'completed' ? { type: 'turn.completed' } : { type: 'turn.failed', status: state, error: { message: state } }
+  const journal = [nestedSource({ type: 'agentMessage', id: 'final', text: 'actual child report' }),
+    { ...terminal, thread_id: N_CHILD, turn_id: N_CT }].map(e => JSON.stringify(e) + '\n').join('')
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? journal : path.endsWith('/owner.json') ? JSON.stringify({ generation: m.generation, ended: true }) : text })
+  on('turn.complete', () => ({ text: '' }))
+  const s = await step($, m.host)
+  expect(handback(s.result)).toContain('actual child report')
+  if (state !== 'completed') expect(handback(s.result)).toContain(`codex failed: exit 1: ${state}`)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'turn-1', agentId: m.host, reason: 'answer' } as any)
+  const stored: any = w.store.get(`mirror:sess-1:${N_CHILD}`)
+  expect(stored.state).toBe(state === 'interrupted' ? 'aborted' : state)
+  expect(w.writes.filter(w => w.path.includes('/interrupt-'))).toEqual([])
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
+
+for (const status of ['accepted', 'rejected', 'unknown', 'missing']) test(`batch 8 steer ${status} persists its outcome across journal recovery without resubmission`, async ($, on) => {
+  const id = `${N_CHILD}-1-source-uuid`
+  const m = savedMirror('host-recovered-message', { messages: [{ id, status: 'submitted' }] })
+  const ack = status === 'missing' ? '' : JSON.stringify({ type: 'codexmod.steer', thread_id: N_CHILD, turn_id: N_CT, id, status }) + '\n'
+  const journal = ack + nestedJournal
+  const w = world(on, { task: m.token, store: mirrorStore(m), readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? journal : path.endsWith('/owner.json') ? JSON.stringify({ generation: m.generation, ended: true }) : text })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const s = await step($, m.host, i)
+    if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(s.result); break }
+    await runCalls($, s.chunks, m.host)
+  }
+  expect(final).toContain('child checked the fixture')
+  const rec: any = w.store.get(`agent:sess-1:${m.host}`)
+  expect(rec.mirror.messages).toEqual([{ id, status: status === 'missing' ? 'unknown' : status }])
+  if (status === 'missing') expect(final).toContain('outcome unknown')
+  expect(w.writes.filter(w => w.path.includes('/steer-'))).toEqual([])
+  expect(w.spawned).toEqual([])
+})
+
+test('batch 8 failed control checkpoint never submits a steer and reports the unknown outcome', async ($, on) => {
+  const m = savedMirror()
+  const w = world(on, { task: m.token, store: mirrorStore(m), storeReject: key => key.startsWith('agent:') })
+  await $.session.append({ agentId: m.host, uuid: 'uncheckpointed-message', origin: { kind: 'coordinator' }, door: 'attachment',
+    message: { role: 'system', content: '<system-reminder>The coordinator sent a message while you were working:\nDo this once\nAddress this before completing your current task.</system-reminder>' } } as any)
+  expect(w.writes.filter(w => w.path.includes('/steer-'))).toEqual([])
+  expect(w.logs.some(line => line.includes('mirror steer unknown: checkpoint unavailable'))).toBe(true)
+  expect(w.spawned).toEqual([])
 })
 
 test('nested launch guards refuse unowned type/token and malformed display references without reaching native core', async ($, on) => {
