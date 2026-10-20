@@ -445,7 +445,9 @@ hook worker and mirror targets have no recoverable live status; the main caller
 gets explicit `available:false` and must use the final report. A subagent caller
 without a live parent binding is refused. No terminal state is inferred from
 saved records or host task badges. Completed/restart/mirror status reads remain
-deferred, and fresh Desktop session acceptance has not been run for this change.
+deferred. A fresh Desktop session verified main-parent queries with
+`app-server`/`auto`; see the [local installation acceptance](docs/codex-ui-map.md#local-installation-acceptance).
+Nested-parent Desktop acceptance remains unverified.
 
 Full footers retain the full thread ID and show direct usage plus `tree` usage when descendants exist. Exec follow-ups subtract the last known cumulative full-thread baseline; duplicate completion totals replace each other. Unknown or interrupted baselines are labeled partial/unknown instead of charging historical totals to the next run. App-server uses response IDs or guarded turn deltas, including final usage arriving after completion. Transport switches share the persisted thread total when available.
 Tree counts already include direct usage: never add the two. Exec reports known direct usage as a lower bound with missing descendant usage; app-server adds observed descendants once by source identity. Failed capacity-attempt usage, when known, is shown separately before the resumed launch. Responses and cumulative turn snapshots are deduplicated; cache and reasoning

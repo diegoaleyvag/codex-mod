@@ -52,11 +52,41 @@ Mirrors and end/restart/missing runs do not support progress recovery. Main
 callers get `available:false` with a final-report fallback; subagent callers
 without a live parent binding are refused. Host Completed badges and saved
 records never become inferred source completion. Completed/restart/mirror reads
-and fresh Desktop-session acceptance remain deferred. `codex_message_status`
+remain deferred. Main-parent Desktop acceptance is recorded below; nested-parent
+Desktop acceptance remains unverified. `codex_message_status`
 continues to report SendMessage receipts only, not agent progress or approval
 delivery. Existing `codex-sandbox: read-only` already enforces review isolation;
 project/caller setup owns environments, with no `codex-env` support, automatic
 activation or tool-version probing added here.
+
+### Local installation acceptance
+
+The owner authorized integrating the reviewed candidate into the principal local
+checkout. Commit `38adee8` was fast-forwarded into `main`; the directory marketplace
+and `plugin list --json` select that checkout through `readFromFolder`. Plugin
+options were preserved byte-for-byte. This is an unreleased local enhancement
+on manifest version 1.2.1; the published 1.2.1 tag was not changed.
+
+After quitting and reopening Desktop, a new **This computer** session without a
+folder/environment used Sonnet 5.5 medium to launch one background Codex Sol 6.1
+medium worker. Of four status queries, two observed its single `sleep 25` command
+in progress, about 8.2 and 14.6 seconds after launch. Public commentary, one active
+action and zero pending approvals/questions were visible to the parent.
+`observedAt` advanced while `lastSourceObservedAt` stayed fixed. Effective facts
+reported `app-server`, `danger-full-access`, network enabled and `auto`, matching
+the existing owner settings. No network access or approval challenge was tested.
+
+The real handback returned `PROGRESS_DESKTOP_OK`; the next query returned
+`available:false` with the final-report fallback. The source rollout was archived
+and independently contained exactly one command invocation. Native tool details
+and the final summary were inspected in Desktop. The host's existing
+SubagentHandback Auto-classifier-unavailable notice remained visible; this test
+does not claim a host safety review. Nested-parent Desktop queries and broader
+task-card placement remain unverified. Earlier isolated headless probes cover
+both transports with read-only/never, while other mode/identity cases have test
+coverage. The reviewed payload passed 795 hook and 165 Node tests; strict
+validation and the seven status projection tests also passed from the principal
+checkout after integration.
 
 ## Map
 
