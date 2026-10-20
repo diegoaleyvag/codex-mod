@@ -90,6 +90,31 @@ test('total serialized budget applies when many individual fields are below thei
   assert.equal(compact.thread, 'resume-me')
 })
 
+test('saturated metadata retains history recovery and quarantine flags even after cache loss', async () => {
+  // Stress the compactor's accepted per-field limit, including required text
+  // fields. Append history flags last so incidental object order cannot save them.
+  const crowded = Object.fromEntries(['model', 'effort', 'sandbox', 'agentName', 'thread', 'session', 'parentHost', 'parentThread',
+    'control', 'generation', 'token', 'launch', 'state', 'host', 'handbackLock', 'lastTaskFingerprint', 'launchKeyFingerprint',
+    'capacityRetryKeyFingerprint'].map(key => [key, 'x'.repeat(FIELD_BUDGET - 20)]))
+  const optional = Object.fromEntries(Array.from({ length: 4000 }, (_, i) => [`optional${i}`, 1]))
+  const value = { ...record(), ...crowded, ...optional, historyArchived: true, historyAmbiguous: true }
+  for (const diskFails of [false, true]) {
+    const h = host({ diskFails })
+    assert.equal(await writeStoreState(h.$, 'agent:s:history', value), !diskFails)
+    const metadata = structuredClone(h.store.get('agent:s:history'))
+    assert.ok(JSON.stringify(metadata).length <= RECORD_BUDGET)
+    assert.equal(metadata.historyArchived, true)
+    assert.equal(metadata.historyAmbiguous, true)
+    assert.deepEqual(Object.keys(metadata).slice(0, 2), ['historyArchived', 'historyAmbiguous'])
+    assert.ok(Object.keys(optional).some(key => metadata[key] === undefined))
+    h.files.clear()
+    const restored = await readStoreState(h.$, 'agent:s:history', metadata)
+    assert.equal(restored.recoveryUnavailable, true)
+    assert.equal(restored.historyArchived, true)
+    assert.equal(restored.historyAmbiguous, true)
+  }
+})
+
 test('rejected writes return normally, log debug, and retain source state in cache', async () => {
   const h = host({ reject: true })
   assert.equal(await writeStoreState(h.$, 'agent:s:a', { ...record(), wire: { records: ['source'], rows: {} } }), false)

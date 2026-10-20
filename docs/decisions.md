@@ -97,3 +97,95 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
 - Consequences: recovery supplies presentation only. It never restores a held answer,
   executes an action or changes the guards. This fixes a reproducible recovery gap;
   it does not establish the cause of Desktop's generic Coordinator rows.
+
+## D-011 - Hide new plugin sessions through an opt-in source classification (superseded by D-012)
+- Date: 2026-10-19 (unreleased).
+- Decision: `hideSessions` defaults to false. When enabled, new root threads use
+  `chatgpt_hidden` through exec's `--thread-source` or app-server's `threadSource`.
+  Resumes never retag an existing thread; real children retain source parent/subagent metadata.
+- Why: the inspected Codex/Work app filters this private marker from its chat catalogs
+  and notifications, while Codex accepts and persists it without ephemeral sessions.
+  Archiving after completion would still expose running sessions and miss interrupted runs.
+- Consequences: history stays persistent in the same Codex home, without auth or database
+  changes. Existing sidebar entries need separate archiving. Other host versions and
+  live UI visibility require verification; accepting an arbitrary source is not proof
+  of hiding. No safety guards or transport fallback semantics change.
+
+## D-012 - Archive owned source sessions after process completion
+- Date: 2026-10-19 (unreleased). Supersedes D-011.
+- Decision: `archiveSessions` defaults to false. When enabled, the hook uses
+  `codex archive -- <UUID>` only for its exact owned source thread after the
+  process iterator ends and its result resolves. Both transports and exec fallback
+  share this cleanup. Mirrors are excluded; conflicting source identities persist
+  a quarantine that disables all future history operations, including after reload.
+  A follow-up best-effort unarchives the same thread in its recorded Codex home
+  before one ordinary resume; a persisted archive flag supports this after opt-out.
+- Why: the D-011 candidate failed live protocol verification: `thread/read` retains
+  `chatgpt_hidden`, but `thread/list` drops it before the Desktop catalog sees the
+  thread. Acceptance and persistence of a source marker do not establish hiding.
+  The supported archive/unarchive lifecycle preserves history and exact-ID resume
+  without changing authentication or editing Codex's database or history files.
+- Consequences: running sessions can appear, and aborts, timeouts, worker loss or
+  process crashes can miss cleanup. Older sessions and real child sessions need
+  separate manual archiving after they stop. CLI unarchive errors do not distinguish
+  already active threads from failures, so the same-thread resume validates state;
+  no new-thread fallback or history-command retry is allowed. Archive failure adds
+  a short notice without losing the result. No safety guard or source policy changes.
+
+## D-013 - Owner grants bound execution and one-shot approvals
+- Date: 2026-10-19 (unreleased). Refines D-002 and D-006.
+- Decision: user options and supported user extraConfig keys grant execution authority;
+  named launch headers may request only bounded modes, paths, roots and network.
+  Explicit cwd requests require an existing registered worktree of the parent Git
+  repository or a canonical owner-allowed directory. Both transports force the
+  resolved policy; snapshots and a required recovery fingerprint pin each thread.
+  Unknown legacy execution state becomes a disclosed conservative baseline, never
+  a reason to inherit newly expanded config. No policy header is applied by steering.
+- Why: prompt prose cannot grant filesystem/network rights, session cwd cannot write
+  a sibling worktree automatically, and inherited exec approval config disagreed
+  with app-server's hardcoded never policy. Full access remains a conscious owner
+  opt-in and must be described as unrestricted, including network and protected Git.
+- Consequences: options override ambient execution config.toml; supported owner
+  extraConfig execution keys override option defaults before launch narrowing.
+  Existing users relying on ambient policy must migrate explicitly. Interactive
+  modes require app-server and never fall back to exec. Manual native controls are
+  host-dependent and not Desktop-accepted; unanswered requests expire without
+  consent. Native auto uses installed Codex auto_review. Orchestrator mode exposes
+  only the exact source agent's authoritative immediate Claude parent to a real
+  inspect/decide tool; background launch and parent polling are required. Command
+  and file approvals are one-shot; permission grants use requested literal subsets
+  and turn scope. Method/RPC/token/thread/turn/item/callback/kind identity, lifecycle
+  cancellation and existing replay/ownership/handback guards all remain enforced.
+  No experimental RPC capability or persistent approval cache is enabled.
+
+## D-014 - Revalidate the original cwd grant and approve only visible source proposals
+- Date: 2026-10-19 (unreleased). Refines D-013.
+- Decision: execution snapshot v2 records whether cwd came from the original
+  session, a registered worktree with an original parent/common-directory anchor,
+  or an owner root. Every resume rechecks the original basis against current
+  grants and registration without retargeting the thread. Unanchored v1 snapshots
+  fail explicitly instead of guessing their original authority. An unsuccessful
+  Git metadata probe cannot silently establish nonrepository session authority.
+- Why: a saved external cwd must not survive revocation merely because the host
+  moved onto it, and file-approval RPC parameters do not contain the proposed patch.
+- Consequences: file acceptance requires the exact matching owned in-progress item,
+  presented paths/kinds/diff and an unchanged complete proposal snapshot. Proposals
+  above 32768 characters, missing/empty/stale proposals and opaque command or stdin
+  requests can be declined/cancelled but never blindly accepted. The runner checks
+  its own source evidence again at response delivery. Network destinations remain
+  distinct from command or stdin payloads. Parent authority requires complete host
+  identity and known active lifecycle state; an absent parentId is accepted only
+  through the installed AgentInfo contract that documents a main-loop launch.
+
+## D-015 - Writable-root requests select exact canonical owner grants
+- Date: 2026-10-19 (unreleased). Refines D-013 and D-014.
+- Decision: every requested or resumed additional writable root must equal an
+  explicitly owner-granted root after canonical resolution. A launch may omit
+  granted roots, but cannot select a descendant without a separate explicit grant.
+- Why: Codex can retain protected metadata exclusions under a parent workspace
+  root while explicitly naming a child such as `.git` enables writes there.
+  Lexical or canonical containment therefore does not establish narrower access.
+- Consequences: equality applies to protected and ordinary descendants alike,
+  including `.codex`, `.agents` and normal subdirectories. Symlink aliases of an
+  exact grant work; retargeted aliases and revoked exact grants fail on resume.
+  A broader parent grant cannot replace a removed exact metadata grant.

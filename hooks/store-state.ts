@@ -51,7 +51,7 @@ export function compactStoreState(value: State): State {
   }
   // A total guard is necessary even when every individual field is small.
   // Required identity/guard fields go first; optional snapshots are expendable.
-  const required = ['model', 'effort', 'sandbox', 'agentName', 'thread', 'updatedAt', 'version', 'session', 'parentHost', 'parentThread', 'control', 'generation', 'token', 'depth', 'launch', 'state', 'host', 'handedBack', 'handback', 'handbackLock', 'userCount', 'launchesSinceNew', 'runSeq', 'lastTaskFingerprint', 'launchKeyFingerprint', 'capacityRetryKeyFingerprint', 'guardTripKeyFingerprint', 'guardTrip', 'launches', 'recoveryUnavailable']
+  const required = ['executionFingerprint', 'historyArchived', 'historyAmbiguous', 'model', 'effort', 'sandbox', 'agentName', 'thread', 'updatedAt', 'version', 'session', 'parentHost', 'parentThread', 'control', 'generation', 'token', 'depth', 'launch', 'state', 'host', 'handedBack', 'handback', 'handbackLock', 'userCount', 'launchesSinceNew', 'runSeq', 'lastTaskFingerprint', 'launchKeyFingerprint', 'capacityRetryKeyFingerprint', 'guardTripKeyFingerprint', 'guardTrip', 'launches', 'recoveryUnavailable']
   const bounded: State = {}
   for (const key of [...required, ...Object.keys(out).filter(k => !required.includes(k))]) {
     if (out[key] !== undefined && size({ ...bounded, [key]: out[key], cachedState: true, recoveryUnavailable: true, cacheFingerprint: { length: 0, sha256: '0'.repeat(64) } }) <= RECORD_BUDGET) bounded[key] = out[key]

@@ -447,7 +447,7 @@ test('--config values are parsed like TOML scalars and arrays', async () => {
   const r = start('normal', { extra: ['--config', 'features.plugins=false', '--config', 'web_search="disabled"', '--config', 'n=3', '--config', "a=['x','y']", '--config', 'raw=hello'] })
   await r.exit
   const cfg = r.sent().find(m => m.method === 'thread/start').params.config
-  assert.deepEqual(cfg, { model_reasoning_effort: 'low', 'features.plugins': false, web_search: 'disabled', n: 3, a: ['x', 'y'], raw: 'hello' })
+  assert.deepEqual(cfg, { model_reasoning_effort: 'low', 'features.plugins': false, web_search: 'disabled', n: 3, a: ['x', 'y'], raw: 'hello', approval_policy: 'never', approvals_reviewer: 'user' })
   r.cleanup()
 })
 
@@ -1095,5 +1095,120 @@ test('R6 app-server capacity text is retained for the hook retry; sidecar itself
     assert.ok(r.lines().some(e => e.type === 'turn.failed' && e.error.message === 'Selected model is at capacity. Please try a different model.'))
     assert.equal(r.sent().filter(m => m.method === 'turn/start').length, 1)
     assert.equal(r.sent().find(m => m.method === 'thread/resume').params.threadId, 'same-thread')
+  } finally { r.cleanup() }
+})
+
+// Execution approvals use installed method schemas and never replay source commands.
+const { approvalIdentity, fileApprovalEvidence, commandApprovalContext } = await import('../hooks/approval-policy.mjs')
+const proposedRunnerFile = (r, q) => {
+  const source = r.lines().findLast(l => l.source?.item?.id === q.params.itemId)?.source
+  return source && fileApprovalEvidence(q, { ...source, itemId: source.item.id, cwd: r.sent().find(m => m.method === 'thread/start').params.cwd })
+}
+for (const mode of ['ask', 'orchestrator']) for (const kind of ['command', 'file', 'permissions']) test(`execution ${mode} ${kind}: exact one-shot approval, stale identity and forged session grants refused`, async () => {
+  const r = start(`capability-approval-${kind}`, { extra: ['--approval-mode', mode] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    const body = { ...approvalIdentity(q), decision: 'accept', actor: mode === 'ask' ? 'human' : 'orchestrator', ...(kind === 'file' ? { fileChanges: proposedRunnerFile(r, q) } : {}) }
+    assert.equal(r.sent().some(m => m.id === 701 && !m.method), false)
+    const invalid = [{ ...body, method: 'foreign' }, { ...body, approvalId: 'foreign' }, { ...body, kind: 'command' }, { ...body, decision: 'acceptForSession' }, { ...body, actor: 'source' }]
+    if (kind !== 'command') invalid.splice(2, 1)
+    if (kind === 'permissions') invalid.push({ ...body, permissions: { fileSystem: { write: ['/'] } }, scope: 'session' })
+    for (let i = 0; i < invalid.length; i++) {
+      writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(invalid[i]))
+      await r.waitFor(() => r.lines().filter(l => l.type === 'codexmod.responseRejected').length >= i + 1)
+      assert.equal(r.sent().some(m => m.id === 701 && !m.method), false)
+    }
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(body))
+    assert.equal((await r.exit).code, 0)
+    const replies = r.sent().filter(m => m.id === 701 && !m.method)
+    assert.equal(replies.length, 1)
+    assert.deepEqual(replies[0].result, kind === 'permissions' ? { permissions: q.params.permissions, scope: 'turn' } : { decision: 'accept' })
+    assert.equal(r.sent().find(m => m.method === 'thread/start').params.approvalPolicy, 'on-request')
+    assert.equal(r.sent().find(m => m.method === 'turn/start').params.approvalsReviewer, 'user')
+  } finally { r.cleanup() }
+})
+for (const suffix of ['resolved', 'finish']) test(`execution approvals: ${suffix} invalidates a pending token`, async () => {
+  const r = start(`capability-approval-command-${suffix}`, { extra: ['--approval-mode', 'ask'] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'cancelled'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), decision: 'accept', actor: 'human' }))
+    await r.exit
+    assert.equal(r.sent().filter(m => m.id === 701 && !m.method && m.result?.decision === 'accept').length, 0)
+  } finally { r.cleanup() }
+})
+test('execution approval interruption and unavailable controls supply no consent', async () => {
+  for (const mode of ['interrupt', 'timeout', 'unsupported']) {
+    const r = start('capability-approval-command', { extra: ['--approval-mode', 'ask', '--approval-timeout-ms', mode === 'timeout' ? '150' : '3000'] })
+    try {
+      await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+      const q = r.lines().find(l => l.type === 'codexmod.request')
+      if (mode === 'interrupt') writeFileSync(join(r.control, 'interrupt'), '')
+      if (mode === 'unsupported') writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), unsupported: true, actor: 'human' }))
+      await r.exit
+      assert.equal(r.sent().some(m => m.id === 701 && m.result?.decision === 'accept'), false)
+      assert.ok(r.lines().some(l => l.type === 'codexmod.request' && ['unsupported', 'cancelled'].includes(l.status)))
+    } finally { r.cleanup() }
+  }
+})
+test('native auto review is explicit at thread and turn start; experimental RPC remains disabled', async () => {
+  const r = start('normal', { extra: ['--approval-mode', 'auto', '--config', 'approval_policy="never"', '--config', 'approvals_reviewer="user"'] })
+  try {
+    assert.equal((await r.exit).code, 0)
+    for (const method of ['thread/start', 'turn/start']) {
+      const p = r.sent().find(m => m.method === method).params
+      assert.equal(p.approvalPolicy, 'on-request')
+      assert.equal(p.approvalsReviewer, 'auto_review')
+      if (p.config) assert.equal(p.config.approvals_reviewer, 'auto_review')
+    }
+    assert.equal(r.sent().find(m => m.method === 'initialize').params.capabilities.experimentalApi, false)
+  } finally { r.cleanup() }
+})
+for (const decision of ['decline', 'cancel']) for (const kind of ['command', 'file', 'permissions']) test(`execution ${kind} ${decision} returns one refusal without a grant`, async () => {
+  const r = start(`capability-approval-${kind}`, { extra: ['--approval-mode', 'ask'] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), decision, actor: 'human' }))
+    await r.exit
+    const replies = r.sent().filter(m => m.id === 701 && !m.method)
+    assert.equal(replies.length, 1)
+    assert.deepEqual(replies[0].result, kind === 'permissions' ? { permissions: {}, scope: 'turn' } : { decision })
+  } finally { r.cleanup() }
+})
+
+for (const condition of ['missing', 'stale']) test(`file approval ${condition} proposal cannot be accepted but can be declined`, async () => {
+  const r = start(`capability-approval-file-${condition}`, { extra: ['--approval-mode', 'ask'] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    const evidence = proposedRunnerFile(r, q)
+    if (condition === 'stale') await r.waitFor(() => r.lines().some(l => l.source?.item?.id === q.params.itemId && l.source?.item?.status === 'completed'))
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), decision: 'accept', actor: 'human', fileChanges: evidence }))
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.responseRejected'))
+    assert.equal(r.sent().some(m => m.id === 701 && m.result?.decision === 'accept'), false)
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), decision: 'decline', actor: 'human' }))
+    await r.exit
+    assert.deepEqual(r.sent().find(m => m.id === 701 && !m.method).result, { decision: 'decline' })
+  } finally { r.cleanup() }
+})
+for (const context of ['opaque', 'stdin', 'item', 'network']) test(`command approval ${context} requires actionable exact context`, async () => {
+  const r = start(`capability-approval-command-${context}`, { extra: ['--approval-mode', 'ask'] })
+  try {
+    await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.request' && l.status === 'pending'))
+    const q = r.lines().find(l => l.type === 'codexmod.request')
+    const source = r.lines().findLast(l => l.source?.item?.id === q.params.itemId)?.source
+    const shown = commandApprovalContext(q, source && { ...source, itemId: source.item.id, cwd: r.sent().find(m => m.method === 'thread/start').params.cwd })
+    const body = { ...approvalIdentity(q), decision: 'accept', actor: 'human', ...(shown ? { commandContext: shown } : {}) }
+    writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify(body))
+    if (['opaque', 'stdin'].includes(context)) {
+      await r.waitFor(() => r.lines().some(l => l.type === 'codexmod.responseRejected'))
+      assert.equal(r.sent().some(m => m.id === 701 && m.result?.decision === 'accept'), false)
+      writeFileSync(join(r.control, `response-${q.token}.json`), JSON.stringify({ ...approvalIdentity(q), decision: 'decline', actor: 'human' }))
+    }
+    await r.exit
+    assert.deepEqual(r.sent().find(m => m.id === 701 && !m.method).result, { decision: ['opaque', 'stdin'].includes(context) ? 'decline' : 'accept' })
+    if (context === 'network') assert.deepEqual(shown.network, { host: 'api.example.test', protocol: 'https' })
   } finally { r.cleanup() }
 })

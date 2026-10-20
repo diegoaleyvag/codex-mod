@@ -106,8 +106,8 @@
 // Global rules (userConfig `globalRules`, default on): when off (experimental),
 // Codex runs with CODEX_HOME set to a plugin-owned folder holding symbolic
 // links to the real home's auth.json, config.toml and models_cache.json only,
-// so the user-level AGENTS.md is not loaded. Nothing in the real home is
-// written or deleted by this module.
+// so the user-level AGENTS.md is not loaded. The module leaves auth and config
+// files alone; optional session history changes use the Codex CLI.
 
 import { admitMirrorLaunch, mirrorHostMatches, mirrorLaunchDigest, mirrorLaunchDiagnostic, MirrorDiagnostics, isMirrorAutoModeNoVerdict, prepareMirrorRetry } from './mirror-launch.ts'
 import type { MirrorAuthority } from './mirror-launch.ts'
@@ -127,6 +127,9 @@ import { RowCache, saveRow, loadRow } from './row-cache.ts'
 import type { RowPresentation } from './row-cache.ts'
 import { boundedNames, validCapabilities, resolvePolicy, policyTask, configHash, capacityFallback } from './run-policy.ts'
 import type { RolePolicy, EffectiveConfig } from './run-policy.ts'
+import { executionRequest, resolveExecution, executionOverrides, executionOverride, permissionEvidence, APPROVAL_MODES } from './execution-policy.ts'
+import type { ApprovalMode, ExecutionPolicy } from './execution-policy.ts'
+import { APPROVAL_METHODS, approvalRequest, approvalIdentity, matchesApproval, approvalResponse, approvalParent, parentMayDecide, fileApprovalEvidence, FILE_APPROVAL_UNAVAILABLE, commandApprovalContext, COMMAND_APPROVAL_UNAVAILABLE } from './approval-policy.mjs'
 import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
@@ -319,6 +322,12 @@ export type Config = {
   codexPath?: string
   lean: boolean
   globalRules: boolean
+  archiveSessions: boolean
+  approvalMode: ApprovalMode
+  allowedApprovalModes: string[]
+  networkAccess: boolean
+  additionalWritableRoots: string[]
+  allowedCwdRoots: string[]
   generic: Profile
   projectRoles: boolean
   modelAgents: boolean
@@ -401,6 +410,12 @@ export function parseConfig(raw: unknown): Config {
     codexPath: codexPath === '' ? undefined : codexPath,
     lean: bool('lean', true),
     globalRules: bool('globalRules', true),
+    archiveSessions: bool('archiveSessions', false),
+    approvalMode: oneOf<ApprovalMode>('approvalMode', 'never', APPROVAL_MODES),
+    allowedApprovalModes: list('allowedApprovalModes', []).filter(v => (APPROVAL_MODES as readonly string[]).includes(v)),
+    networkAccess: bool('networkAccess', false),
+    additionalWritableRoots: list('additionalWritableRoots', []),
+    allowedCwdRoots: list('allowedCwdRoots', []),
     generic: {
       model: model !== '' && /^[\w.:-]+$/.test(model) ? model : '',
       effort: /^[a-z]+$/.test(effort) ? effort : (bad('defaultEffort', 'not an effort name'), FALLBACK_EFFORT),
@@ -443,7 +458,13 @@ export type AgentRecord = Profile & {
   selection?: { session: string; toolUseId: string; type: string; launchModel: string; launchEffort: string; note?: string }
   modelRowIds?: string[]
   thread?: string
+  // Archive state survives option changes so a follow-up can restore this thread.
+  historyArchived?: boolean
+  // Conflicting source IDs permanently remove this record's history authority.
+  historyAmbiguous?: true
   effectiveConfig?: EffectiveConfig
+  effectiveExecution?: ExecutionPolicy
+  executionFingerprint?: string
   effectiveFingerprint?: string
   fallbackModels?: string[]
   capacityRetryKey?: string
@@ -504,6 +525,7 @@ export type SourceRecord = {
   turnId?: string
   itemId?: string
   cwd?: string
+  executionPolicy?: ExecutionPolicy
   startedAtMs?: number
   completedAtMs?: number
   item?: Record<string, any>
@@ -1084,7 +1106,7 @@ export function catalogLine(catalog: readonly ModelInfo[]): string {
 /** One resolver for spawn presentation and execution. Explicit prompt errors
  * still fail the run; an unsupported native Agent effort uses the default. */
 export function resolveProfile(base: Profile, task: string, list?: readonly ModelInfo[], nativeEffort?: unknown): { profile: Profile; rest: string; note?: string; invalid?: string } {
-  const o = parseOverrides(task)
+  const o = parseOverrides(executionRequest(task).rest)
   const model = o.model ?? (base.model || list?.[0]?.slug || FALLBACK_MODEL)
   const info = list?.find(m => m.slug === model)
   const defaultEffort = base.effort || info?.defaultEffort || FALLBACK_EFFORT
@@ -1195,15 +1217,94 @@ function shellLabelParts(command: string): string[] | undefined {
 const COMMAND_FAMILIES = ['git', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'cargo', 'go', 'make', 'uv', 'pip', 'swift', 'gh']
 const commandProgram = (words: string[]) => {
   const prog = (words[0] ?? '').split('/').pop() ?? ''
-  return /^[\w.+-]{1,40}$/.test(prog) ? prog : undefined
+  return /^[\w.+-]{1,40}$/.test(prog) && activityOperand(prog) ? prog : undefined
 }
 const commandName = (words: string[], prog: string) => {
   const sub = COMMAND_FAMILIES.includes(prog) ? words.slice(1).find(w => !w.startsWith('-')) : undefined
-  return sub && /^[\w.+-]{1,40}$/.test(sub) ? `${prog} ${sub}` : prog
+  return sub && /^[\w.+-]{1,40}$/.test(sub) && activityOperand(sub) ? `${prog} ${sub}` : prog
+}
+
+// Titles expose selected literal operands, never arbitrary flags, environment
+// assignments or script bodies. Keep controls and common credential forms out.
+function activityOperand(value: unknown, max = 72): string | undefined {
+  if (typeof value !== 'string' || !value || /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(value) ||
+    /(?:\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]|\bBearer\s|\b(?:sk-|gh[pousr]_)[\w-]{8,}|-----BEGIN)/i.test(value)) return undefined
+  return value.length > max ? `${value.slice(0, 24)}...${value.slice(-(max - 27))}` : value
+}
+
+const activityPath = (path: string, cwd?: string) => {
+  if (!path || /[\x00-\x1f\x7f]/.test(path) || path.split('/').includes('..')) return undefined
+  if (!path.startsWith('/') && !cwd?.startsWith('/')) return path.replace(/^\.\//, '')
+  return '/' + (path.startsWith('/') ? path : `${cwd}/${path}`).split('/').filter(p => p && p !== '.').join('/')
+}
+
+function readActivity(words: string[], prog: string): string | undefined {
+  let args = words.slice(1)
+  let verb = 'Read'
+  if (prog === 'head' || prog === 'tail') {
+    verb = prog === 'head' ? 'Read start of' : 'Read end of'
+    if (args[0] === '-n' && /^\+?\d+$/.test(args[1] ?? '')) args = args.slice(2)
+  } else if (prog === 'nl') {
+    verb = 'Read with line numbers'
+    if (args[0] === '-ba') args = args.slice(1)
+  } else if (prog === 'sed') {
+    if (args[0] !== '-n' || !/^\d+(?:,\d+)?p$/.test(args[1] ?? '')) return undefined
+    verb = 'Read part of'
+    args = args.slice(2)
+  } else if (prog !== 'cat') return undefined
+  if (args[0] === '--') args = args.slice(1)
+  if (args.length !== 1 || args[0]!.startsWith('-')) return undefined
+  const path = activityOperand(args[0])
+  return path ? `${verb} ${path}` : undefined
+}
+
+function testActivity(words: string[], prog: string): string | undefined {
+  let args = words.slice(1)
+  if (['python', 'python3'].includes(prog) && args[0] === '-m' && args[1] === 'pytest') args = args.slice(2)
+  else if (prog === 'uv' && args[0] === 'run' && args[1] === 'pytest') args = args.slice(2)
+  else if (prog !== 'pytest') return undefined
+  const targets = args.filter(arg => !['-q', '-v', '-vv', '-x', '-s', '--verbose', '--quiet', '--exitfirst'].includes(arg))
+  // Unknown options may consume the next word; never present that value as a target.
+  if (targets.length > 2 || targets.some(t => t.startsWith('-') || !activityOperand(t))) return undefined
+  return `Run pytest${targets.length ? ` ${targets.map(t => activityOperand(t)).join(', ')}` : ''}`
+}
+
+function sourceActivity(words: string[], prog: string, part: string, command: string, source?: SourceRecord): string | undefined {
+  const item = source?.item
+  if (!item || item.type !== 'commandExecution' || item.command !== command ||
+    !Array.isArray(item.commandActions) || item.commandActions.length > 6) return undefined
+  const matches = item.commandActions.filter((a: any) => a && typeof a.command === 'string' &&
+    (a.command === part || (part === unwrapShell(command) && a.command === command)))
+  if (matches.length !== 1) return undefined
+  const action = matches[0]
+  if (action.type !== 'search' || !['rg', 'grep'].includes(prog)) return undefined
+  let query: string | undefined
+  const paths: string[] = []
+  let options = true
+  for (let n = 1; n < words.length; n++) {
+    const word = words[n]!
+    if (options && word === '--') { options = false; continue }
+    if (options && word.startsWith('-')) {
+      if (['-n', '-i', '-F', '-S', '-s', '-l', '-H', '-r', '-R', '-0', '--null', '--json', '--hidden', '--no-ignore', '--fixed-strings', '--files-with-matches', '--count-matches'].includes(word)) continue
+      if (['-g', '--glob', '-t', '--type', '-A', '-B', '-C', '--max-count'].includes(word) && words[n + 1] !== undefined) { n++; continue }
+      return undefined
+    }
+    if (query === undefined) query = word
+    else paths.push(word)
+  }
+  // The metadata must agree with the literal command, including its search root.
+  if (query !== action.query || paths.length !== 1 || paths[0] === '-' || typeof action.path !== 'string' ||
+    !activityPath(paths[0]!, source?.cwd) || activityPath(paths[0]!, source?.cwd) !== activityPath(action.path, source?.cwd)) return undefined
+  const label = activityOperand(query, 60)
+  const path = activityOperand(paths[0])
+  return label && path ? `Search ${label} in ${path}` : undefined
 }
 
 /** A short description of the whole command, without inferring its result. */
-export function describeCommand(command: string): string {
+export function describeCommand(command: string, source?: SourceRecord, original = command): string {
+  // Unwrapping is also used for display, but an expanding outer shell word
+  // cannot establish literal operands for a richer activity title.
+  if (original !== command && (original.length > 8192 || !literalWords(original))) return 'Run shell command'
   if (/^\s*(?:if|case)\b/.test(command)) return 'Run conditional shell command'
   if (/^\s*(?:for|while|until|select|function)\b/.test(command)) return 'Run compound shell command'
   const parts = shellLabelParts(command)
@@ -1212,20 +1313,29 @@ export function describeCommand(command: string): string {
   if (parts.some(p => /^(?:for|while|until|do|done|select|function)\b/.test(p))) return 'Run compound shell command'
   const commands = parts.map(p => literalWords(p))
   if (commands.some(words => !words || !commandProgram(words))) return 'Run shell command'
-  if (commands.length > 1) return `Run shell commands: ${commands.map(words => commandName(words!, commandProgram(words!)!)).join(', ')}`
+  if (commands.length > 1) {
+    const labels = commands.map((words, n) => {
+      const prog = commandProgram(words!)!
+      return sourceActivity(words!, prog, parts[n]!, original, source) ?? readActivity(words!, prog) ??
+        testActivity(words!, prog) ?? commandName(words!, prog)
+    })
+    return oneLine(`Run shell commands: ${labels.join(', ')}`, 240)
+  }
   const words = commands[0]!
   const prog = commandProgram(words)!
+  const activity = sourceActivity(words, prog, parts[0]!, original, source) ?? readActivity(words, prog) ?? testActivity(words, prog)
+  if (activity) return activity
   if (prog === 'sed') return words.includes('-i') ? 'Edit file in place' : 'Read part of a file'
   if (COMMAND_FAMILIES.includes(prog)) return `Run ${commandName(words, prog)}`
   return DESCRIBE[prog] ?? (prog ? `Run ${prog}` : 'Run a command')
 }
 
 /** A finished command as a `Bash` call answered with Codex's output and exit code. */
-export function commandAction(command: string, output: string, exitCode: number | null, status?: string): Action {
+export function commandAction(command: string, output: string, exitCode: number | null, status?: string, source?: SourceRecord): Action {
   const inner = unwrapShell(command)
   return {
     tool: 'Bash',
-    input: { command: inner, description: `${describeCommand(inner)}${exitCode === null ? ' (exit unreported)' : ''}` },
+    input: { command: inner, description: `${describeCommand(inner, source, command)}${exitCode === null ? ' (exit unreported)' : ''}` },
     result: {
       stdout: output,
       stderr: '',
@@ -1274,7 +1384,7 @@ export function mcpServerNames(toml: string): string[] {
 }
 
 const homeDir = async ($: EngineInterface): Promise<string> => ((await $.env.get('HOME')) ?? '').replace(/\/$/, '')
-/** The real Codex home: CODEX_HOME, else ~/.codex. Only ever read. */
+/** The real Codex home: CODEX_HOME, else ~/.codex. */
 const codexHome = async ($: EngineInterface): Promise<string> => (await $.env.get('CODEX_HOME')) || `${await homeDir($)}/.codex`
 
 /** The `-c` overrides of a lean launch, MCP servers read from the user's config.toml (read only). */
@@ -1320,6 +1430,28 @@ export async function shadowHome($: EngineInterface): Promise<string> {
   return shadow
 }
 
+/** History commands accept only a source UUID, never Codex's name-based fallback. */
+async function sessionHistory($: EngineInterface, codex: string, home: string, operation: 'archive' | 'unarchive', thread: string): Promise<boolean> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(thread)) {
+    $.ui.log(`codex-mod: session ${operation} skipped: source thread UUID unavailable`, { to: 'debug' })
+    return false
+  }
+  try {
+    // process.run has no env override. Pass an assignment through env as one
+    // argv entry, without a shell, so cleanup cannot target the ambient home.
+    const result = await $.process.run(['/usr/bin/env', `CODEX_HOME=${home}`, codex, operation, '--', thread], { timeoutMs: 10000 })
+    if (result.exitCode === 0) return true
+    $.ui.log(`codex-mod: session ${operation} ${thread} failed (exit ${result.exitCode}): ${oneLine(result.stderr, 300)}`, { to: 'debug' })
+  } catch (err) {
+    $.ui.log(`codex-mod: session ${operation} ${thread} failed: ${errText(err)}`, { to: 'debug' })
+  }
+  return false
+}
+
+/** Do not change history while another locally known consumer owns this source. */
+const historyInUse = (thread: string, home: string): boolean => [...runs.values()].some(run =>
+  !run.ended && !run.mirror && run.thread === thread && run.policy?.home === home)
+
 /** The argv of one launch (pure). */
 export function launchArgv(p: {
   codex: string
@@ -1328,6 +1460,7 @@ export function launchArgv(p: {
   resume?: string
   lean: string[]
   extra: readonly string[]
+  execution?: ExecutionPolicy
 }): string[] {
   const { prof, resume } = p
   return [
@@ -1335,6 +1468,7 @@ export function launchArgv(p: {
     ...(resume ? ['-c', `sandbox_mode="${prof.sandbox}"`] : ['--sandbox', prof.sandbox, '-C', p.cwd]),
     '-m', prof.model, '-c', `model_reasoning_effort="${prof.effort}"`, ...p.lean,
     ...p.extra.flatMap(kv => ['-c', kv]),
+    ...(p.execution ? executionOverrides(p.execution) : ['approval_policy="never"']).flatMap(kv => ['-c', kv]),
     ...(resume ? [resume] : []), '-',
   ]
 }
@@ -1355,13 +1489,15 @@ export function runnerArgv(p: {
   control: string
   questions?: boolean
   nestedAgents?: boolean
+  execution?: ExecutionPolicy
 }): string[] {
-  const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra]
+  const overrides = [...p.lean.filter((_, i) => p.lean[i - 1] === '-c'), ...p.extra, ...(p.execution ? executionOverrides(p.execution) : [])]
   return [
     p.node, p.runner, 'run', '--codex', p.codex, '--cwd', p.cwd,
     '--model', p.prof.model, '--effort', p.prof.effort, '--sandbox', p.prof.sandbox,
     ...(p.resume ? ['--thread', p.resume] : []),
     ...overrides.flatMap(kv => ['--config', kv]),
+    '--approval-mode', p.execution?.approvalMode ?? 'never',
     '--control', p.control,
     ...(p.questions ? ['--questions', 'choices'] : []),
     ...(p.nestedAgents === false ? ['--nested', 'false'] : []),
@@ -1426,6 +1562,8 @@ type Run = {
   prof: Profile
   cwd: string
   child: HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+  // Only a launched source owns history cleanup; mirrors never get this identity.
+  history?: { codex: string; home: string; archive: boolean; thread?: string; observed?: true; ambiguous?: true }
   thread?: string
   buffered: string
   stderrTail: string
@@ -1477,6 +1615,8 @@ type Run = {
   execBaseline?: Usage
   execTotal?: Usage
   policy?: EffectiveConfig
+  execution?: ExecutionPolicy
+  approvalParent?: { main?: boolean; agentId?: string; sourceId: string }
   configNote?: string
   capacityRetried?: boolean
   rawTask?: string
@@ -1511,6 +1651,8 @@ const nativeSources = new Map<string, { uuid: string; text: string }>()
 const nativeSends = new Map<string, { id: string; received?: string }>()
 const sendGates = new Map<string, Promise<void>>()
 let statusTool: string | undefined
+let approvalTool: string | undefined
+const pendingApprovals = new Map<string, { run: Run; question: Question }>()
 const MAX_DELIVERIES = 20
 // tool_use id -> the answer of one action call this module emitted.
 type HeldAnswer = { sessionId: string; agentId: string; action: Action; inputDigest: string; sourceDigest: string }
@@ -2204,6 +2346,7 @@ export const register: Register = (on, options) => {
     const held = heldMirrorCall(e, next.origin.plugin)
     flushMirrorDiagnostics($)
     if (held) return next(e)
+    if (e.tool === approvalTool) return approvalCall($, e)
     if (e.tool === statusTool) {
       if (e.agentId !== undefined || hasPrefix(e.tool_use_id)) return { deny: NOT_EXECUTED }
       const agentId = (e as any).targetAgentId
@@ -2282,7 +2425,7 @@ export const register: Register = (on, options) => {
     }
     return next(e)
   }).catch(($, e, next) => {
-    if (e.tool === statusTool) return { deny: NOT_EXECUTED }
+    if (e.tool === statusTool || e.tool === approvalTool) return { deny: NOT_EXECUTED }
     if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
     if (!guarded(e) && !unresolved(e)) return next(e)
     const held = typeof e.tool_use_id === 'string' ? answers.get(e.tool_use_id) : undefined
@@ -2293,7 +2436,7 @@ export const register: Register = (on, options) => {
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
   on('tool.check', async ($, e, next) => {
-    if (e.tool === statusTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
+    if (e.tool === statusTool || e.tool === approvalTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
     const held = heldMirrorCall(e, next.origin.plugin, 'check')
     flushMirrorDiagnostics($)
     if (held) return next(e)
@@ -2352,6 +2495,35 @@ export const register: Register = (on, options) => {
     if (questionRow && e.props.tool === displayTools.codex_question && owned?.tool === e.props.tool && questionRow.session === await sessionId($)) {
       const { Box, Text, Button } = $.ui.resolve(e)
       const q = questionRow.question
+      if (APPROVAL_METHODS.has(q.method)) {
+        const run = runs.get(questionRow.agent)
+        const valid = q.status === 'pending' && run && !run.ended && !run.killed && !run.mirror && run.execution?.approvalMode === 'ask' &&
+          run.sessionId === questionRow.session && run.control === questionRow.control && run.thread === q.params.threadId && run.turnId === q.params.turnId
+        if (typeof Button !== 'function') {
+          if (valid) await $.fs.write(`${questionRow.control}/response-${q.token}.json`, JSON.stringify({ ...approvalIdentity(q), unsupported: true, actor: 'human' }))
+          return Text({ children: 'Codex approval unsupported: native buttons unavailable; no consent supplied.' })
+        }
+        const fileChanges = run ? proposedFileChanges(run, q) : undefined
+        const commandContext = run ? proposedCommand(run, q) : undefined
+        const approvalBody = (decision: string) => ({ ...approvalIdentity(q), decision, actor: 'human', ...(fileChanges ? { fileChanges } : {}), ...(commandContext ? { commandContext } : {}) })
+        const decide = async (decision: string) => {
+          const current = runs.get(questionRow.agent)
+          if (!valid || current !== run || current.ended || current.killed || q.status !== 'pending') return
+          const body = approvalBody(decision)
+          if (!approvalResponse(q, body, proposedFileChanges(current, q), proposedCommand(current, q))) { $.ui.invalidate('ui.render'); return }
+          q.status = 'submitting'
+          $.ui.invalidate('ui.render')
+          try { await $.fs.write(`${questionRow.control}/response-${q.token}.json`, JSON.stringify(body)) }
+          catch { q.status = 'pending'; $.ui.invalidate('ui.render') }
+        }
+        return Box({ flexDirection: 'column', children: [Text({ weight: 'semibold', children: `Codex approval: ${q.params.kind ?? q.method}` }),
+          Text({ children: JSON.stringify(q.params) }),
+          ...(q.method === 'item/fileChange/requestApproval' ? [Text({ children: fileChanges ? JSON.stringify(fileChanges) : FILE_APPROVAL_UNAVAILABLE })] : []),
+          ...(q.method === 'item/commandExecution/requestApproval' ? [Text({ children: commandContext ? JSON.stringify(commandContext) : COMMAND_APPROVAL_UNAVAILABLE })] : []),
+          Text({ children: `${q.status}; one-shot decision, no command replay` }),
+          ...(valid ? ['accept', 'decline', 'cancel'].filter(decision => approvalResponse(q, approvalBody(decision), fileChanges, commandContext)).map(decision =>
+            Button({ key: `${q.token}:${decision}`, label: decision === 'accept' ? 'Approve once' : decision === 'decline' ? 'Decline' : 'Cancel turn', onPress: () => { void decide(decision) } })) : [])] })
+      }
       const send = async (cancel = false) => {
         const run = runs.get(questionRow.agent)
         if (q.status !== 'pending' || !run || run.ended || run.killed || run.control !== questionRow.control || run.thread !== q.params.threadId || run.turnId !== q.params.turnId) return
@@ -2843,6 +3015,41 @@ async function loadProjectRoles($: EngineInterface, config: Config): Promise<voi
   }
 }
 
+const proposedFileChanges = (run: Run, q: Question) => fileApprovalEvidence(q,
+  run.ledger.items.get(JSON.stringify([q.params.threadId, q.params.turnId, q.params.itemId])))
+const proposedCommand = (run: Run, q: Question) => commandApprovalContext(q,
+  run.ledger.items.get(JSON.stringify([q.params.threadId, q.params.turnId, q.params.itemId])))
+
+/** No source-provided identity is trusted by the delegated approval endpoint. */
+async function approvalCall($: EngineInterface, e: any): Promise<any> {
+  const deny = (reason: string) => ({ deny: `codex-mod: ${reason}` })
+  if (hasPrefix(e.tool_use_id)) return deny('display calls cannot grant approvals')
+  const run = typeof e.targetAgentId === 'string' ? runs.get(e.targetAgentId) : undefined
+  if (!run || run.ended || run.killed || run.mirror || run.execution?.approvalMode !== 'orchestrator' || run.sessionId !== await sessionId($)) return deny('no live owner-delegated approval target')
+  const list = await $.agent.list().catch(() => undefined)
+  const isCodex = (a: any) => typeof a?.type !== 'string' || a.type.startsWith(`${$.plugin.name}:`) || records.has(a.id) || runs.has(a.id)
+  const parent = approvalParent(list, run.agentId, isCodex)
+  if (!parent || JSON.stringify(parent) !== JSON.stringify(run.approvalParent) || !parentMayDecide(parent, e.agentId, list, isCodex)) return deny('only the authoritative immediate Claude parent may inspect or decide')
+  const pending = [...pendingApprovals.values()].filter(p => p.run === run && p.question.status === 'pending' && p.question.params.threadId === run.thread && p.question.params.turnId === run.turnId)
+  if (e.action === 'inspect') return { result: [{ type: 'text', text: JSON.stringify(pending.map(p => {
+    const fileChanges = proposedFileChanges(run, p.question)
+    const commandContext = proposedCommand(run, p.question)
+    return { identity: approvalIdentity(p.question), request: p.question.params, ...(p.question.method === 'item/fileChange/requestApproval'
+      ? { acceptAllowed: !!fileChanges, ...(fileChanges ? { fileChanges } : { fileChangesUnavailable: FILE_APPROVAL_UNAVAILABLE }) } :
+      p.question.method === 'item/commandExecution/requestApproval' ? { acceptAllowed: !!commandContext, ...(commandContext ? { commandContext } : { commandContextUnavailable: COMMAND_APPROVAL_UNAVAILABLE }) } : {}) }
+  })) }] }
+  if (e.action !== 'decide' || !object(e.identity)) return deny('inspect before deciding; exact approval identity required')
+  const match = pending.find(p => matchesApproval(p.question, e.identity) && Object.keys(e.identity).length === Object.keys(approvalIdentity(p.question)).length)
+  if (!match || !run.control) return deny('stale or mismatched approval identity')
+  const body = { ...e.identity, decision: e.decision, ...(e.permissions === undefined ? {} : { permissions: e.permissions }),
+    ...(e.fileChanges === undefined ? {} : { fileChanges: e.fileChanges }), ...(e.commandContext === undefined ? {} : { commandContext: e.commandContext }), actor: 'orchestrator' }
+  if (!approvalResponse(match.question, body, proposedFileChanges(run, match.question), proposedCommand(run, match.question))) return deny('unsupported decision, missing or changed file proposal, or permission grant; inspect the exact current request before deciding')
+  match.question.status = 'submitting'
+  try { await $.fs.write(`${run.control}/response-${match.question.token}.json`, JSON.stringify(body)) }
+  catch { match.question.status = 'pending'; return deny('approval control write failed; no approval delivered') }
+  return { result: [{ type: 'text', text: 'Exact one-shot decision submitted to the owned runner; delivery is not yet confirmed. No command was replayed.' }] }
+}
+
 /**
  * The API owns full names. These tools have no executor, only the guards above.
  * Inputs must not shadow the host's flat envelope (tool, tool_use_id,
@@ -2856,7 +3063,7 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
     const registered = await $.tool.register({
       name,
       description: name === 'codex_question'
-        ? 'Display-only question controls for a pending Codex question. Only an explicit human answer or cancel submits a response. Never call this tool: all other calls are refused and it performs no work.'
+        ? 'Display-only controls for a pending Codex question or owner-enabled approval. Only an explicit human answer, one-shot approval, decline or cancel submits a response. Never call this tool: all other calls are refused and it executes no source operation.'
         : `Display-only ${tool ? 'tool result' : coordinator ? 'coordinator message' : 'plan update'} drawn for Codex agents. Never call this tool: all other calls are refused and it performs no work.`,
       ...(coordinator || name === 'codex_question' ? { isDeferred: false } : {}),
       inputSchema: {
@@ -2870,6 +3077,13 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
     })
     displayTools[name] = registered.tool
     displayNames.add(registered.tool)
+  }
+  if (!approvalTool && (cfg.approvalMode === 'orchestrator' || cfg.allowedApprovalModes.includes('orchestrator'))) {
+    const registered = await $.tool.register({ name: 'codex_approval', isDeferred: false,
+      description: 'Inspect or decide an exact pending one-shot Codex approval. Only the authoritative immediate Claude parent may use this owner-delegated tool. Inspect before deciding; copy the complete identity and, for file acceptance, the exact fileChanges returned by inspect. No command is replayed.',
+      inputSchema: { type: 'object', additionalProperties: false, properties: { targetAgentId: { type: 'string' }, action: { enum: ['inspect', 'decide'] },
+        identity: { type: 'object' }, decision: { enum: ['accept', 'decline', 'cancel'] }, permissions: { type: 'object' }, fileChanges: { type: 'object' }, commandContext: { type: 'object' } }, required: ['targetAgentId', 'action'] } })
+    approvalTool = registered.tool
   }
   if (!statusTool) {
     const registered = await $.tool.register({ name: 'codex_message_status', isDeferred: false,
@@ -3397,7 +3611,13 @@ async function foldIn($: EngineInterface, run: Run, f: FollowUp): Promise<void> 
     await recordOutcome($, run.agentId, { ...o, status: 'unknown', reason: 'receipt checkpoint unavailable; no submission' })
     return
   }
-  const text = parseOverrides(f.text).rest.trim()
+  const steeringRequest = executionRequest(f.text)
+  if (Object.keys(steeringRequest.request).length) {
+    run.queue.push({ kind: 'note', text: '↪ execution policy headers cannot change a running or resumed thread; start a new agent with the requested owner-granted policy' })
+    if (f.messageId || f.uuid) await recordOutcome($, run.agentId, { messageId: f.messageId ?? f.uuid!, sourceUuid: f.uuid, status: 'rejected', receivedAt: Date.now(), reason: 'execution policy headers require a new agent' })
+    return
+  }
+  const text = parseOverrides(steeringRequest.rest).rest.trim()
   if (run.transport === 'app-server' && run.control !== undefined && !run.ended && !run.killed && text !== '') {
     run.pendingSteers.push(f)
     try {
@@ -3446,8 +3666,9 @@ async function* startRun(
   const agentId = e.agentId!
   if (base.recoveryUnavailable) return yield* handBack($, e, 'codex failed: recovery state unavailable', '', handback)
   await loadCatalog($)
-  const resolved = retry ? { profile: retry.profile, rest: parseOverrides(rawTask).rest, invalid: checkProfile(catalog ?? undefined, retry.profile.model, retry.profile.effort) }
-    : resolveProfile(base, rawTask, catalog ?? undefined)
+  const launch = executionRequest(rawTask)
+  const resolved = retry ? { profile: retry.profile, rest: parseOverrides(launch.rest).rest, invalid: checkProfile(catalog ?? undefined, retry.profile.model, retry.profile.effort) }
+    : resolveProfile(base, launch.rest, catalog ?? undefined)
   const lastTask = delivery !== undefined && base.lastTask !== undefined ? base.lastTask : rawTask
   const rec: AgentRecord = {
     ...base,
@@ -3501,9 +3722,17 @@ async function* startRun(
   await saveRecord($, agentId, rec)
   $.ui.invalidate('ui.render')
   if (base.lastTask === undefined && base.selection?.note) carry = [carry, `↪ ${base.selection.note}`].filter(Boolean).join('\n\n')
-  const cwd = await $.session.cwd()
+  const sessionCwd = await $.session.cwd()
+  if (rec.executionFingerprint && !rec.effectiveExecution) return yield* handBack($, e, 'codex failed: saved execution policy unavailable; restore its private cache before resuming', '', handback)
+  if (rec.effectiveExecution && rec.executionFingerprint !== rec.effectiveExecution.fingerprint) return yield* handBack($, e, 'codex failed: saved execution policy fingerprint mismatch; no resume launched', '', handback)
+  const execution = await resolveExecution($, config, launch.request, sessionCwd, prof.sandbox, rec.effectiveExecution, !!rec.thread && !rec.effectiveExecution)
+  rec.effectiveExecution = execution
+  rec.executionFingerprint = execution.fingerprint
+  rec.sandbox = prof.sandbox = execution.sandbox
+  const cwd = execution.cwd
   let configNote = base.thread && (base.model !== rec.model || base.effort !== rec.effort)
     ? 'model/effort changed on follow-up; cold start possible' : undefined
+  if (execution.source === 'legacy') configNote = [configNote, 'legacy execution baseline unknown; pinned current cwd with never approvals, no network or extra roots'].filter(Boolean).join('; ')
   if (!rec.effectiveConfig) {
     if (rec.effectiveFingerprint) {
       return yield* handBack($, e, 'codex failed: saved thread policy unavailable; restore its private state cache before resuming', '', handback)
@@ -3526,10 +3755,26 @@ async function* startRun(
   rec.effectiveFingerprint = configHash({ policy: rec.effectiveConfig.fingerprint, ...prof })
   await saveRecord($, agentId, rec)
   const task = roleTask(name, resolved.rest, rec.effectiveConfig)
-  const lean = rec.effectiveConfig.overrides.flatMap(kv => ['-c', kv])
+  const lean = rec.effectiveConfig.overrides.filter(kv => !executionOverride(kv)).flatMap(kv => ['-c', kv])
   const env = { CODEX_HOME: rec.effectiveConfig.home }
-  if (retry) carry = [carry, `↪ ${retry.note}`].filter(Boolean).join('\n\n')
   const via = await transportFor($, config)
+  if (execution.approvalMode !== 'never' && via.transport !== 'app-server') return yield* handBack($, e, `codex failed: approval mode ${execution.approvalMode} requires app-server; ${via.transport === 'exec' ? via.note ?? 'exec transport selected' : ''}. No fallback run was made.`, '', handback)
+  let parent: Run['approvalParent']
+  if (execution.approvalMode === 'orchestrator') {
+    const list = await $.agent.list().catch(() => undefined)
+    parent = approvalParent(list, agentId, (a: any) => a.type.startsWith(`${$.plugin.name}:`) || records.has(a.id) || runs.has(a.id))
+    if (!parent || !approvalTool) return yield* handBack($, e, 'codex failed: authoritative Claude parent identity or approval tool unavailable; orchestrator approvals refused', '', handback)
+  }
+  if (execution.approvalMode === 'ask' && (!config.nativeActions || !displayTools.codex_question || agentTools.get(name) && !agentTools.get(name)!.has(displayTools.codex_question!))) return yield* handBack($, e, 'codex failed: ask approvals require owned native UI controls; host UI unavailable', '', handback)
+  if (rec.thread && !rec.mirror && !rec.historyAmbiguous && (config.archiveSessions || rec.historyArchived === true) && !historyInUse(rec.thread, env.CODEX_HOME)) {
+    // The CLI also fails for an already active thread. Keep the normal exact-ID
+    // resume as the state check: never retry it or replace it with a new thread.
+    if (await sessionHistory($, config.codexPath ?? 'codex', env.CODEX_HOME, 'unarchive', rec.thread)) {
+      rec.historyArchived = undefined
+      await saveRecord($, agentId, rec)
+    }
+  }
+  if (retry) carry = [carry, `↪ ${retry.note}`].filter(Boolean).join('\n\n')
   let argv: string[]
   let control: string | undefined
   if (via.transport === 'app-server') {
@@ -3549,10 +3794,10 @@ async function* startRun(
     await $.process.run(['mkdir', '-p', '-m', '700', `${runs.slice(0, runs.lastIndexOf('/'))}`, runs, control], { timeoutMs: 10000 }).catch(() => undefined)
     const questionTool = displayTools.codex_question
     const questions = config.nativeActions && !rec.effectiveConfig.lean && questionTool !== undefined && (agentTools.get(name)?.has(questionTool) ?? true)
-    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [], control, questions, nestedAgents: config.nestedAgents })
+    argv = runnerArgv({ node: via.node, runner: via.runner, codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [], control, questions, nestedAgents: config.nestedAgents, execution })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   } else {
-    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [] })
+    argv = launchArgv({ codex: config.codexPath ?? 'codex', prof, cwd, resume: rec.thread, lean, extra: [], execution })
     $.ui.log(`codex-mod: agent ${agentId} -> ${argv.slice(0, -1).join(' ')}${env ? ` (CODEX_HOME=${env.CODEX_HOME})` : ''} (prompt ${task.length} chars on stdin)`, { to: 'debug' })
   }
 
@@ -3566,6 +3811,7 @@ async function* startRun(
     prof,
     cwd,
     child: $.process.spawn({ argv, cwd, input: task, ...(env ? { env } : {}) }),
+    history: { codex: config.codexPath ?? 'codex', home: env.CODEX_HOME, archive: config.archiveSessions, thread: rec.thread, ambiguous: rec.historyAmbiguous },
     thread: rec.thread,
     buffered: '',
     stderrTail: '',
@@ -3593,6 +3839,8 @@ async function* startRun(
     unknown: 0,
     unknownTypes: [],
     policy: rec.effectiveConfig,
+    execution,
+    approvalParent: parent,
     configNote,
     capacityRetried: !!retry,
     rawTask,
@@ -3785,8 +4033,10 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
     return
   }
   const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
+  if (source && run.execution) source.executionPolicy = run.execution
   if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
   const captured = source ? run.ledger.capture(source) : undefined
+  if (captured?.record.item?.type === 'fileChange') $.ui.invalidate('ui.render')
   if (captured?.render === false) {
     if (run.transport === 'exec' && envelope?.type === 'turn.completed') await handle($, run, parseCodexLine(line), source)
     return
@@ -3927,7 +4177,19 @@ const remember = (run: Run, path: string, text: string | undefined) => {
 async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: SourceRecord): Promise<void> {
   if (ev.kind === 'thread') {
     run.thread = ev.id
+    if (run.history) {
+      if (run.history.thread !== undefined && run.history.thread !== ev.id) run.history.ambiguous = true
+      else {
+        run.history.thread = ev.id
+        run.history.observed = true
+      }
+    }
     const rec = records.get(run.agentId)
+    if (rec && run.history?.ambiguous) rec.historyAmbiguous = true
+    if (rec?.historyArchived && !run.mirror) {
+      rec.historyArchived = undefined
+      await saveRecord($, run.agentId, rec)
+    }
     if (rec !== undefined && rec.thread !== ev.id) {
       rec.thread = ev.id
       rec.threadUsage = { thread: ev.id, total: zeroUsage(), valid: false }
@@ -3941,6 +4203,8 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     if (ev.kind === 'note' && ev.dim) dimNotes.add(ev.text)
   } else if (ev.kind === 'action') {
     run.actions++
+    const evidence = permissionEvidence(`${ev.action.error ?? ''} ${JSON.stringify(ev.action.result)}`, run.execution)
+    if (evidence && !run.queue.some(q => q.kind === 'note' && q.text === evidence)) run.queue.push({ kind: 'note', text: evidence })
     if (source?.item?.type === 'webSearch') {
       ev.action = webAction(source.item, source)
       ev.display = ev.action.tool === 'codex_tool' ? 'codex_tool' : undefined
@@ -3970,6 +4234,26 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
     }
     for (const row of questionRows.values()) if (row.agent === run.agentId && row.question.token === q.token) row.question = q
     $.ui.invalidate('ui.render')
+    if (APPROVAL_METHODS.has(q.method)) {
+      if (q.status !== 'pending') pendingApprovals.delete(q.token)
+      if (q.status === 'pending' && approvalRequest(q.method, q.params)) {
+        if (run.mirror || !run.execution || !['ask', 'orchestrator'].includes(run.execution.approvalMode)) return
+        pendingApprovals.set(q.token, { run, question: q })
+        if (run.execution.approvalMode === 'orchestrator') {
+          run.queue.push({ kind: 'interim', text: `Codex approval pending: parent must inspect codex_approval with targetAgentId=${run.agentId}. No consent supplied.` })
+          return
+        }
+        const tool = displayTools.codex_question
+        if (!tool || !cfg.nativeActions || agentTools.get(run.name) && !agentTools.get(run.name)!.has(tool)) {
+          await $.fs.write(`${run.control}/response-${q.token}.json`, JSON.stringify({ ...approvalIdentity(q), unsupported: true, actor: 'human' }))
+          run.queue.push({ kind: 'interim', text: 'Codex approval unsupported: owned native UI controls unavailable; no consent supplied.' })
+          return
+        }
+        run.queue.push({ kind: 'action', action: { tool, input: { server: 'codex', name: q.method, arguments: { ...q.params, requestId: q.requestId, token: q.token, status: q.status } },
+          result: [{ type: 'text', text: 'Approval received; awaiting explicit one-shot decision. Receipt is not consent.' }], source } })
+        return
+      }
+    }
     if (q.status === 'pending' && q.method === QUESTION_METHOD && choiceQuestions(q.params)) {
       const tool = displayTools.codex_question
       const ownTools = agentTools.get(run.name)
@@ -4060,7 +4344,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
   } else if (ev.kind === 'command') {
     run.actions++
     if (source?.item?.status === 'inProgress') return
-    run.queue.push({ kind: 'action', action: explorationAction(source) ?? { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status), source } })
+    run.queue.push({ kind: 'action', action: explorationAction(source) ?? { ...commandAction(ev.command, ev.output, ev.exitCode, source?.item?.status, source), source } })
   } else if (ev.kind === 'fileStart') {
     for (const c of ev.changes) {
       const path = absolute(source?.cwd ?? run.cwd, c.path)
@@ -4351,7 +4635,7 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
           const original = q.action
           const item = original.source!.item!
           blocks.push({ text: `${original.tool} unavailable in this agent's tools; showing the original Bash command.` })
-          q.action = { ...commandAction(item.command, item.aggregatedOutput, item.exitCode, item.status), source: original.source }
+          q.action = { ...commandAction(item.command, item.aggregatedOutput, item.exitCode, item.status, original.source), source: original.source }
           if (original.tool === 'Grep' && item.exitCode === 1) {
             delete q.action.error
             q.action.input.description = `${q.action.input.description} (no matches; exit 1)`
@@ -4430,10 +4714,12 @@ async function* complete(
   }
   let reason = failure?.reason
   let detail = failure?.detail ?? ''
+  let processEnded = false
   if (failure === undefined) {
     let ended: ProcessSpawnResult | undefined
     try {
       ended = await run.child.result
+      processEnded = ended !== undefined
     } catch (err) {
       reason = `stream closed (${errText(err)})`
     }
@@ -4452,8 +4738,18 @@ async function* complete(
       detail = tail
     }
   }
+  const evidence = permissionEvidence([reason, detail, tail, ...run.errors].filter(Boolean).join('\n'), run.execution)
+  if (evidence) detail = [detail, evidence].filter(Boolean).join('\n')
   if (reason !== undefined && preflight) detail = [detail, `(launch check: ${preflight})`].filter(Boolean).join('\n')
   const record = records.get(run.agentId)
+  if (run.history?.archive && !run.mirror && run.ended && processEnded && !run.killed && !signal.aborted &&
+      run.history.observed && !run.history.ambiguous && run.thread && run.history.thread === run.thread && record?.thread === run.thread && !record.mirror && !record.historyAmbiguous &&
+      !historyInUse(run.thread, run.history.home)) {
+    if (await sessionHistory($, run.history.codex, run.history.home, 'archive', run.thread)) {
+      record.historyArchived = true
+      await saveRecord($, run.agentId, record)
+    } else run.queue.push({ kind: 'note', text: '↪ session archive failed; result preserved, no automatic retry' })
+  }
   const atCapacity = reason !== undefined && [reason, detail, ...run.errors, run.fatal ?? '', tail].some(s => s.includes('Selected model is at capacity'))
   const capacityBeforeWork = run.actions === 0 && run.texts.length === 0 && !run.ledger.records.some(r => r.item)
   if (record && run.thread && atCapacity && run.transport === 'exec' && !run.execTotal && run.execBaseline && capacityBeforeWork) {

@@ -462,3 +462,24 @@ harness](../tests/fixtures/steer-v2-harness.md) for host ordering and live gates
   does not explain it, and the new card layout/live redraw remain unaccepted
   in Desktop. No source work was launched for the probe. Instrumentation was
   removed from the runtime root and cache, and Desktop was restarted again.
+
+## 1.2.1 execution-policy verification (2026-10-19)
+
+- A full Desktop restart followed by a fresh This computer session used Sonnet
+  5.5 medium as parent and one gpt-6.1-sol medium worker. With explicit owner
+  full-access, network, rich-tool and auto-review grants, the worker verified
+  its cwd, scratch file/Git operations, separate file reads/searches, a protected
+  Git metadata write, GitHub HTTP access and computer-tool inventory. A native
+  Read row was visible. Only disposable scratch files were changed.
+- Native Codex auto review approved the inventory action. Claude's separate
+  handback classifier-unavailable notice does not describe that reviewer.
+  The completed source thread was archived and retained its history.
+- Current local checks passed 788 hook tests, 158 Node tests and strict plugin
+  validation. CI now includes approval-policy tests on Node 20/22 and
+  execution-policy tests on Node 22, on Ubuntu and macOS. Hosted results remain
+  pending until the release PR runs.
+- Manual approval buttons, real immediate-parent inspect/decide delivery and
+  file-approval source ordering remain pending dedicated Desktop acceptance.
+  Computer-tool inventory does not establish window/browser control. The
+  earlier generic Coordinator receipt remains the accepted text fallback;
+  custom paint and live redraw remain unaccepted.

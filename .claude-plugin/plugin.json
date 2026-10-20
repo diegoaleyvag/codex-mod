@@ -1,6 +1,6 @@
 {
   "name": "codex-mod",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Subagent types codex-mod:codex and project-declared roles answered by the local OpenAI Codex CLI (codex exec) instead of an Anthropic model.",
   "author": {
     "name": "Diego Leyva",
@@ -76,10 +76,16 @@
       "description": "Off (experimental): run Codex with a plugin-owned CODEX_HOME that links only auth.json, config.toml and models_cache.json, so the user-level AGENTS.md is not loaded.",
       "default": true
     },
+    "archiveSessions": {
+      "type": "boolean",
+      "title": "Archive completed Codex sessions",
+      "description": "Archive owned source threads after their Codex process ends, keeping persistent history and same-thread follow-ups. Active sessions can appear; interrupted or crashed runs may require manual archiving.",
+      "default": false
+    },
     "extraConfig": {
       "type": "string",
       "title": "Extra Codex config",
-      "description": "Advanced: raw key=value overrides passed as -c to every launch (model, model_reasoning_effort and sandbox_mode are refused).",
+      "description": "Advanced owner key=value overrides. Execution keys approval_policy, approvals_reviewer, sandbox_workspace_write.network_access and writable_roots override execution-option defaults before launch narrowing. Unsupported execution values fail closed. Model, effort and sandbox_mode remain reserved.",
       "multiple": true,
       "default": []
     },
@@ -201,6 +207,45 @@
         "gpt-6-sol",
         "gpt-5.6-sol"
       ]
+    },
+    "approvalMode": {
+      "type": "string",
+      "title": "Approval mode",
+      "description": "Owner execution policy: never (default), ask (native user buttons), auto (Codex auto_review), or orchestrator (delegate exact one-shot decisions to the authoritative Claude parent). Interactive/reviewer modes require app-server; no exec fallback.",
+      "default": "never",
+      "options": [
+        "never",
+        "ask",
+        "auto",
+        "orchestrator"
+      ]
+    },
+    "allowedApprovalModes": {
+      "type": "string",
+      "multiple": true,
+      "title": "Additional launch approval grants",
+      "description": "Additional owner-authorized modes a leading codex-approval header may request. Repository and prompt text cannot grant modes. Never is always permitted.",
+      "default": []
+    },
+    "networkAccess": {
+      "type": "boolean",
+      "title": "Sandbox network access",
+      "description": "Allow network in workspace-write sandbox launches. A launch may narrow this grant. Full access has no network sandbox.",
+      "default": false
+    },
+    "additionalWritableRoots": {
+      "type": "string",
+      "multiple": true,
+      "title": "Additional writable directories",
+      "description": "Owner-granted existing absolute directory roots. A launch may select exact canonical members of this list; descendant directories need their own explicit grant. Ordinary workspace roots retain protected Git restrictions; exact Git metadata directories need explicit grants.",
+      "default": []
+    },
+    "allowedCwdRoots": {
+      "type": "string",
+      "multiple": true,
+      "title": "Additional launch working directories",
+      "description": "Owner-approved existing absolute roots for codex-cwd. Registered worktrees of the current repository are also accepted. No path is inferred from prose.",
+      "default": []
     }
   }
 }
