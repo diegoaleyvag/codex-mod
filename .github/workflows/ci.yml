@@ -4,7 +4,8 @@ on:
   push:
   pull_request:
 
-# The runner tests and Node 22 cache/checkpoint tests run here. Hook tests import
+# Runner and approval-policy tests run on Node 20/22; TypeScript-import suites
+# run on Node 22 with type stripping. Hook tests import
 # claude-code/testing, which ships with Claude Code, so `claude plugin test .`
 # and `claude plugin validate --strict .` run locally.
 jobs:
@@ -22,11 +23,11 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Syntax check
         run: node --check scripts/codex-runner.mjs
-      - name: Runner tests
-        run: node --test tests/runner.test.mjs
-      - name: Cache and checkpoint tests
+      - name: Runner and approval-policy tests
+        run: node --test tests/runner.test.mjs tests/approval-policy.test.mjs
+      - name: Cache, checkpoint, and execution-policy tests
         if: matrix.node == 22
-        run: node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs
+        run: node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs tests/execution-policy.test.mjs
       - name: JSON validity
         run: |
           node -e "

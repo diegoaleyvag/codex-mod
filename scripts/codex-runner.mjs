@@ -34,6 +34,7 @@ import { spawn } from 'node:child_process'
 import { appendFileSync, chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { APPROVAL_METHODS, approvalRequest, approvalIdentity, matchesApproval, approvalResponse, fileApprovalEvidence, commandApprovalContext } from '../hooks/approval-policy.mjs'
 import { createSteerControl } from '../hooks/steer-control.mjs'
 import { TreeUsage } from '../hooks/tree-usage.mjs'
 import { QUESTION_METHOD, choiceQuestions, choiceResponse } from '../hooks/questions.mjs'
@@ -238,6 +239,11 @@ async function main() {
       process.exit(2)
     }
   }
+  const approvalMode = args['approval-mode'] ?? 'never'
+  if (!['never', 'ask', 'auto', 'orchestrator'].includes(approvalMode)) {
+    emit({ type: 'codexmod.fatal', message: 'unsupported approval mode; no Codex process launched' })
+    return process.exitCode = 1
+  }
   makeControlDir(args.control)
 
   // State.
@@ -264,6 +270,8 @@ async function main() {
   const inflight = new Set()
   const questions = new Map()
   const requestIds = new Map()
+  const approvalTimers = new Map()
+  const approvalItems = new Map()
   let ppid = process.ppid
   const nested = args.nested !== 'false'
   const generation = randomUUID()
@@ -404,6 +412,7 @@ async function main() {
       pendingInterrupt = true
       return
     }
+    for (const q of questions.values()) if (APPROVAL_METHODS.has(q.method)) settleQuestion(q, { error: { code: -32800, message: 'turn interrupted; approval cancelled' } }, 'cancelled')
     send('turn/interrupt', { threadId, turnId }).catch(() => {})
     await Promise.race([new Promise(r => turnWaiters.push(r)), new Promise(r => setTimeout(r, ms))])
   }
@@ -484,6 +493,8 @@ async function main() {
   }
   const settleQuestion = (q, response, status) => {
     if (!questions.delete(q.token)) return
+    clearTimeout(approvalTimers.get(q.token))
+    approvalTimers.delete(q.token)
     const failed = () => requestEvent(q, 'failed', { error: { code: -32000, message: 'question response could not be delivered to Codex' } })
     try {
       if (!child.stdin.writable || child.stdin.destroyed) return failed()
@@ -496,6 +507,24 @@ async function main() {
     let body
     try { body = JSON.parse(readFileSync(path, 'utf8')) } catch { return }
     remove(path)
+    if (q && APPROVAL_METHODS.has(q.method)) {
+      const target = threads.get(q.params.threadId)
+      if (final || finished || parentStopping || !target || target.done || target.failed || stoppedAncestor(target) || target.turnId !== q.params.turnId ||
+          !matchesApproval(q, body) || body.actor !== (approvalMode === 'ask' ? 'human' : 'orchestrator')) {
+        emit({ type: 'codexmod.responseRejected', token, message: 'stale or mismatched approval response; no consent delivered' })
+        return
+      }
+      if (body.unsupported === true) {
+        settleQuestion(q, { error: { code: -32601, message: 'owned approval controls unavailable; no consent supplied' } }, 'unsupported')
+        return
+      }
+      const source = approvalItems.get(JSON.stringify([q.params.threadId, q.params.turnId, q.params.itemId]))
+      const response = approvalResponse(q, body, fileApprovalEvidence(q, source), commandApprovalContext(q, source))
+      if (!response) { emit({ type: 'codexmod.responseRejected', token, message: 'invalid approval decision or grant; no consent delivered' }); return }
+      settleQuestion(q, response, body.decision === 'cancel' ? 'cancelled' : 'answered')
+      if (body.decision === 'cancel' && q.method === 'item/permissions/requestApproval') void interruptAndEnd()
+      return
+    }
     if (!q || final || turnDone || body.token !== token || body.requestId !== q.id || body.threadId !== threadId || body.turnId !== turnId || body.itemId !== q.params.itemId) {
       emit({ type: 'codexmod.responseRejected', token, message: 'stale or mismatched question response; no answer delivered' })
       return
@@ -525,6 +554,7 @@ async function main() {
         const target = threads.get(body.threadId)
         if (!target || target.turnId !== body.turnId) throw new Error('stale child interrupt')
         stoppedThreads.add(target.id)
+    for (const q of questions.values()) if (q.params.threadId === target.id) settleQuestion(q, { error: { code: -32800, message: 'source child interrupted' } }, 'cancelled')
         for (const state of threads.values()) if (stoppedAncestor(state)) void interruptThread(state, body.operationId)
       } else {
         if (body.turnId && body.turnId !== turnId) throw new Error('stale root interrupt')
@@ -652,6 +682,13 @@ async function main() {
       ...(p.completedAtMs !== undefined ? { completedAtMs: p.completedAtMs } : {}),
       ...(item ? { item: publicItem } : {}),
       data: publicSource(Object.fromEntries(Object.entries(p).filter(([key]) => key !== 'item'))) }
+    const approvalItemId = item?.id ?? p.itemId
+    if (approvalItemId && (['fileChange', 'commandExecution'].includes(item?.type) || m.method === 'item/fileChange/patchUpdated')) {
+      const key = JSON.stringify([threadId, turnId, approvalItemId])
+      const previous = approvalItems.get(key)
+      approvalItems.set(key, { ...source, itemId: approvalItemId, cwd: args.cwd,
+        item: item ? publicItem : previous?.item && { ...previous.item, changes: p.changes } })
+    }
     if (!['item/started', 'item/completed', 'rawResponseItem/completed', 'item/reasoning/textDelta'].includes(m.method)) {
       emit({ type: 'codexmod.source', source })
     }
@@ -692,6 +729,8 @@ async function main() {
         const q = questions.get(token)
         if (q) {
           questions.delete(token)
+          clearTimeout(approvalTimers.get(token))
+          approvalTimers.delete(token)
           requestEvent(q, 'cancelled', { error: { code: -32800, message: 'request resolved by Codex; late answers refused' } })
         }
         break
@@ -699,6 +738,7 @@ async function main() {
       case 'turn/completed': {
         const t = p.turn ?? {}
         state.done = true
+        for (const q of questions.values()) if (q.params.threadId === state.id) settleQuestion(q, { error: { code: -32800, message: 'source turn ended; approval cancelled' } }, 'cancelled')
         if (threadId === rootThread()) { turnDone = true; rootCode = t.status === 'completed' ? 0 : 1 }
         if (t.status === 'completed') {
           const direct = usage.direct(threadId, state.rootTurnId)
@@ -899,7 +939,16 @@ async function main() {
         requestEvent(q, 'pending')
         return
       }
-      const error = { code: -32601, message: 'unsupported by codex-mod (only enabled, non-secret bounded choice questions; approvals remain disabled)' }
+      if (APPROVAL_METHODS.has(m.method) && ['ask', 'orchestrator'].includes(approvalMode) && approvalRequest(m.method, q.params) &&
+          q.params.threadId === threadId && q.params.turnId === turnId && !turnDone && !finished && !parentStopping) {
+        questions.set(q.token, q)
+        requestEvent(q, 'pending')
+        // A host that never renders the row cannot leave a source process hung forever.
+        const timeout = Number(args['approval-timeout-ms'] ?? 120000)
+        approvalTimers.set(q.token, setTimeout(() => settleQuestion(q, { error: { code: -32601, message: 'approval controls unavailable or no decision received before timeout; no consent supplied' } }, 'unsupported'), Number.isFinite(timeout) && timeout > 0 ? timeout : 120000))
+        return
+      }
+      const error = { code: -32601, message: 'unsupported by codex-mod: request is disabled, malformed, unowned, or outside the installed one-shot approval/choice contract' }
       requestEvent(q, 'unsupported', { error })
       if (m.params?.threadId === undefined || m.params.threadId === threadId) {
         emit({ type: 'codexmod.source', source: { transport: 'app-server', event: m.method, threadId, turnId,
@@ -987,7 +1036,12 @@ async function main() {
     const i = kv.indexOf('=')
     if (i > 0) config[kv.slice(0, i).trim()] = tomlValue(kv.slice(i + 1))
   }
-  const base = { cwd: args.cwd, model: args.model, sandbox: args.sandbox, approvalPolicy: 'never', config }
+  // Top-level policy and config agree; no ambient config may silently enable approvals.
+  const approvalPolicy = approvalMode === 'never' ? 'never' : 'on-request'
+  const approvalsReviewer = approvalMode === 'auto' ? 'auto_review' : 'user'
+  config.approval_policy = approvalPolicy
+  config.approvals_reviewer = approvalsReviewer
+  const base = { cwd: args.cwd, model: args.model, sandbox: args.sandbox, approvalPolicy, approvalsReviewer, config }
   let th
   try {
     th = args.thread
@@ -1009,6 +1063,8 @@ async function main() {
       input: [{ type: 'text', text: prompt, text_elements: [] }],
       effort: args.effort,
       model: args.model,
+      approvalPolicy,
+      approvalsReviewer,
     })
   } catch (e) {
     if (finished) return

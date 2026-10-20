@@ -15,6 +15,7 @@ import { imageFile, captureImage, generationAction, findingsAction, literalRecei
 import batch7Models from './fixtures/batch7-models.mjs'
 import { resolvePolicy, canonicalOverrides, configHash, policyTask, capacityFallback } from '../hooks/run-policy.ts'
 import { RECORD_BUDGET, compactStoreState, writeStoreState } from '../hooks/store-state.ts'
+import { executionRequest, ownerExecution, resolveExecution, executionOverrides, permissionEvidence } from '../hooks/execution-policy.ts'
 import { fingerprint } from '../hooks/fingerprint.ts'
 import { ROW_SLOTS } from '../hooks/row-cache.ts'
 import { choiceQuestions, choiceResponse, answeredQuestion } from '../hooks/questions.mjs'
@@ -27,6 +28,8 @@ const cacheDirectories = {
   tier: 'prepend' as const,
   register: ((on: On) => {
     on('process.run', ($, e, next) => {
+      if (e.argv[0] === 'git' && e.argv[1] === '-C') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
+      if (e.argv[0] === '/bin/sh' && e.argv[3] === 'codex-mod-path') return { value: { exitCode: 0, stdout: e.argv[4], stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       if (e.argv[0] === 'mkdir' && String(e.argv.at(-1)).includes('/codex-mod/runs/state-')) return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       return next(e)
     })
@@ -202,6 +205,7 @@ function world(on: On, opts: WorldOpts = {}) {
   const logs: string[] = []
   const sleeps: number[] = []
   const kills = { count: 0, bySignal: 0 }
+  const source = { ended: 0 }
   const status = new Map<string, Status>()
   const store = opts.store ?? new Map<string, unknown>()
   const files = opts.files ?? new Map<string, string>()
@@ -329,6 +333,7 @@ function world(on: On, opts: WorldOpts = {}) {
       }
       return { value: { code: fixture?.code ?? opts.code ?? 0, signal: null } }
     } finally {
+      source.ended++
       if (next.signal.aborted) kills.count++
     }
   })
@@ -337,7 +342,7 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, status, store, clock, files, core, checks, writes, stateWrites, reads, location, toolSpecs, toolLists }
+  return { spawned, modelCalls, logs, sleeps, kills, source, status, store, clock, files, core, checks, writes, stateWrites, reads, location, toolSpecs, toolLists }
 }
 
 // Source evidence and display payloads now recover from private cache files.
@@ -483,9 +488,23 @@ async function nestedLaunchHarness(on: On, opts: WorldOpts) {
   engine.fs.exists = async (path: string) => path.endsWith('/scripts/codex-runner.mjs')
   engine.fs.list = async () => []
   engine.clock.sleep = async (ms: number) => { w.clock.now += ms }
-  engine.process.run = async (argv: string[]) => runOk(argv[0] === 'which' ? `/bin/${argv[1]}`
-    : argv[1]?.endsWith('/scripts/codex-runner.mjs') && argv[2] === '--version' ? '1'
-    : argv.includes('--version') ? 'codex-cli 0.163.0' : 'ok').value
+  engine.process.run = async (argv: string[]) => {
+    if (argv[0] === '/bin/sh' && argv[3] === 'codex-mod-path') {
+      if (argv[4] !== '/tmp/project') throw new Error('unexpected harness canonical cwd')
+      return runOk('/tmp/project').value
+    }
+    if (argv[0] === 'git' && argv[1] === '-C') {
+      if (argv[2] !== '/tmp/project') throw new Error('unexpected harness Git cwd')
+      const probe = argv.slice(3).join(' ')
+      if (probe === 'rev-parse --path-format=absolute --git-common-dir') return runOk('/tmp/project/.git').value
+      if (probe === 'rev-parse --show-toplevel') return runOk('/tmp/project').value
+      if (probe === 'worktree list --porcelain') return runOk('worktree /tmp/project\n').value
+      throw new Error('unexpected harness Git authority probe')
+    }
+    return runOk(argv[0] === 'which' ? `/bin/${argv[1]}`
+      : argv[1]?.endsWith('/scripts/codex-runner.mjs') && argv[2] === '--version' ? '1'
+      : argv.includes('--version') ? 'codex-cli 0.163.0' : 'ok').value
+  }
   engine.process.spawn = async function* (input: Spawned) {
     w.spawned.push(input)
     for (const piece of opts.pieces ?? []) {
@@ -1099,7 +1118,8 @@ test('a codex agent step is answered by codex, with no model request and no head
   const run = w.spawned[0]!
   expect(run.argv.slice(1)).toEqual([
     'exec', '--json', '--skip-git-repo-check', '--sandbox', 'workspace-write', '-C', '/tmp/project',
-    '-m', 'gpt-6.1-sol', '-c', 'model_reasoning_effort="medium"', '-',
+    '-m', 'gpt-6.1-sol', '-c', 'model_reasoning_effort="medium"',
+    '-c', 'approval_policy="never"', '-c', 'approvals_reviewer="user"', '-c', 'sandbox_workspace_write.network_access=false', '-c', 'sandbox_workspace_write.writable_roots=[]', '-',
   ])
   // no session start ran: `codex` from PATH
   expect(run.argv[0]).toBe('codex')
@@ -1664,7 +1684,7 @@ test('helpers: shell unwrapping, descriptions, footer numbers, MCP names, diffs'
   expect(unwrapShell('git status')).toBe('git status')
   expect(describeCommand('git status --short')).toBe('Run git status')
   expect(describeCommand('cd sub && npm test')).toBe('Run shell commands: cd, npm test')
-  expect(describeCommand('sed -n 1,20p a.ts')).toBe('Read part of a file')
+  expect(describeCommand('sed -n 1,20p a.ts')).toBe('Read part of a.ts')
   expect(describeCommand('frobnicate')).toBe('Run frobnicate')
   expect([compact(950), compact(37412), compact(154000), compact(1250000), compact(2000)]).toEqual(['950', '37.4K', '154K', '1.3M', '2K'])
   expect(footer({ agent: 'codex', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', actions: 3, usage: { input: 192000, cached: 154000, output: 631 }, thread: '01a14f50-c51c' }))
@@ -1705,6 +1725,80 @@ test('compound command labels preserve the original Bash source and output witho
   expect(validAction(action)).toBe(true)
 })
 
+test('activity titles select literal read and pytest targets without exposing option values', () => {
+  for (const [command, title] of [
+    ['cat preregistration.json', 'Read preregistration.json'],
+    ["cat 'pilot doc;$(literal).md'", 'Read pilot doc;$(literal).md'],
+    ['head -n 20 "pilot doc.md"', 'Read start of pilot doc.md'],
+    ['tail -n +3 notes.txt', 'Read end of notes.txt'],
+    ['nl -ba notes.txt', 'Read with line numbers notes.txt'],
+    ['sed -n 2,8p notes.txt', 'Read part of notes.txt'],
+    ['pytest -q tests/test_pilot.py::test_read', 'Run pytest tests/test_pilot.py::test_read'],
+    ['python3 -m pytest tests', 'Run pytest tests'],
+    ['uv run pytest -q tests/a.py tests/b.py', 'Run pytest tests/a.py, tests/b.py'],
+    ['pytest -k secret_filter tests', 'Run pytest'],
+    ['python3 -c "print(42)"', 'Run Python'],
+    ['cat a b', 'Show file contents'],
+    ['sed -i s/a/b/ a.txt', 'Edit file in place'],
+    ['TOKEN=private pytest tests', 'Run shell command'],
+    ["cat 'token=private'", 'Show file contents'],
+    ["cat 'sk-abcdefghijk'", 'Show file contents'],
+    ['git --token ghp_abcdefghijk', 'Run git'],
+    ['cat "$TOKEN"', 'Run shell command'],
+    ['cat <<EOF\nprivate\nEOF', 'Run shell command'],
+  ]) expect(describeCommand(command!)).toBe(title)
+  expect(commandAction('/bin/zsh -lc "cat \'$TOKEN\'"', '', 0).input.description).toBe('Run shell command')
+})
+
+test('activity search titles require exact source, command, query and path linkage', () => {
+  const command = "rg -n 'pilot | draft' docs"
+  const item = { type: 'commandExecution', command, commandActions: [{ type: 'search', command, query: 'pilot | draft', path: '/workspace/docs' }] }
+  const source = { transport: 'app-server' as const, event: 'item/completed', cwd: '/workspace', item }
+  expect(describeCommand(command, source)).toBe('Search pilot | draft in docs')
+  const wrapped = `/bin/zsh -lc ${JSON.stringify(command)}`
+  expect(commandAction(wrapped, '', 0, 'completed', { ...source, item: { ...item, command: wrapped } }).input.description).toBe('Search pilot | draft in docs')
+  for (const changed of [
+    { ...item, command: 'rg other docs' },
+    { ...item, type: 'agentMessage', description: 'Unrelated successful task' },
+    { ...item, commandActions: [{ ...item.commandActions[0], command: 'rg other docs' }] },
+    { ...item, commandActions: [{ ...item.commandActions[0], query: 'other' }] },
+    { ...item, commandActions: [{ ...item.commandActions[0], path: '/foreign/docs' }] },
+    { ...item, commandActions: [{ ...item.commandActions[0], type: 'unknown' }] },
+    { ...item, commandActions: [...item.commandActions, ...item.commandActions] },
+  ]) expect(describeCommand(command, { ...source, item: changed })).toBe('Search files')
+  for (const query of ['password=private', 'sk-abcdefghijkl', 'bad\u001btitle']) {
+    const cmd = `rg '${query}' docs`
+    expect(describeCommand(cmd, { ...source, item: { ...item, command: cmd, commandActions: [{ type: 'search', command: cmd, query, path: 'docs' }] } })).toBe('Search files')
+  }
+  const unsupported = 'rg --pre private-script pilot docs'
+  expect(describeCommand(unsupported, { ...source, item: { ...item, command: unsupported, commandActions: [{ type: 'search', command: unsupported, query: 'pilot', path: 'docs' }] } })).toBe('Search files')
+})
+
+test('activity titles bound long operands and compounds while preserving failed and unknown exits', () => {
+  const path = `${'nested/'.repeat(100)}preregistration.json`
+  const title = describeCommand(`cat '${path}'`)
+  expect(title.startsWith('Read nested/')).toBe(true)
+  expect(title.endsWith('preregistration.json')).toBe(true)
+  expect(title.length <= 80).toBe(true)
+  const command = `cat '${path}'; pytest '${path}'; cat '${path}'`
+  expect(describeCommand(command).length <= 240).toBe(true)
+  expect(describeCommand('cat a; pytest tests')).toBe('Run shell commands: Read a, Run pytest tests')
+  const compound = 'cat a; rg -n pilot docs'
+  const source = { transport: 'app-server' as const, event: 'item/completed', cwd: '/workspace', item: { type: 'commandExecution', command: compound,
+    commandActions: [{ type: 'read', command: 'cat a', path: '/workspace/a' }, { type: 'search', command: 'rg -n pilot docs', query: 'pilot', path: '/workspace/docs' }] } }
+  expect(describeCommand(compound, source)).toBe('Run shell commands: Read a, Search pilot in docs')
+  // A whole compound annotated as one search does not establish its subcommand.
+  expect(describeCommand(compound, { ...source, item: { ...source.item, commandActions: [{ type: 'search', command: compound, query: 'pilot', path: 'docs' }] } })).toBe('Run shell commands: Read a, rg')
+  for (const [exitCode, status] of [[2, 'failed'], [null, 'failed'], [null, 'completed']] as const) {
+    const action = commandAction('pytest tests/a.py', 'original error\n[output truncated]', exitCode, status)
+    expect(action.input.description).toBe(`Run pytest tests/a.py${exitCode === null ? ' (exit unreported)' : ''}`)
+    expect(action.input.command).toBe('pytest tests/a.py')
+    expect(action.result).toEqual({ stdout: 'original error\n[output truncated]', stderr: '', interrupted: false })
+    expect(Boolean(action.error)).toBe(status === 'failed')
+    if (action.error) expect(action.error).toContain('original error\n[output truncated]')
+  }
+})
+
 // ---- session.start ---------------------------------------------------------
 
 const runOk = (stdout = 'ok') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -1712,7 +1806,7 @@ const runOk = (stdout = 'ok') => ({ value: { exitCode: 0, stdout, stderr: '', is
 const startProject = async ($: any, on: On, opts: WorldOpts = {}) => {
   const w = world(on, { ...opts, files: new Map([['.claude/codex-mod.json', PROJECT_ROLES], ...(opts.files ?? [])]) })
   on('agent.register', (_$, e: any) => ({ value: { agent: `codex-mod:${e.name}` } }))
-  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : 'ok'))
+  on('process.run', (_$, e: any) => runOk(e.argv[0] === 'which' ? '/bin/codex' : e.argv[0] === '/bin/sh' ? e.argv[4] : 'ok'))
   await $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
   return w
 }
@@ -1738,8 +1832,9 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
   expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question', 'codex_message_status'])
   expect(w.toolSpecs.filter(t => t.name !== 'codex_message_status').every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
-  expect(w.toolSpecs[3].description).toContain('question controls')
-  expect(w.toolSpecs[3].description).toContain('Only an explicit human answer or cancel submits a response')
+  expect(w.toolSpecs[3].description).toContain('question or owner-enabled approval')
+  expect(w.toolSpecs[3].description).toContain('one-shot approval')
+  expect(w.toolSpecs[3].description).toContain('Only an explicit human answer, one-shot approval, decline or cancel submits a response')
   expect(w.toolSpecs[3].description).not.toBe(w.toolSpecs[0].description)
   expect(w.toolSpecs[3].isDeferred).toBe(false)
   expect(w.toolSpecs[3].inputSchema).toEqual(w.toolSpecs[0].inputSchema)
@@ -2667,16 +2762,18 @@ test('extraConfig entries are passed as -c to every launch', { options: { extraC
   const w = world(on)
   await step($, 'agent-extra')
   const argv = w.spawned[0]!.argv
-  expect(argv.slice(-3)).toEqual(['-c', 'tools.view_image=false', '-'])
+  expect(argv.filter((_, i) => argv[i - 1] === '-c')).toContain('tools.view_image=false')
 })
 
 test('option validation: every knob, defaults on refused values', async () => {
   const d = parseConfig({})
   expect(d).toMatchObject({
-    lean: true, globalRules: true, generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, projectRoles: true, allowProjectFullAccess: false,
+    lean: true, globalRules: true, archiveSessions: false, generic: { model: '', effort: 'medium', sandbox: 'workspace-write' }, projectRoles: true, allowProjectFullAccess: false,
     extraConfig: [], intervalMs: 1000, maxActionsPerStep: 10, handbackMode: 'auto', footer: 'full', timeoutMs: 0, nativeActions: true, ttlMs: 2 * 86_400_000, maxRunsPerWindow: 3, warnings: [],
   })
   expect(d.codexPath).toBe(undefined)
+  expect(parseConfig({ archiveSessions: true }).archiveSessions).toBe(true)
+  expect(parseConfig({ archiveSessions: 'true' })).toMatchObject({ archiveSessions: false, warnings: ['archiveSessions: not a boolean; default used'] })
   const good = parseConfig({
     codexPath: '/x/codex', defaultModel: 'gpt-6-luna', defaultEffort: 'ULTRA', defaultSandbox: 'read-only', projectRoles: false, allowProjectFullAccess: true, lean: false, globalRules: false,
     extraConfig: ['a.b=1'], progressIntervalMs: 0, maxActionsPerStep: 3, handbackMode: 'tool', footer: 'short', timeoutMinutes: 30, nativeActions: false, pruneDays: 7,
@@ -2838,7 +2935,7 @@ test('project roles: follow-ups prepend instructions once; file and cwd edits do
   expect(w.spawned[1]!.argv).toContain('resume')
   expect(w.spawned[1]!.argv).toContain('model_reasoning_effort="high"')
   expect(w.spawned[1]!.input).toBe('Keep the change bounded.\n\nDo not spawn sub-agents.\n\nsecond')
-  expect(w.spawned[1]!.cwd).toBe('/tmp/elsewhere')
+  expect(w.spawned[1]!.cwd).toBe('/tmp/project')
   expect(w.reads.filter(p => p === '.claude/codex-mod.json').length).toBe(1)
   expect(handback(second.result)).not.toContain('Keep the change bounded.')
   expect(w.store.get('agent:sess-1:agent-project')).toMatchObject({ lastTask: 'second', model: 'gpt-6.1-sol', effort: 'high' })
@@ -2935,10 +3032,10 @@ test('globalRules on (default): no CODEX_HOME, nothing prepared', async ($, on) 
 test('launch argv (pure): new and resumed runs, extra -c last before the prompt', async () => {
   const prof = { model: 'm', effort: 'max', sandbox: 'read-only' }
   expect(launchArgv({ codex: 'codex', prof, cwd: '/w', lean: [], extra: ['k=v'] })).toEqual([
-    'codex', 'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-C', '/w', '-m', 'm', '-c', 'model_reasoning_effort="max"', '-c', 'k=v', '-',
+    'codex', 'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-C', '/w', '-m', 'm', '-c', 'model_reasoning_effort="max"', '-c', 'k=v', '-c', 'approval_policy="never"', '-',
   ])
   expect(launchArgv({ codex: 'codex', prof, cwd: '/w', resume: 'th', lean: [], extra: [] })).toEqual([
-    'codex', 'exec', 'resume', '--json', '--skip-git-repo-check', '-c', 'sandbox_mode="read-only"', '-m', 'm', '-c', 'model_reasoning_effort="max"', 'th', '-',
+    'codex', 'exec', 'resume', '--json', '--skip-git-repo-check', '-c', 'sandbox_mode="read-only"', '-m', 'm', '-c', 'model_reasoning_effort="max"', '-c', 'approval_policy="never"', 'th', '-',
   ])
 })
 
@@ -3254,7 +3351,7 @@ test('helpers: runner lines, versions, model_provider, runner argv, footer with 
   expect(modelProvider('model = "x"\n[profiles.a]\nmodel_provider = "ollama"')).toBe(undefined)
   expect(runnerArgv({ node: '/n', runner: '/r.mjs', codex: '/c', prof: { model: 'm', effort: 'low', sandbox: 'read-only' }, cwd: '/w', resume: 'th', lean: ['-c', 'features.apps=false', '-c', 'web_search="disabled"'], extra: ['k=v'], control: '/ctl' })).toEqual([
     '/n', '/r.mjs', 'run', '--codex', '/c', '--cwd', '/w', '--model', 'm', '--effort', 'low', '--sandbox', 'read-only', '--thread', 'th',
-    '--config', 'features.apps=false', '--config', 'web_search="disabled"', '--config', 'k=v', '--control', '/ctl',
+    '--config', 'features.apps=false', '--config', 'web_search="disabled"', '--config', 'k=v', '--approval-mode', 'never', '--control', '/ctl',
   ])
   expect(runnerArgv({ node: 'n', runner: 'r', codex: 'c', prof: { model: 'm', effort: 'e', sandbox: 's' }, cwd: '/w', lean: [], extra: [], control: '/ctl' })).not.toContain('--thread')
   const p = { agent: 'codex', model: 'm', effort: 'low', sandbox: 'workspace-write', actions: 2 }
@@ -3295,7 +3392,7 @@ const ACK = (id: number, status: 'accepted' | 'rejected', reason?: string) => ou
  * and speaking protocol 1, `codex app-server --help` passing (or `help` exit);
  * `$.clock.after` fires after a few real ms, whatever it asks.
  */
-function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol?: string; node?: boolean } = {}) {
+function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol?: string; node?: boolean; history?: (e: any) => any } = {}) {
   const w = world(on, opts)
   const runs: string[][] = []
   const timers: number[] = []
@@ -3303,6 +3400,7 @@ function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol
   on('process.run', (_$, e: any) => {
     runs.push([...e.argv])
     const a = e.argv as string[]
+    if (a[0] === '/usr/bin/env' && ['archive', 'unarchive'].includes(a[3]) && ready.history) return ready.history(e)
     if (a[0] === 'which') return a[1] === 'node' && ready.node === false ? { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : runOk(`/usr/local/bin/${a[1]}\n`)
     if (a.includes('app-server')) return { value: { exitCode: ready.help ?? 0, stdout: 'usage', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (RUNNER_PATH.test(a[1] ?? '') && a[2] === '--version') return runOk(`${ready.protocol ?? '1'}\n`)
@@ -3319,6 +3417,177 @@ function appWorld(on: On, opts: WorldOpts = {}, ready: { help?: number; protocol
 
 const startSession = ($: any) => $.session.start?.({ cwd: '/tmp/project', surface: null, isInteractive: false })
 const CONTROL = /^\/home\/t\/\.cache\/codex-mod\/runs\/[a-z0-9]+-[a-z0-9]+-\d+$/
+
+const HISTORY_THREAD = '019c6e27-e55b-73d1-87d8-4e01f1f75043'
+const HISTORY_OTHER = '019c7714-3b77-74d1-9866-e1f484aae2ab'
+const historyOutput = (thread = HISTORY_THREAD) => CODEX_JSONL.replace('t-1', thread)
+
+/** Metadata commands are distinct from the one inference process in these fixtures. */
+function historyWorld(on: On, mode: 'exec' | 'app-server' | 'fallback', opts: WorldOpts = {}, outcome: 'ok' | 'exit' | 'throw' = 'ok') {
+  const commands: { argv: string[]; ended: number }[] = []
+  let w: ReturnType<typeof world>
+  const history = (e: any) => {
+    commands.push({ argv: [...e.argv], ended: w.source.ended })
+    if (outcome === 'throw') throw new Error('history command unavailable')
+    return outcome === 'exit' ? { value: { ...runOk().value, exitCode: 1, stderr: 'Error: failed to unarchive session' } } : runOk()
+  }
+  if (mode === 'exec') {
+    w = world(on, opts)
+    on('process.run', (_$, e: any) => e.argv[0] === '/usr/bin/env' && ['archive', 'unarchive'].includes(e.argv[3]) ? history(e) : runOk())
+  } else w = appWorld(on, opts, { help: mode === 'fallback' ? 2 : 0, history })
+  return { ...w, history: commands }
+}
+
+for (const mode of ['exec', 'app-server', 'fallback'] as const) test(`session history ${mode}: default off makes no metadata commands`,
+  { options: { transport: mode === 'exec' ? 'exec' : 'app-server' } }, async ($, on) => {
+    const w = historyWorld(on, mode, { stdout: historyOutput() })
+    const s = await step($, 'agent-codex')
+    expect(firstLine(handback(s.result))).toBe('PONG')
+    expect(w.history).toEqual([])
+    expect(savedState(w, 'agent:sess-1:agent-codex').historyArchived).toBe(undefined)
+  })
+
+for (const mode of ['exec', 'app-server', 'fallback'] as const) test(`session history ${mode}: archive after process end, restore the same thread before follow-up`,
+  { options: { archiveSessions: true, codexPath: '/opt/owned-codex', transport: mode === 'exec' ? 'exec' : 'app-server' } }, async ($, on) => {
+    let conv: any[] = [user('first')]
+    const w = historyWorld(on, mode, { messages: () => conv, stdout: historyOutput(), storeSnapshots: true })
+    const first = await step($, 'agent-codex')
+    expect(firstLine(handback(first.result))).toBe('PONG')
+    expect(w.history).toEqual([{ argv: ['/usr/bin/env', 'CODEX_HOME=/home/t/.codex', '/opt/owned-codex', 'archive', '--', HISTORY_THREAD], ended: 1 }])
+    const stored = savedState(w, 'agent:sess-1:agent-codex')
+    expect(stored.historyArchived).toBe(true)
+    expect((w.store.get('agent:sess-1:agent-codex') as any).historyArchived).toBe(true)
+    expect(stored.effectiveFingerprint).toBe(configHash({ policy: stored.effectiveConfig.fingerprint, model: stored.model, effort: stored.effort, sandbox: stored.sandbox }))
+    conv = [...conv, ...toolResult('SubagentHandback'), user('follow-up')]
+    await step($, 'agent-codex', 0, 'history-follow-up')
+    expect(w.history.map(c => [c.argv[3], c.ended])).toEqual([['archive', 1], ['unarchive', 1], ['archive', 2]])
+    expect(w.history.every(c => c.argv[5] === HISTORY_THREAD && c.argv[1] === `CODEX_HOME=${w.spawned[0].env!.CODEX_HOME}`)).toBe(true)
+    expect(w.spawned.length).toBe(2)
+    expect(w.spawned[1].argv).toContain(mode === 'app-server' ? '--thread' : 'resume')
+    expect(w.spawned[1].argv).toContain(HISTORY_THREAD)
+    expect(w.spawned[1].env).toEqual(w.spawned[0].env)
+    expect(savedState(w, 'agent:sess-1:agent-codex').effectiveFingerprint).toBe(stored.effectiveFingerprint)
+    expect(w.spawned.every(s => !s.argv.includes('--thread-source') && !s.argv.includes('--ephemeral'))).toBe(true)
+    expect(w.core).toEqual([])
+  })
+
+for (const transport of ['exec', 'app-server'] as const) test(`session history ${transport}: action yields and a live source cannot trigger archive`,
+  { options: { archiveSessions: true, transport } }, async ($, on) => {
+    const w = historyWorld(on, transport, { pieces: [THREAD(HISTORY_THREAD), cmdDone('/bin/zsh -lc pwd'), MESSAGE('done')] })
+    const first = await step($, 'agent-progress')
+    expect(w.source.ended).toBe(0)
+    expect(w.history).toEqual([])
+    await runCalls($, first.chunks, 'agent-progress')
+    const last = await step($, 'agent-progress', 1)
+    expect(firstLine(handback(last.result))).toBe('done')
+    expect(w.history.map(c => [c.argv[3], c.ended])).toEqual([['archive', 1]])
+  })
+
+for (const transport of ['exec', 'app-server'] as const) test(`session history ${transport}: compact recovery restores an archived thread after opt-out in its recorded home`,
+  { options: { archiveSessions: false, transport, globalRules: true } }, async ($, on) => {
+    const policy = resolvePolicy(parseConfig({}), undefined, [], [], '/recorded/source-home').policy
+    const key = 'agent:sess-1:agent-restarted'
+    const rec = { ...PERSISTED, thread: HISTORY_THREAD, historyArchived: true, effectiveConfig: policy, updatedAt: 1_000_000 }
+    const compact = compactStoreState(rec)
+    expect(compact.historyArchived).toBe(true)
+    const w = historyWorld(on, transport, { task: 'follow-up after reload', store: new Map([[key, compact]]), stdout: historyOutput(), storeSnapshots: true })
+    const result = await step($, 'agent-restarted')
+    expect(firstLine(handback(result.result))).toBe('PONG')
+    expect(w.history).toEqual([{ argv: ['/usr/bin/env', 'CODEX_HOME=/recorded/source-home', 'codex', 'unarchive', '--', HISTORY_THREAD], ended: 0 }])
+    expect(w.spawned.length).toBe(1)
+    expect(w.spawned[0].argv).toContain(HISTORY_THREAD)
+    expect(w.spawned[0].env).toEqual({ CODEX_HOME: '/recorded/source-home' })
+    expect(savedState(w, key).historyArchived).toBe(undefined)
+  })
+
+for (const outcome of ['exit', 'throw'] as const) test(`session history archive ${outcome}: preserve the terminal result without replay`,
+  { options: { archiveSessions: true } }, async ($, on) => {
+    const w = historyWorld(on, 'exec', { stdout: historyOutput() }, outcome)
+    const result = await step($, 'agent-codex')
+    expect(handback(result.result)).toContain('PONG')
+    expect(handback(result.result)).toContain('session archive failed; result preserved, no automatic retry')
+    expect(w.history.length).toBe(1)
+    expect(w.spawned.length).toBe(1)
+    expect(savedState(w, 'agent:sess-1:agent-codex').historyArchived).toBe(undefined)
+    expect(w.logs.some(l => l.includes('session archive') && l.includes('failed'))).toBe(true)
+    expect(w.core).toEqual([])
+  })
+
+for (const resumeFails of [false, true]) test(`session history: unarchive failure ${resumeFails ? 'keeps a failed resume on its original thread' : 'allows an already active exact-ID resume'}`,
+  { options: { archiveSessions: true } }, async ($, on) => {
+    const key = 'agent:sess-1:agent-restarted'
+    const w = historyWorld(on, 'exec', { task: 'follow-up', store: new Map([[key, { ...PERSISTED, thread: HISTORY_THREAD, historyArchived: true, updatedAt: 1_000_000 }]]),
+      stdout: resumeFails ? '' : historyOutput(), code: resumeFails ? 1 : 0 }, 'exit')
+    const result = await step($, 'agent-restarted')
+    expect(w.history[0].argv).toEqual(['/usr/bin/env', 'CODEX_HOME=/home/t/.codex', 'codex', 'unarchive', '--', HISTORY_THREAD])
+    expect(w.spawned.length).toBe(1)
+    expect(w.spawned[0].argv.slice(1, 3)).toEqual(['exec', 'resume'])
+    expect(w.spawned[0].argv).toContain(HISTORY_THREAD)
+    expect(handback(result.result)).toContain(resumeFails ? 'codex failed: exit 1' : 'PONG')
+    expect(w.history.map(c => c.argv[3])).toEqual(resumeFails ? ['unarchive'] : ['unarchive', 'archive'])
+    expect(savedState(w, key).historyArchived).toBe(resumeFails ? true : undefined)
+  })
+
+for (const identity of ['missing', 'flag', 'changed'] as const) test(`session history excludes ${identity} source identity`,
+  { options: { archiveSessions: true } }, async ($, on) => {
+    const pieces = identity === 'missing' ? [MESSAGE('done')] : identity === 'flag' ? [THREAD('--all'), MESSAGE('done')]
+      : [THREAD(HISTORY_THREAD), THREAD(HISTORY_OTHER), MESSAGE('done')]
+    let conv: any[] = [user('first')]
+    const w = historyWorld(on, 'exec', { pieces, messages: () => conv, storeSnapshots: true })
+    const result = await step($, 'agent-codex')
+    expect(handback(result.result)).toContain('done')
+    expect(w.history).toEqual([])
+    expect(w.spawned.length).toBe(1)
+    if (identity === 'changed') {
+      const key = 'agent:sess-1:agent-codex'
+      expect(savedState(w, key).historyAmbiguous).toBe(true)
+      conv = [...conv, ...toolResult('SubagentHandback'), user('follow-up')]
+      await step($, 'agent-codex', 0, 'quarantined-follow-up')
+      // A fresh agent/worker hydrates the same bounded record with its sticky
+      // quarantine. The historical foreign ID never becomes archive authority.
+      const compact = compactStoreState(savedState(w, key))
+      expect(compact.historyAmbiguous).toBe(true)
+      w.store.set('agent:sess-1:agent-restarted', compact)
+      conv = [...conv, ...toolResult('SubagentHandback'), user('after reload')]
+      await step($, 'agent-restarted', 0, 'quarantined-reload')
+      expect(w.spawned.length).toBe(3)
+      expect(w.history).toEqual([])
+      expect(savedState(w, 'agent:sess-1:agent-restarted').historyAmbiguous).toBe(true)
+    }
+  })
+
+test('session history: failed source process still archives only after its terminal result', { options: { archiveSessions: true } }, async ($, on) => {
+  const w = historyWorld(on, 'exec', { stdout: historyOutput(), code: 1 })
+  const result = await step($, 'agent-codex')
+  expect(handback(result.result)).toContain('codex failed: exit 1')
+  expect(handback(result.result)).toContain('PONG')
+  expect(w.history.map(c => [c.argv[3], c.ended])).toEqual([['archive', 1]])
+})
+
+test('session history: an aborted source receives no cleanup command', { timeoutMs: 15000, options: { archiveSessions: true } }, async ($, on) => {
+  const w = historyWorld(on, 'exec', { pieces: [THREAD(HISTORY_THREAD), cmdDone('/bin/zsh -lc pwd'), MESSAGE('not completed')] })
+  on('turn.complete', () => ({ text: '' }))
+  await step($, 'agent-abort')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'turn-1', agentId: 'agent-abort', reason: 'aborted' } as any)
+  await new Promise<void>(r => setTimeout(() => r(), 300))
+  expect(w.history).toEqual([])
+  expect(w.kills.count).toBe(1)
+})
+
+test('session history: recovered mirror observation never owns archive or unarchive commands', { options: { archiveSessions: true, progressIntervalMs: 0 } }, async ($, on) => {
+  const m = savedMirror()
+  const w = historyWorld(on, 'exec', { task: m.token, store: mirrorStore(m, { historyArchived: true }),
+    readFile: (path, text) => path.endsWith(`/events-${N_CHILD}.jsonl`) ? nestedJournal : path.endsWith('/owner.json') ? JSON.stringify({ generation: m.generation, ended: true }) : text })
+  let final = ''
+  for (let i = 0; i < 6; i++) {
+    const result = await step($, m.host, i)
+    if (result.result.toolUses.some(u => u.name === 'SubagentHandback')) { final = handback(result.result); break }
+    await runCalls($, result.chunks, m.host)
+  }
+  expect(final).toContain('child checked the fixture')
+  expect(w.history).toEqual([])
+  expect(w.spawned).toEqual([])
+})
 
 test('app-server: session start checks node, the runner and codex app-server; a launch runs the runner with the same profile', { options: { transport: 'app-server', extraConfig: ['tools.view_image=false'] } }, async ($, on) => {
   const w = appWorld(on, { files: new Map([['/home/t/.codex/config.toml', CONFIG_TOML], ['.claude/codex-mod.json', PROJECT_ROLES]]), pieces: [THREAD('t-60'), TURN('tu-1'), MESSAGE('PONG'), USAGE] })
@@ -4584,6 +4853,26 @@ const explorationSource = (item: Record<string, any>) => ({ transport: 'app-serv
 const explorationLine = (item: Record<string, any>, event = 'item/completed') => JSON.stringify({ type: event === 'item/started' ? 'item.started' : 'item.completed',
   item: { ...item, type: 'command_execution', aggregated_output: item.aggregatedOutput, exit_code: item.exitCode }, source: { ...explorationSource(item), event } })
 
+test('activity titles reach failed Bash rows from source metadata without native search reclassification', async ($, on) => {
+  const command = "rg -n 'pilot | draft' docs"
+  const item = { id: 'title-search', type: 'commandExecution', source: 'agent', cwd: '/workspace', command,
+    status: 'failed', exitCode: 2, aggregatedOutput: 'rg: docs: Permission denied\n[output truncated]', truncated: true,
+    commandActions: [{ type: 'search', command, query: 'pilot | draft', path: '/workspace/docs' }] }
+  const w = world(on, { availableTools: [...NATIVE_TOOLS], stdout: explorationLine(item) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
+  const s = await step($, 'agent-progress')
+  const calls = callsOf(s.chunks)
+  expect(calls.length).toBe(1)
+  const call = calls[0]!
+  expect(call.name).toBe('Bash')
+  expect(call.input.command).toBe(command)
+  expect(call.input.description).toBe('Search pilot | draft in docs')
+  const answer: any = await $.tool.call({ tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' } as any)
+  expect(answer.deny).toContain('failed (exit code 2)')
+  expect(answer.deny).toContain(item.aggregatedOutput)
+  expect(w.core).toEqual([])
+  expect(w.reads.some(p => p.startsWith('/workspace'))).toBe(false)
+})
+
 for (const { item, tool } of batch2Cases) {
   test(`batch 2 mapping: ${item.id} -> ${tool}`, () => {
     const action = explorationAction(explorationSource(item))
@@ -4740,7 +5029,7 @@ test('batch 2 an unavailable Grep preserves the successful no-match outcome in B
   const w = world(on, { availableTools: ['Bash'], stdout: explorationLine(fixture.item) + '\n' + itemLine({ type: 'agent_message', text: 'Done' }) })
   const s = await step($, 'agent-progress')
   expect(callsOf(s.chunks).map(c => c.name)).toEqual(['Bash'])
-  expect(callsOf(s.chunks)[0].input.description).toContain('no matches; exit 1')
+  expect(callsOf(s.chunks)[0].input.description).toBe('Search x in . (no matches; exit 1)')
   const [answer]: any = await runCalls($, s.chunks, 'agent-progress')
   expect(answer).toEqual({ result: { stdout: '', stderr: '', interrupted: false } })
   expect(w.core).toEqual([])
@@ -6283,5 +6572,271 @@ test('R6 exec multiAgent off detects a spawn and preserves its honest source rep
     expect(handback(result.result)).toContain('multiAgent=false: Codex child spawn observed')
     expect(handback(result.result)).toContain('1 missing')
     expect(handback(result.result)).toContain('parent done')
+    expect(w.core).toEqual([])
+  })
+
+// Owner grants, named launch requests and persisted execution policy share one resolver.
+const policyFailure = async (operation: () => Promise<unknown>): Promise<string> => {
+  try { await operation(); return 'unexpected success' } catch (error) { return String(error) }
+}
+const executionFs = (paths: Record<string, string> = {}, gitValues: Record<string, string> = {}) => ({ process: { run: async (argv: string[]) => {
+  if (argv[0] === '/bin/sh') {
+    const path = paths[argv[4]!] ?? argv[4]!
+    return { exitCode: path === 'missing' ? 1 : 0, stdout: path === 'missing' ? '' : path + '\n', stderr: '' }
+  }
+  const key = argv.slice(2).join(' ')
+  return { exitCode: gitValues[key] === undefined ? 128 : 0, stdout: gitValues[key] ?? '', stderr: gitValues[key] === undefined ? 'fatal: not a git repository' : '' }
+} } }) as any
+
+test('execution policy defaults are explicit, extraConfig is owner authority, and prompt TOML is never evaluated', async () => {
+  const owner = parseConfig({})
+  const policy = await resolveExecution(executionFs(), owner, {}, '/repo', 'workspace-write')
+  expect(policy).toMatchObject({ cwd: '/repo', sandbox: 'workspace-write', approvalMode: 'never', networkAccess: false, writableRoots: [], source: 'owner' })
+  expect(executionOverrides(policy)).toEqual(['approval_policy="never"', 'approvals_reviewer="user"', 'sandbox_workspace_write.network_access=false', 'sandbox_workspace_write.writable_roots=[]'])
+  expect(ownerExecution(parseConfig({ approvalMode: 'ask', networkAccess: false, extraConfig: ['approval_policy="on-request"', 'approvals_reviewer="auto_review"', 'sandbox_workspace_write.network_access=true', "sandbox_workspace_write.writable_roots=['/extra']"] }))).toEqual({ approvalMode: 'auto', networkAccess: true, writableRoots: ['/extra'] })
+  expect(executionRequest('codex-cwd: /worktree\ncodex-model: gpt-6-sol\ncodex-network: false\nTask /untrusted/path').rest).toBe('codex-model: gpt-6-sol\nTask /untrusted/path')
+  expect(executionRequest('Task: use /untrusted/path and approval_policy="on-request"').request).toEqual({})
+  expect(await policyFailure(() => resolveExecution(executionFs(), owner, { approvalMode: 'orchestrator' }, '/repo', 'workspace-write'))).toContain('not granted by the owner')
+  expect(await policyFailure(() => resolveExecution(executionFs(), owner, { networkAccess: true }, '/repo', 'workspace-write'))).toContain('not granted by the owner')
+  expect(await policyFailure(() => resolveExecution(executionFs(), owner, { writableRoots: ['/foreign'] }, '/repo', 'workspace-write'))).toContain('outside the owner grants')
+  expect(await policyFailure(() => resolveExecution(executionFs(), owner, { sandbox: 'danger-full-access' }, '/repo', 'workspace-write'))).toContain('owner authority')
+})
+
+test('execution cwd accepts only canonical registered worktrees or explicit owner directory grants', async () => {
+  const owner = parseConfig({})
+  const gitValues = { '/repo rev-parse --show-toplevel': '/repo', '/repo rev-parse --path-format=absolute --git-common-dir': '/repo/.git', '/worktree rev-parse --path-format=absolute --git-common-dir': '/repo/.git',
+    '/worktree rev-parse --show-toplevel': '/worktree', '/repo worktree list --porcelain': 'worktree /repo\n\nworktree /worktree\n' }
+  const fs = executionFs({ '/link': '/worktree', '/missing': 'missing' }, gitValues)
+  expect((await resolveExecution(fs, owner, { cwd: '/link' }, '/repo', 'workspace-write')).cwd).toBe('/worktree')
+  expect(await policyFailure(() => resolveExecution(fs, owner, { cwd: '/missing' }, '/repo', 'workspace-write'))).toContain('directory unavailable')
+  expect(await policyFailure(() => resolveExecution(fs, owner, { cwd: '/foreign' }, '/repo', 'workspace-write'))).toContain('cannot validate registered worktree')
+  expect(await policyFailure(() => resolveExecution(executionFs({}, { ...gitValues, '/worktree rev-parse --path-format=absolute --git-common-dir': '/foreign/.git' }), owner, { cwd: '/worktree' }, '/repo', 'workspace-write'))).toContain('not a registered worktree')
+  expect((await resolveExecution(executionFs(), parseConfig({ allowedCwdRoots: ['/allowed'] }), { cwd: '/allowed/child' }, '/repo', 'workspace-write')).cwd).toBe('/allowed/child')
+  expect(await policyFailure(() => resolveExecution(executionFs({ '/allowed/escape': '/foreign' }), parseConfig({ allowedCwdRoots: ['/allowed'] }), { cwd: '/allowed/escape' }, '/repo', 'workspace-write'))).toContain('cannot validate registered worktree')
+})
+
+test('saved execution policy rejects privilege and target drift, revoked grants and missing policy recovery', async () => {
+  const owner = parseConfig({ networkAccess: true, approvalMode: 'orchestrator', additionalWritableRoots: ['/extra'], allowProjectFullAccess: true })
+  const saved = await resolveExecution(executionFs(), owner, {}, '/repo', 'workspace-write')
+  expect(await resolveExecution(executionFs(), owner, {}, '/repo', 'workspace-write', saved)).toEqual(saved)
+  for (const request of [{ networkAccess: false }, { approvalMode: 'never' as const }, { writableRoots: [] }, { sandbox: 'read-only' }]) expect(await policyFailure(() => resolveExecution(executionFs(), owner, request, '/repo', 'workspace-write', saved))).toContain('same-thread resume cannot change')
+  expect(await policyFailure(() => resolveExecution(executionFs(), parseConfig({}), {}, '/repo', 'workspace-write', saved))).toContain('not granted by the owner')
+  const legacy = await resolveExecution(executionFs(), owner, {}, '/repo', 'workspace-write', undefined, true)
+  expect(legacy).toMatchObject({ approvalMode: 'never', networkAccess: false, writableRoots: [], source: 'legacy' })
+  const compacted = compactStoreState({ model: 'm', effort: 'medium', sandbox: 'workspace-write', agentName: 'codex', thread: 'thread', executionFingerprint: saved.fingerprint,
+    effectiveExecution: { ...saved, writableRoots: ['/x'.repeat(2000)] }, extra: 'z'.repeat(50000) })
+  expect(compacted.executionFingerprint).toBe(saved.fingerprint)
+  expect(compacted.effectiveExecution).toBe(undefined)
+})
+
+test('full access reports unrestricted network honestly; read-only never claims writable roots', async () => {
+  const owner = parseConfig({ defaultSandbox: 'danger-full-access' })
+  const full = await resolveExecution(executionFs(), owner, {}, '/repo', 'danger-full-access')
+  expect(full.networkAccess).toBe(true)
+  expect(permissionEvidence('api.github.com connection failed', full)).toContain('sandbox causality unproven')
+  expect(permissionEvidence('error connecting to api.github.com', full)).toContain('sandbox causality unproven')
+  expect(permissionEvidence('EPERM .git/FETCH_HEAD', full)).toContain('network=true')
+  expect(permissionEvidence('EPERM .git/FETCH_HEAD', full)).toContain('unrestricted filesystem')
+  expect(await policyFailure(() => resolveExecution(executionFs(), owner, { networkAccess: false }, '/repo', 'danger-full-access'))).toContain('cannot disable network')
+  const read = await resolveExecution(executionFs(), parseConfig({ networkAccess: true, additionalWritableRoots: ['/extra'] }), {}, '/repo', 'read-only')
+  expect(read).toMatchObject({ networkAccess: false, writableRoots: [] })
+})
+
+test('interactive execution never falls back to exec or launches without owned native ask controls', { options: { approvalMode: 'ask' } }, async ($, on) => {
+  const w = world(on)
+  const r = await step($, 'agent-codex')
+  expect(w.spawned.length).toBe(0)
+  expect(handback(r.result)).toContain('requires app-server')
+})
+
+test('new execution marker with missing private cache refuses resume before spawning', async ($, on) => {
+  const key = 'agent:sess-1:agent-codex'
+  const w = world(on, { store: new Map([[key, { model: 'gpt-6.1-sol', effort: 'medium', sandbox: 'workspace-write', agentName: 'codex', thread: 'thread-old', updatedAt: 1, executionFingerprint: 'saved-policy' }]]) })
+  const r = await step($, 'agent-codex')
+  expect(w.spawned.length).toBe(0)
+  expect(handback(r.result)).toContain('saved execution policy unavailable')
+})
+
+for (const mode of ['ask', 'orchestrator']) test(`interactive ${mode} fails closed when native controls or authoritative parent are missing`,
+  { options: { transport: 'app-server', approvalMode: mode, nativeActions: false } }, async ($, on) => {
+    const w = appWorld(on, mode === 'orchestrator' ? { agentList: () => [{ id: 'agent-codex', type: 'codex-mod:codex', status: 'running' }] } : {})
+    await startSession($)
+    const r = await step($, 'agent-codex')
+    expect(w.spawned.length).toBe(0)
+    expect(handback(r.result)).toContain(mode === 'ask' ? 'native UI controls' : 'authoritative Claude parent identity')
+  })
+
+for (const reason of ['missing-entry', 'list-failure', 'codex-parent']) test(`orchestrator rejects ${reason} without a source launch`,
+  { options: { transport: 'app-server', approvalMode: 'orchestrator' } }, async ($, on) => {
+    let calls = 0
+    const w = appWorld(on, { agentList: () => {
+      calls++
+      if (reason === 'list-failure' && calls > 1) throw new Error('authoritative agent list unavailable')
+      if (reason === 'missing-entry' && calls > 1) return []
+      return [{ id: 'agent-codex', type: 'codex-mod:codex', description: 'source', status: 'running', parentId: 'source-parent' },
+        { id: 'source-parent', type: 'codex-mod:codex', description: 'source parent', status: 'running', parentId: undefined }] as any
+    } })
+    await startSession($)
+    const r = await step($, 'agent-codex')
+    expect(w.spawned.length).toBe(0)
+    expect(handback(r.result)).toContain('codex failed')
+  })
+
+for (const nested of [false, true]) test(`orchestrator tool binds ${nested ? 'nested Claude' : 'main'} parent, rejects siblings/source/mirrors and consumes an exact decision once`,
+  { options: { transport: 'app-server', approvalMode: 'orchestrator', progressIntervalMs: 0 } }, async ($, on) => {
+    let parentActive = true
+    const q = { type: 'codexmod.request', token: 'approval-token-123', requestId: 71, method: 'item/commandExecution/requestApproval', status: 'pending',
+      params: { threadId: 'approval-thread', turnId: 'approval-turn', itemId: 'approval-item', approvalId: 'callback', kind: 'writeStdin', command: 'printf exact', startedAtMs: 1 } }
+    const w = appWorld(on, { agentList: () => [
+      { id: 'agent-codex', type: 'codex-mod:codex', description: 'source', status: 'running', ...(nested ? { parentId: 'claude-parent' } : {}) },
+      { id: 'claude-parent', type: 'general-purpose', description: 'parent', status: parentActive ? 'running' : 'completed', parentId: undefined },
+      { id: 'sibling', type: 'general-purpose', description: 'sibling', status: 'running', parentId: undefined },
+      { id: 'source-mirror', type: 'codex-mod:codex-child', description: 'mirror', status: 'running', parentId: undefined },
+    ], pieces: [THREAD('approval-thread'), TURN('approval-turn'), out(JSON.stringify(q)), cmdDone('printf permitted-parallel-command'), MESSAGE('done')] })
+    await startSession($)
+    await step($, 'agent-codex')
+    const parent = nested ? { agentId: 'claude-parent' } : {}
+    const inspect = { tool: 'mcp__codex-mod__codex_approval', tool_use_id: 'inspect-approval', targetAgentId: 'agent-codex', action: 'inspect' }
+    for (const agentId of ['agent-codex', 'source-mirror', 'sibling', ...(nested ? [] : ['claude-parent'])]) {
+      const denied: any = await $.tool.call({ ...inspect, agentId } as any)
+      expect(denied.deny).toContain('immediate Claude parent')
+    }
+    if (nested) expect((await $.tool.call(inspect as any) as any).deny).toContain('immediate Claude parent')
+    const pending: any = await $.tool.call({ ...inspect, ...parent } as any)
+    const identity = JSON.parse(pending.result[0].text)[0].identity
+    expect(identity).toMatchObject({ method: q.method, requestId: 71, token: q.token, approvalId: 'callback', kind: 'writeStdin' })
+    const decide = { ...inspect, ...parent, action: 'decide', identity, decision: 'accept' }
+    expect((await $.tool.call({ ...decide, identity: { ...identity, approvalId: 'foreign' } } as any) as any).deny).toContain('stale or mismatched')
+    if (nested) {
+      parentActive = false
+      expect((await $.tool.call(decide as any) as any).deny).toContain('immediate Claude parent')
+      parentActive = true
+    }
+    const accepted: any = await $.tool.call(decide as any)
+    expect(accepted.result[0].text).toContain('submitted')
+    expect(w.writes.filter(v => v.path.endsWith(`/response-${q.token}.json`)).length).toBe(1)
+    expect(JSON.parse(w.writes.find(v => v.path.endsWith(`/response-${q.token}.json`))!.text)).toMatchObject({ ...identity, decision: 'accept', actor: 'orchestrator' })
+    expect((await $.tool.call(decide as any) as any).deny).toContain('stale or mismatched')
+    expect(w.core).toEqual([])
+    expect(w.checks).toEqual([])
+  })
+
+const approvalPatch = [{ path: '/repo/exact.txt', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+exact-proposal\n' }]
+const fileApprovalRequest = { type: 'codexmod.request', token: 'file-approval-token', requestId: 791, method: 'item/fileChange/requestApproval', status: 'pending',
+  params: { threadId: 'approval-thread', turnId: 'approval-turn', itemId: 'approval-file', startedAtMs: 1, reason: 'Reason is not a proposed patch' } }
+const approvalFileEvent = (id: string, changes = approvalPatch, status = 'inProgress', turn = 'approval-turn') => {
+  const item = { id, type: 'fileChange', status, changes }
+  return out(JSON.stringify({ type: status === 'inProgress' ? 'item.started' : 'item.completed', item: { ...item, type: 'file_change' },
+    source: { transport: 'app-server', event: status === 'inProgress' ? 'item/started' : 'item/completed', threadId: 'approval-thread', turnId: turn, item } }))
+}
+const approvalHost = () => [{ id: 'agent-codex', type: 'codex-mod:codex', description: 'Owned source task', status: 'running' }]
+
+test('file approval manual controls show only the exact proposal and submit its bound snapshot once',
+  { options: { transport: 'app-server', approvalMode: 'ask', progressIntervalMs: 0 } }, async ($, on) => {
+    const w = appWorld(on, { agentList: approvalHost, pieces: [THREAD('approval-thread'), TURN('approval-turn'),
+      approvalFileEvent('competing-file', [{ path: '/repo/foreign.txt', kind: { type: 'delete' }, diff: '-foreign-proposal' }]),
+      approvalFileEvent('approval-file'), out(JSON.stringify(fileApprovalRequest)), MESSAGE('done')] })
+    await startSession($)
+    const result = await step($, 'agent-codex')
+    const call = callsOf(result.chunks).find(c => c.name === 'mcp__codex-mod__codex_question')!
+    await runCalls($, result.chunks, 'agent-codex')
+    const card: any = await b6Render($, call)
+    const shown = JSON.parse(card.children.find((c: any) => c.type === 'Text' && c.children?.[0]?.includes('"changes"')).children[0])
+    expect(shown.item.changes).toEqual(approvalPatch)
+    expect(shown.identity).toMatchObject({ token: fileApprovalRequest.token, requestId: 791, itemId: 'approval-file' })
+    expect(JSON.stringify(card)).not.toContain('foreign-proposal')
+    const accept = card.children.find((c: any) => c.type === 'Button' && c.props.label === 'Approve once')
+    await $.ui.press({ plugin: 'codex-mod', surface: 'desktop', requestId: call.id, key: accept.props.key } as any)
+    await $.ui.press({ plugin: 'codex-mod', surface: 'desktop', requestId: call.id, key: accept.props.key } as any)
+    const responses = w.writes.filter(v => v.path.endsWith(`/response-${fileApprovalRequest.token}.json`))
+    expect(responses.length).toBe(1)
+    expect(JSON.parse(responses[0].text)).toMatchObject({ ...shown.identity, fileChanges: shown, decision: 'accept', actor: 'human' })
+    expect(w.core).toEqual([])
+  })
+
+for (const missing of ['wrong-item', 'wrong-turn', 'empty', 'oversized']) test(`file approval manual ${missing} evidence offers refusal controls without blind acceptance`,
+  { options: { transport: 'app-server', approvalMode: 'ask', progressIntervalMs: 0 } }, async ($, on) => {
+    const event = missing === 'wrong-item' ? approvalFileEvent('competing-file') : missing === 'wrong-turn' ? approvalFileEvent('approval-file', approvalPatch, 'inProgress', 'old-turn') :
+      approvalFileEvent('approval-file', missing === 'empty' ? [] : [{ path: '/repo/too-large.txt', kind: { type: 'add' }, diff: 'z'.repeat(32768) }])
+    const w = appWorld(on, { agentList: approvalHost, pieces: [THREAD('approval-thread'), TURN('approval-turn'), event, out(JSON.stringify(fileApprovalRequest)), MESSAGE('done')] })
+    await startSession($)
+    const result = await step($, 'agent-codex')
+    const call = callsOf(result.chunks).find(c => c.name === 'mcp__codex-mod__codex_question')!
+    await runCalls($, result.chunks, 'agent-codex')
+    const card: any = await b6Render($, call)
+    expect(JSON.stringify(card)).toContain('acceptance disabled')
+    const labels = card.children.filter((c: any) => c.type === 'Button').map((c: any) => c.props.label)
+    expect(labels).toEqual(['Decline', 'Cancel turn'])
+    expect(w.writes).toEqual([])
+    const decline = card.children.find((c: any) => c.type === 'Button' && c.props.label === 'Decline')
+    await $.ui.press({ plugin: 'codex-mod', surface: 'desktop', requestId: call.id, key: decline.props.key } as any)
+    expect(JSON.parse(w.writes[0].text)).toMatchObject({ decision: 'decline', itemId: 'approval-file', token: fileApprovalRequest.token })
+  })
+
+for (const stale of [false, true]) test(`file approval parent inspect provides exact changes and ${stale ? 'rejects a stale proposal' : 'requires the inspected proposal for acceptance'}`,
+  { options: { transport: 'app-server', approvalMode: 'orchestrator', progressIntervalMs: 0 } }, async ($, on) => {
+    const w = appWorld(on, { agentList: approvalHost, pieces: [THREAD('approval-thread'), TURN('approval-turn'),
+      approvalFileEvent('competing-file', [{ path: '/repo/foreign.txt', kind: { type: 'delete' }, diff: '-foreign-proposal' }]),
+      approvalFileEvent('approval-file'), out(JSON.stringify(fileApprovalRequest)), cmdDone('printf permitted-parallel-command'),
+      approvalFileEvent('approval-file', [], 'completed'), cmdDone('printf after-proposal-closed'), MESSAGE('done')] })
+    await startSession($)
+    const first = await step($, 'agent-codex')
+    const inspect = { tool: 'mcp__codex-mod__codex_approval', tool_use_id: 'file-inspect', targetAgentId: 'agent-codex', action: 'inspect' }
+    const inspected: any = await $.tool.call(inspect as any)
+    const pending = JSON.parse(inspected.result[0].text)[0]
+    expect(pending.acceptAllowed).toBe(true)
+    expect(pending.fileChanges.item.changes).toEqual(approvalPatch)
+    expect(JSON.stringify(pending)).not.toContain('foreign-proposal')
+    const decide = { ...inspect, action: 'decide', identity: pending.identity, decision: 'accept' }
+    expect((await $.tool.call(decide as any) as any).deny).toContain('file proposal')
+    if (stale) {
+      await runCalls($, first.chunks, 'agent-codex')
+      await step($, 'agent-codex', 1)
+      expect((await $.tool.call({ ...decide, fileChanges: pending.fileChanges } as any) as any).deny).toContain('file proposal')
+      const current: any = await $.tool.call(inspect as any)
+      expect(JSON.parse(current.result[0].text)[0].acceptAllowed).toBe(false)
+      expect(w.writes).toEqual([])
+      expect((await $.tool.call({ ...decide, decision: 'decline' } as any) as any).result[0].text).toContain('submitted')
+    } else {
+      expect((await $.tool.call({ ...decide, fileChanges: { ...pending.fileChanges, item: { ...pending.fileChanges.item, id: 'competing-file' } } } as any) as any).deny).toContain('file proposal')
+      expect((await $.tool.call({ ...decide, fileChanges: pending.fileChanges } as any) as any).result[0].text).toContain('submitted')
+      expect(JSON.parse(w.writes[0].text).fileChanges).toEqual(pending.fileChanges)
+    }
+    expect(w.core).toEqual([])
+  })
+
+for (const context of ['opaque', 'stdin', 'item', 'network']) test(`command approval manual ${context} exposes actionable context without inventing stdin bytes`,
+  { options: { transport: 'app-server', approvalMode: 'ask', progressIntervalMs: 0 } }, async ($, on) => {
+    const q = { ...fileApprovalRequest, token: 'command-context-token', requestId: 792, method: 'item/commandExecution/requestApproval', params: { threadId: 'approval-thread', turnId: 'approval-turn',
+      itemId: 'approval-command', startedAtMs: 2, kind: context === 'stdin' ? 'writeStdin' : 'command', ...(context === 'network' ? { networkApprovalContext: { host: 'api.example.test', protocol: 'https' } } : {}) } }
+    const item = { id: 'approval-command', type: 'commandExecution', status: 'inProgress', command: 'ORIGINAL_COMMAND_IS_NOT_STDIN' }
+    const commandItem = out(JSON.stringify({ type: 'item.started', item: { ...item, type: 'command_execution' }, source: { transport: 'app-server', event: 'item/started', threadId: 'approval-thread', turnId: 'approval-turn', item } }))
+    const w = appWorld(on, { agentList: approvalHost, pieces: [THREAD('approval-thread'), TURN('approval-turn'), ...(['stdin', 'item'].includes(context) ? [commandItem] : []), out(JSON.stringify(q)), MESSAGE('done')] })
+    await startSession($)
+    const result = await step($, 'agent-codex')
+    const call = callsOf(result.chunks).find(c => c.name === 'mcp__codex-mod__codex_question')!
+    await runCalls($, result.chunks, 'agent-codex')
+    const card: any = await b6Render($, call)
+    const accept = card.children.find((c: any) => c.type === 'Button' && c.props.label === 'Approve once')
+    if (['opaque', 'stdin'].includes(context)) {
+      expect(accept).toBe(undefined)
+      expect(JSON.stringify(card)).toContain('acceptance disabled')
+      expect(JSON.stringify(card)).not.toContain('ORIGINAL_COMMAND_IS_NOT_STDIN')
+    } else {
+      expect(Boolean(accept)).toBe(true)
+      if (context === 'network') expect(JSON.stringify(card)).toContain('api.example.test')
+      else expect(JSON.stringify(card)).toContain('ORIGINAL_COMMAND_IS_NOT_STDIN')
+      await $.ui.press({ plugin: 'codex-mod', surface: 'desktop', requestId: call.id, key: accept.props.key } as any)
+      expect(JSON.parse(w.writes[0].text).commandContext.kind).toBe(context === 'network' ? 'network' : 'command')
+    }
+  })
+
+
+test('execution launch refuses selecting protected descendants from a parent writable-root grant',
+  { options: { additionalWritableRoots: ['/tmp/project'] } }, async ($, on) => {
+    const w = world(on, { task: 'codex-writable-roots: ["/tmp/project/.git"]\nDo the bounded task' })
+    const r = await step($, 'agent-codex')
+    expect(w.spawned.length).toBe(0)
+    expect(handback(r.result)).toContain('exactly match an explicit canonical owner root')
     expect(w.core).toEqual([])
   })

@@ -11,16 +11,16 @@ Run these checks before opening a pull request:
 ```bash
 claude plugin test .
 claude plugin validate --strict .
-node --test tests/runner.test.mjs
+node --test tests/runner.test.mjs tests/approval-policy.test.mjs
 ```
 
-The runner tests (`tests/runner.test.mjs`) need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment. CI (`.github/workflows/ci.yml`) runs the runner tests, a syntax check and a JSON validity check on Ubuntu and macOS with Node 20 and 22; the hook tests and `claude plugin validate` run locally.
+The runner and approval-policy tests need only Node 18 or later and a fake app-server. The hook tests (`tests/codex.test.ts`) import `claude-code/testing`, which ships with Claude Code, so they cannot run in a generic CI environment. CI (`.github/workflows/ci.yml`) runs the runner and approval-policy tests, a syntax check and a JSON validity check on Ubuntu and macOS with Node 20 and 22; the hook tests and `claude plugin validate` run locally.
 
-The cache and checkpoint tests import TypeScript helpers. Run them with Node 22
+The cache, checkpoint and execution-policy tests import TypeScript helpers. Run them with Node 22
 or later; CI exercises them on Node 22 on both operating systems:
 
 ```bash
-node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs
+node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs tests/execution-policy.test.mjs
 ```
 
 ## Release checklist

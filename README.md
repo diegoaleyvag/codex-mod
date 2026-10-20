@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml/badge.svg)](https://github.com/diegoaleyvag/codex-mod/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version 1.2.0](https://img.shields.io/badge/version-1.2.0-informational.svg)](CHANGELOG.md)
+[![Version 1.2.1](https://img.shields.io/badge/version-1.2.1-informational.svg)](CHANGELOG.md)
 
 codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hooks-module API) that adds subagent types answered by the OpenAI Codex CLI running on your machine instead of an Anthropic model. Claude stays the orchestrator and delegates self-contained tasks to `codex exec --json`, using your own ChatGPT/Codex login. Codex's commands and file changes show up in the transcript as ordinary Bash, Edit and Write rows, and its final answer comes back like any other subagent report.
 
@@ -10,7 +10,18 @@ codex-mod is a Claude Code plugin (a "mod", built on the early-access plugin hoo
 
 *Claude delegates to a Codex agent (gpt-6-luna, low), then sends it a change of plan while it works; Codex picks it up mid-turn.*
 
-## What's new in 1.2
+## What's new in 1.2.1
+
+- Explicit working directories, registered-worktree validation and owner grants
+  for network, writable roots, sandbox and approval modes, pinned across resumes.
+- Opt-in Codex automatic review, manual controls and delegation to the immediate
+  Claude parent. Experimental controls and their host limits are listed under
+  [Execution policy](#execution-policy-and-working-directories).
+- More useful deterministic command titles and optional completion archiving
+  that preserves history and same-thread follow-ups.
+- CI coverage for runner, approval, execution-policy and recovery helpers.
+
+### Included from 1.2
 
 - **More faithful action rows:** reads, searches, file changes, web results and
   plans use native rows when source evidence and host admission permit them,
@@ -94,7 +105,7 @@ Image views use guarded Read image results with actual PNG/JPEG/GIF/WebP bytes o
 
 Reasoning summaries appear as best-effort live thinking, absent from reopened native thinking history; raw reasoning content never crosses the wire. Summary streaming remains opted out; completed public summaries use existing step pacing. Commentary, partial answers, proposed plans and full review-mode text appear separately and cannot become the final handback. Actual complete structured findings can use guarded ReportFindings with `richRows`; review prose is never parsed into invented findings. Warnings do not fail the turn, compaction notices deduplicate against their source item, and sleep reports elapsed time without scheduling anything.
 
-With `app-server`, `nativeActions:true` and `lean:false`, explicit non-secret choice questions (1–4 questions, 2–4 options each, short headers, no Other/free-text option) use an owned `codex_question` card. Select answers and press **Send selected answers**, or **Cancel question**. Only that explicit action sends a bound, one-time RPC response; card receipt is neither answer nor approval. An acknowledged answer can add an admitted AskUserQuestion reported-answer row with `richRows`. Unavailable question UI, unsupported shapes, all permission/approval requests and exec requests get explicit unsupported errors; `approvalPolicy:never` is unchanged. Ended, resolved, restarted and stale requests cannot be answered by old controls. Headless `-p` has no human controls, so use the interactive/Desktop harness for pending questions.
+With `app-server`, `nativeActions:true` and `lean:false`, explicit non-secret choice questions (1–4 questions, 2–4 options each, short headers, no Other/free-text option) use an owned `codex_question` card. Select answers and press **Send selected answers**, or **Cancel question**. Only that explicit action sends a bound, one-time RPC response; card receipt is neither answer nor approval. An acknowledged answer can add an admitted AskUserQuestion reported-answer row with `richRows`. Unavailable question UI, unsupported shapes and exec questions get explicit unsupported errors. Permission approvals remain disabled by default; the owner-granted approval modes are described under [Execution policy](#execution-policy-and-working-directories). Ended, resolved, restarted and stale requests cannot be answered by old controls. Headless `-p` has no human controls, so use the interactive/Desktop harness for pending questions.
 
 `nativeActions:false` shows attributed text and disables interactive question requests. The offline host probe accepted Read image and ReportFindings results without executor calls or inference; AskUserQuestion was unavailable in that noninteractive host. See the [Batch 6 harness](tests/fixtures/batch6-harness.md) and [Codex UI map](docs/codex-ui-map.md) for contracts, coverage and remaining Desktop checks.
 
@@ -322,6 +333,7 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `projectCapabilityAllowlist` | `[]` | Selective user grants such as `webSearch:live`, `mcp:rea`, `multiAgent`. |
 | `capacityFallback` | `["gpt-6-sol", "gpt-5.6-sol"]` | Ordered catalog-validated candidates for one same-thread capacity retry. |
 | `globalRules` | `true` | Off (experimental): run Codex with a plugin-owned `CODEX_HOME` so your user-level `AGENTS.md` is not loaded. |
+| `archiveSessions` | `false` | Archive owned source threads after the Codex process ends; preserve history and same-thread follow-ups. Active or interrupted runs can remain visible. |
 | `extraConfig` | none | Raw `key=value` entries passed as `-c` to every launch. `model`, `model_reasoning_effort` and `sandbox_mode` are refused. |
 | `handbackMode` | `auto` | `auto`: `SubagentHandback`, plain text only if the tool is not active for the agent. `tool` or `text` force one. |
 | `footer` | `full` | `full`, `short` (agent, model, effort) or `off`. |
@@ -335,6 +347,29 @@ Set them in the plugin's config screen or under `pluginConfigs` in settings. An 
 | `transport` | `exec` | `exec` (`codex exec --json`, most stable) or `app-server` (experimental, see [Transports](#transports)). |
 | `nodePath` | empty | Absolute path of Node (18 or later) for the `app-server` sidecar. Empty: `PATH`, then common locations. |
 | `pruneDays` | `2` | Delete stored agent records (thread, model, effort) unused for this many days. |
+
+`archiveSessions: true` runs `codex archive -- <thread UUID>` after an owned
+source process has ended, on both transports and app-server's exec fallback.
+This removes completed plugin sessions from the normal Codex/Work history
+without deleting them. The command uses the same Codex executable and recorded
+`CODEX_HOME` as the source run. Authentication, permissions and source metadata
+stay unchanged. Mirror observers, unowned threads and records with conflicting source IDs are
+never archived; conflicting IDs also disable future unarchive commands for that
+record, including after reload.
+
+Follow-ups first try `codex unarchive -- <thread UUID>`, then resume that exact
+thread once. The saved archive flag keeps this recovery available after the
+option is disabled. Unarchive is best effort: the CLI reports a generic failure
+for an already active thread as well as other errors, so the ordinary same-ID
+resume checks its state. A history-command failure never starts a replacement
+thread or replays work, and an archive failure preserves the answer with a
+short notice. Details go to the debug log.
+
+Running sessions can appear in chat lists. Abort, timeout, worker interruption
+or process crashes can miss cleanup; archive those sessions manually when they
+are no longer running. Older sessions are not scanned or changed by this option.
+Real Codex children keep their provenance and are not separately archived by
+the source-run cleanup. This is completion cleanup, not guaranteed invisibility.
 
 `handbackMode: "tool"` can lose answers in a session where the host does not offer `SubagentHandback`; keep `auto`.
 
@@ -403,7 +438,7 @@ To set `transport` from a settings file:
 - **`exec`** (default, most stable). Each launch is `codex exec --json`. A message sent to an agent while it runs cannot reach the running turn: it is queued and runs after the turn, resuming the same thread.
 - **`app-server`** (opt-in, needs Node 18 or later on `PATH` or `nodePath`). A per-run sidecar, `scripts/codex-runner.mjs`, owns the stdin of `codex app-server` for that run, because the hook cannot keep a child's stdin open. A message you send to a running Codex agent is delivered mid-turn (`turn/steer`), and stopping the agent sends `turn/interrupt`. Codex marks `app-server` as experimental, so its protocol may change.
 
-If Node, the runner or `codex app-server` is unavailable, the session falls back to `exec` automatically and the footer says why.
+If Node, the runner or `codex app-server` is unavailable, `approvalMode: "never"` falls back to `exec` and the footer says why. Other approval modes fail before launch; they never lose approval handling through fallback.
 
 The agent's output shows what happened to a message:
 
@@ -425,7 +460,7 @@ The bridge remains per run with stdout event translation. Exec remains the defau
 
 ### Global rules off
 
-With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/codex-mod/home` (default `~/.cache/codex-mod/home`), which contains symbolic links to your real `auth.json`, `config.toml` and `models_cache.json` only. The plugin never writes to your real Codex home. Trade-offs: sessions for these runs live in the shadow folder (threads do not carry across the switch), skills and plugins from your Codex home are not visible, and if Codex replaces `auth.json` instead of writing through the link, your main install may ask you to log in again.
+With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/codex-mod/home` (default `~/.cache/codex-mod/home`), which contains symbolic links to your real `auth.json`, `config.toml` and `models_cache.json` only. The plugin leaves those auth and configuration files alone; optional archive commands update session history in each source run's recorded home. Trade-offs: sessions for these runs live in the shadow folder (threads do not carry across the switch), skills and plugins from your Codex home are not visible, and if Codex replaces `auth.json` instead of writing through the link, your main install may ask you to log in again.
 
 ## How is this different from openai/codex-plugin-cc?
 
@@ -443,7 +478,7 @@ With `globalRules` off, Codex runs with `CODEX_HOME` set to `$XDG_CACHE_HOME/cod
 - In auto mode, every handback carries the note "Auto mode classifier was unavailable". No Anthropic request was made for the classifier to review, so the note is accurate: Claude did not review Codex's work. Verify it yourself.
 - The plugin relies on early-access APIs (`turn.step`, `tool.call`, `$.agent.register`, `SubagentHandback`) that may change.
 - Installing or editing the plugin takes effect in a new session.
-- In `workspace-write`, Codex usually cannot commit inside a git worktree or use the network; let the caller commit and push.
+- `workspace-write` defaults restrict network and protected Git metadata. Owner network and exact Git-directory grants can expand those capabilities; see [Execution policy](#execution-policy-and-working-directories). Commit and push authority still comes from the task.
 - Only finished actions, messages and available reasoning summaries are shown; raw reasoning is never shown. Exact patch adapters preserve empty content, CRLF and missing final newlines; they never clip Write/Edit inputs. Binary, oversized, ambiguous and missing/racing-snapshot patches retain a Bash diff/report. Normal exec payloads without per-file diffs cannot establish exact Write/Edit inputs. Typed Bash patch mapper acceptance and Desktop paint still require the headless/new-session checks in `tests/fixtures/batch3-harness.md`.
 - With `app-server`, a steer is applied at Codex's next step boundary, not instantly.
 - A root driver run does not survive a restart of the plugin worker: it reports `codex failed: run lost`, and a follow-up resumes its thread. A mirror can re-adopt its existing live broker/journal; missing ownership degrades without relaunch.
@@ -484,3 +519,182 @@ Not affiliated with or endorsed by Anthropic or OpenAI. Claude and Claude Code a
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Execution policy and working directories
+
+The user-level plugin options own execution authority. Repository files and task
+text can request capabilities but cannot grant them. Defaults remain
+`workspace-write`, `approvalMode: "never"`, network off and no additional writable
+roots. Both transports now force this policy explicitly. This closes exec's former
+inheritance of `approval_policy` and workspace network/roots from `config.toml`;
+users relying on that inheritance must copy those grants into the plugin options
+or the supported user `extraConfig` keys before activating this version.
+
+| User option | Meaning |
+| --- | --- |
+| `approvalMode` | `never` (default), `ask`, `auto`, or `orchestrator` |
+| `allowedApprovalModes` | Additional modes named launch headers may request; defaults to none |
+| `networkAccess` | Workspace sandbox network grant, default false |
+| `additionalWritableRoots` | Up to 32 existing absolute writable directory grants |
+| `allowedCwdRoots` | Additional existing directory roots allowed for explicit launch cwd requests |
+
+`defaultSandbox: "danger-full-access"` is a ready opt-in for the generic agent's
+unrestricted filesystem and network access. Repository roles still require
+`allowProjectFullAccess: true` to request that sandbox. It has no network or
+writable-root boundary; use `workspace-write` to retain those controls. Ordinary
+extra roots do not automatically remove Codex's protected `.git` rules.
+Installed-CLI probes confirmed that extra roots plus network allow a sibling
+directory write and network connection while `.git/FETCH_HEAD` remains protected.
+A separate real CLI probe verified that explicitly granting the exact `.git`
+directory allows `FETCH_HEAD` writes; full access also permits them. For linked
+worktrees, inspect `git rev-parse --absolute-git-dir` and
+`git rev-parse --path-format=absolute --git-common-dir`, and grant only the exact
+real directories the owner intends. The plugin never adds these grants itself.
+These are CLI policy probes, not live Desktop plugin acceptance.
+
+Start a new task with an optional block of named headers, for example:
+
+```text
+codex-cwd: /absolute/path/to/registered-worktree
+codex-approval: never
+codex-sandbox: workspace-write
+codex-network: false
+codex-writable-roots: ["/absolute/explicit-owner-root"]
+codex-model: gpt-6.1-sol
+Implement the bounded task here.
+```
+
+The requested cwd must exist and resolve either to a registered worktree with the
+same Git common directory as the host repository, or under an explicit
+`allowedCwdRoots` grant. Symlinks resolve before grant comparisons. Missing,
+unrelated and unregistered targets fail before model launch. Paths mentioned in
+prose do not change cwd or write roots. The worktree becomes Codex's cwd and
+workspace sandbox root; additional roots are separate owner grants.
+
+An omitted header uses the owner default. Approval mode `never` is always
+available; any other requested mode must be the owner default or appear in
+`allowedApprovalModes`. Sandbox requests are bounded by the owner's
+`defaultSandbox` and `allowProjectFullAccess` grant. Network can be requested only
+when the owner enables it. A writable-root list can select only exact canonical
+members of the owner-granted root list, including on resume. Descendants require their own explicit owner
+grant: granting `/repo` does not authorize requesting `/repo/.git`, `/repo/.codex`,
+`/repo/.agents` or even `/repo/src` as a separate root. Naming a protected child
+explicitly can expand its permissions. Symlink aliases are accepted only when
+they resolve to the same explicitly granted canonical directory. Read-only has
+no writable-root grant and this version does not implement read-only network
+expansion. A launch cannot request
+network off while retaining `danger-full-access`.
+
+The supported execution `extraConfig` keys are `approval_policy` (`"never"` or
+`"on-request"`), `approvals_reviewer` (`"user"` or `"auto_review"`),
+`sandbox_workspace_write.network_access` and
+`sandbox_workspace_write.writable_roots`. These **user-owned** entries override
+plugin option defaults first; named launch requests then select a permitted
+narrower policy. `on-request` with reviewer `user` selects `ask`, while
+`auto_review` selects `auto`. Whole sandbox tables and unsupported execution
+values fail explicitly. No launch header accepts arbitrary TOML.
+
+Each thread saves its exact effective cwd, sandbox, approval mode, network,
+roots, policy source and fingerprint, alongside source evidence. Snapshot v2 also
+records the cwd's original session, registered-worktree or owner-root authority.
+Every resume revalidates that original authority against current owner grants and
+Git registration/common-directory metadata. Moving the host onto an externally
+granted target cannot turn a revoked grant into session authority. Existing v1
+execution snapshots lack this anchor and fail explicitly; start a new agent.
+Follow-ups keep that snapshot; privilege or target changes require a new agent. Revoked owner
+grants fail closed. New-policy records with a missing recovery payload fail
+instead of becoming legacy records. Old records without an execution snapshot
+use a disclosed conservative baseline: their recorded sandbox, current host cwd,
+never approvals, network off and no additional roots. Full access is inherently
+unrestricted. Host cwd changes do not retarget a snapshotted thread.
+
+### Approval modes
+
+`never` supports either transport, including app-server's ordinary exec fallback.
+Every other mode requires `app-server`; an unavailable runner or unsupported
+reviewer fails explicitly and cannot silently fall back to exec or full access.
+A ready opt-in for native Codex review is `transport: "app-server"` with
+`approvalMode: "auto"`. This sends `on-request` and the installed Codex
+`approvalsReviewer: "auto_review"` at thread and turn start. It uses Codex's
+reviewer, not a Claude safety classifier. A fresh Desktop session with a Sonnet
+parent and a Codex worker verified a native auto-review approval for computer-tool
+inventory, alongside Git writes and network access under explicit full access.
+This does not establish every approval type or interactive control.
+
+`ask` is experimental and depends on owned native approval controls:
+**Approve once**, **Decline**, and **Cancel turn**, limited to decisions the source
+request offers. It requires native action tools and a host that actually invokes
+the custom renderer and supports buttons. Successful tool registration alone
+does not establish this. A fresh session in Desktop 2.42304.2 with bundled Claude
+Code 2.1.299 displayed only generic request details, without buttons, so manual
+approval is **not operational in that tested child view**. The request expired
+without applying its patch; no human decision was fabricated. Missing controls
+fail explicitly, and an unanswered/invisible pending approval expires after 120 seconds
+without consent. Opening a row, receiving a request or rendering a receipt never
+approves it.
+
+`orchestrator` is an explicit owner delegation to the source agent's authoritative
+immediate Claude parent. The parent must launch the Codex worker **in the
+background**, then poll `codex_approval` with `action: "inspect"` and the exact
+`targetAgentId` **before** blocking on completion. Inspect returns the complete
+request and bound `identity`. Decide with `action: "decide"`, that unchanged
+identity, and `decision: "accept"`, `"decline"` or `"cancel"`. For file acceptance,
+copy the full `fileChanges` returned by inspect. When inspect supplies a command
+item fallback, also copy its `commandContext`. These snapshots are checked again
+against the exact current owned source item before submission and in the runner. A permission request
+may additionally select a `permissions` subset. Submission is acknowledged before
+runner delivery; inspect again or read the source outcome rather than replaying
+the decision. Parent auto mode does not receive these requests automatically.
+There is no internal parent notification; polling is required. An unanswered
+request expires after 120 seconds.
+
+A fresh Sonnet 5.5 medium parent in Desktop verified five independent delegated
+cases: file accept/decline/cancel and command accept/cancel. Root checks confirmed
+the two accepted files' exact bytes, absence of all three denied/cancelled files,
+source completion or interruption and history archiving. Headless real-parent
+file and command acceptance also passed. `inspect` exposes current pending
+requests, not a durable delivery receipt; `codex_message_status` tracks
+SendMessage, not approvals. Use the source result to verify delivery. The tested
+command request offered accept, a policy amendment and cancel, with no decline;
+unsupported decisions are never added. Permission-grant and stdin approval
+variants remain **NOT RUN** in Desktop.
+
+The approval tool rejects source Codex agents, mirrors, unrelated Claude agents,
+wrong sessions, orphaned children and missing/failed authoritative parent lookup.
+If the host does not expose enough parent identity, orchestrator mode fails before
+launch. Decisions bind method, JSON-RPC ID, token, thread, turn, item, optional
+`approvalId` and command/`writeStdin` kind. Cancellation, interruption, turn end,
+resolved RPCs and stale identities supply no consent. Command and file responses
+are one-shot; permission grants contain only requested literal paths/network and
+use turn scope. Session approvals, policy amendments, unstable file `grantRoot`,
+special/glob permission roots and unknown RPCs remain unsupported. File approval
+controls and parent inspection show the exact matching in-progress source item's
+paths, kinds and diff, never a patch inferred from a reason or another item.
+Missing, stale, empty, incomplete or oversized proposals disable acceptance. The
+complete proposal limit is 32 files and 32,768 characters; proposals are rejected in full
+instead of silently truncated. Decline and cancel remain available. Command
+approvals require actionable command, explicit stdin callback payload or network
+destination context. Original command text never supplies missing stdin bytes;
+network host/protocol context is shown separately. No reusable
+approval secret is persisted, and Claude never executes or replays the operation.
+
+Permission diagnostics retain the original command output and add policy facts
+for clear permission denials such as `EPERM`, `FETCH_HEAD` and ref-lock failures.
+A message such as `error connecting to api.github.com` is reported as a network
+failure with policy facts; it does not establish sandbox causality. No diagnostic
+retries a command.
+
+### Computer tools
+
+Rich launches preserve configured MCP capabilities. The owner may selectively
+grant a configured server with `projectCapabilityAllowlist: ["mcp:cua_repl"]`
+and a role capability `mcpServers: ["cua_repl"]`; a rich owner preset can also use
+already enabled servers. Lean disables these servers unless explicitly granted.
+Read-only discovery on the installed `cua_repl` server returned its tools and a
+native app inventory. A subsequent real Codex turn using saved ChatGPT auth and
+only that existing MCP server completed two `js` inventory calls: 37 apps and no
+open browser surfaces, without errors. Codex's per-turn MCP metadata resolved the
+standalone probe's missing-context error. Selecting or controlling an app or
+browser remains **NOT RUN**. Prefer an explicit owner `lean:false` rich baseline
+for inherited tool access. Native computer/browser flags alone do not establish
+a working host service; app permissions, context and server health still apply.

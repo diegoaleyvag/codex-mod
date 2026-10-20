@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.1 - 2026-10-19
+
+- Run the approval-policy suite in every CI job and the execution-policy suite in the Node 22 jobs, alongside existing runner and recovery tests.
+
+- Require writable-root requests and resumes to match explicit owner grants by canonical equality. A granted parent directory cannot authorize a separately named protected descendant.
+
+- Add deterministic activity titles with literal file targets and faithful search metadata, retaining conservative descriptions when command syntax or source evidence is ambiguous. Preserve original commands, output and failures without extra model calls.
+
+- Revalidate persisted cwd authorization on every resume; refuse unanchored execution snapshots. Show exact bounded source proposals before file acceptance, refuse opaque command/stdin approvals, and validate complete active host identities while supporting main-parent entries with an absent parentId.
+
+- Add explicit owner execution policy, named permission/cwd launch requests, canonical registered-worktree validation and immutable same-thread policy snapshots. Force matching approval/network/root config on exec and app-server; interactive modes never downgrade to exec.
+- Add opt-in native Codex auto review, experimental manual approval controls and an authoritative-parent one-shot approval tool. Bind installed command/file/permissions RPC identities, reject stale/cancelled/session grants and retain all replay guards. Tested Desktop child views omit manual buttons; their requests expire without consent or source writes.
+- Verify five real Sonnet-led Desktop delegation cases (file accept/decline/cancel and command accept/cancel), exact positive/negative markers and source archiving. Preserve the distinction between decision submission and source delivery; permission-grant and stdin variants remain unverified in Desktop.
+- Distinguish permission-denial evidence from generic network failures with effective-policy facts, and document protected Git paths and runtime-dependent computer tools.
+
+- Add opt-in `archiveSessions` (default false): archive owned source threads through the Codex CLI after process completion on both transports and exec fallback. Preserve history, authentication, permissions and same-thread follow-ups, including after disabling the option. History failures preserve the answer and never replay work. Active sessions can appear; interrupted or crashed runs and older entries may need manual archiving.
+
 ## 1.2.0 - 2026-10-19
 
 - Follow the host's exact auto-mode no-verdict instruction with at most one unchanged observer-launch retry, after retiring the denied core tool ID and checkpointing the live capability. Other denials, admitted spawns and uncertain outcomes never retry.

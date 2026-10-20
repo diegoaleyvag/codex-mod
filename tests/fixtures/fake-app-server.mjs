@@ -141,6 +141,10 @@ createInterface({ input: process.stdin }).on('line', line => {
   log(m)
   const reply = result => out({ id: m.id, result })
   if (m.id !== undefined && m.method === undefined) {
+    if (scenario.startsWith('capability-approval') && m.id === 701) {
+      if (scenario.endsWith('-cancel') && m.result?.decision === 'cancel') return complete('interrupted')
+      return finishNormally()
+    }
     if (scenario.startsWith('batch6-question') && m.id === 201) finishNormally()
     return
   }
@@ -355,6 +359,23 @@ createInterface({ input: process.stdin }).on('line', line => {
       if (scenario === 'unknown') {
         note('brand/new/notification', { threadId: THREAD, turnId: TURN })
         note('item/completed', { threadId: THREAD, turnId: TURN, item: { type: 'holoDeck', id: 'h' } })
+      }
+      if (scenario.startsWith('capability-approval')) {
+        const method = scenario.includes('permissions') ? 'item/permissions/requestApproval' : scenario.includes('file') ? 'item/fileChange/requestApproval' : 'item/commandExecution/requestApproval'
+        const params = { threadId: THREAD, turnId: TURN, itemId: 'approval-item', startedAtMs: 42,
+          ...(method.includes('commandExecution') ? { command: /-(?:opaque|item|stdin|network)$/.test(scenario) ? null : 'printf exact', cwd: '/repo', approvalId: 'callback-1',
+            kind: /-(?:opaque|item|network)$/.test(scenario) ? 'command' : 'writeStdin', ...(scenario.endsWith('-network') ? { networkApprovalContext: { host: 'api.example.test', protocol: 'https' } } : {}) } : {}),
+          ...(method.includes('permissions') ? { cwd: '/repo', permissions: { network: { enabled: true }, fileSystem: { write: ['/extra'] } } } : {}) }
+        if (method === 'item/commandExecution/requestApproval' && /-(?:item|stdin)$/.test(scenario)) note('item/started', { threadId: THREAD, turnId: TURN, item: { id: params.itemId, type: 'commandExecution', status: 'inProgress', command: 'ORIGINAL_COMMAND_IS_NOT_STDIN' } })
+        if (method === 'item/fileChange/requestApproval' && !scenario.includes('missing')) {
+          note('item/started', { threadId: THREAD, turnId: TURN, item: { type: 'fileChange', id: 'competing-item', status: 'inProgress', changes: [{ path: '/repo/foreign.txt', kind: { type: 'delete' }, diff: '-foreign' }] } })
+          note('item/started', { threadId: THREAD, turnId: TURN, item: { type: 'fileChange', id: params.itemId, status: 'inProgress', changes: [{ path: '/repo/exact.txt', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-old\n+exact-proposal\n' }] } })
+          if (scenario.includes('stale')) setTimeout(() => note('item/completed', { threadId: THREAD, turnId: TURN, item: { type: 'fileChange', id: params.itemId, status: 'completed', changes: [] } }), 300)
+        }
+        out({ id: 701, method, params })
+        if (scenario.endsWith('-resolved')) setTimeout(() => { note('serverRequest/resolved', { threadId: THREAD, turnId: TURN, requestId: 701 }); finishNormally() }, 150)
+        if (scenario.endsWith('-finish')) setTimeout(finishNormally, 150)
+        return
       }
       if (scenario === 'approval') {
         out({ id: ++reqId, method: 'item/commandExecution/requestApproval', params: { threadId: THREAD, turnId: TURN } })
