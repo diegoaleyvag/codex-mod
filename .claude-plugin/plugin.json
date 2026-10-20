@@ -211,7 +211,7 @@
     "approvalMode": {
       "type": "string",
       "title": "Approval mode",
-      "description": "Owner execution policy: never (default), ask (native user buttons), auto (Codex auto_review), or orchestrator (delegate exact one-shot decisions to the authoritative Claude parent). Interactive/reviewer modes require app-server; no exec fallback.",
+      "description": "Owner execution policy: never (default), ask (experimental host-dependent user buttons; unavailable in tested Desktop child views), auto (Codex auto_review), or orchestrator (delegate exact one-shot decisions to the authoritative Claude parent). Interactive/reviewer modes require app-server; no exec fallback.",
       "default": "never",
       "options": [
         "never",

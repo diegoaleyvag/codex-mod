@@ -476,10 +476,22 @@ harness](../tests/fixtures/steer-v2-harness.md) for host ordering and live gates
   The completed source thread was archived and retained its history.
 - Current local checks passed 788 hook tests, 158 Node tests and strict plugin
   validation. CI now includes approval-policy tests on Node 20/22 and
-  execution-policy tests on Node 22, on Ubuntu and macOS. Hosted results remain
-  pending until the release PR runs.
-- Manual approval buttons, real immediate-parent inspect/decide delivery and
-  file-approval source ordering remain pending dedicated Desktop acceptance.
+  execution-policy tests on Node 22, on Ubuntu and macOS. The release PR's hosted
+  matrix passed all four OS/runtime combinations.
+- A new This computer session with Sonnet 5.5 medium verified real immediate-parent
+  inspection and delivery for file accept/decline/cancel and command accept/cancel.
+  The two accepted markers had the exact expected bytes; the three negative
+  markers were absent. Source histories confirmed completion or turn interruption,
+  read-only/on-request/user policy, and archiving for all six test workers.
+  Independent headless real-parent file/command acceptance also passed. A separate
+  direct sidecar calibration observed the complete file proposal before approval.
+- Manual `ask` is experimental: the expanded request in Desktop 2.42304.2 with
+  bundled CLI 2.1.299 showed generic details without approval buttons. The actual
+  request expired after 120 seconds without consent or a source write. No human
+  response was synthesized. Other hosts remain unverified.
+- The tested command request did not offer decline, so command decline has no
+  runtime acceptance claim. Permission-grant and stdin variants remain NOT RUN.
+  `codex_message_status` is a SendMessage contract, not an approval receipt.
   Computer-tool inventory does not establish window/browser control. The
   earlier generic Coordinator receipt remains the accepted text fallback;
   custom paint and live redraw remain unaccepted.

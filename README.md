@@ -621,12 +621,15 @@ parent and a Codex worker verified a native auto-review approval for computer-to
 inventory, alongside Git writes and network access under explicit full access.
 This does not establish every approval type or interactive control.
 
-`ask` displays owned native approval controls: **Approve once**, **Decline**, and
-**Cancel turn**. It requires native action tools and a host that actually invokes
+`ask` is experimental and depends on owned native approval controls:
+**Approve once**, **Decline**, and **Cancel turn**, limited to decisions the source
+request offers. It requires native action tools and a host that actually invokes
 the custom renderer and supports buttons. Successful tool registration alone
-does not establish this; some Desktop child views skip custom ToolUse renderers.
-The new Desktop approval controls are **NOT RUN**. Missing controls fail
-explicitly, and an unanswered/invisible pending approval expires after 120 seconds
+does not establish this. A fresh session in Desktop 2.42304.2 with bundled Claude
+Code 2.1.299 displayed only generic request details, without buttons, so manual
+approval is **not operational in that tested child view**. The request expired
+without applying its patch; no human decision was fabricated. Missing controls
+fail explicitly, and an unanswered/invisible pending approval expires after 120 seconds
 without consent. Opening a row, receiving a request or rendering a receipt never
 approves it.
 
@@ -644,6 +647,17 @@ runner delivery; inspect again or read the source outcome rather than replaying
 the decision. Parent auto mode does not receive these requests automatically.
 There is no internal parent notification; polling is required. An unanswered
 request expires after 120 seconds.
+
+A fresh Sonnet 5.5 medium parent in Desktop verified five independent delegated
+cases: file accept/decline/cancel and command accept/cancel. Root checks confirmed
+the two accepted files' exact bytes, absence of all three denied/cancelled files,
+source completion or interruption and history archiving. Headless real-parent
+file and command acceptance also passed. `inspect` exposes current pending
+requests, not a durable delivery receipt; `codex_message_status` tracks
+SendMessage, not approvals. Use the source result to verify delivery. The tested
+command request offered accept, a policy amendment and cancel, with no decline;
+unsupported decisions are never added. Permission-grant and stdin approval
+variants remain **NOT RUN** in Desktop.
 
 The approval tool rejects source Codex agents, mirrors, unrelated Claude agents,
 wrong sessions, orphaned children and missing/failed authoritative parent lookup.

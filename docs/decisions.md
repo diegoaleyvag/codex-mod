@@ -189,3 +189,20 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
   including `.codex`, `.agents` and normal subdirectories. Symlink aliases of an
   exact grant work; retargeted aliases and revoked exact grants fail on resume.
   A broader parent grant cannot replace a removed exact metadata grant.
+
+## D-016 - Ship verified delegation with an explicit manual-UI compatibility limit
+- Date: 2026-10-19. Applies to 1.2.1.
+- Decision: keep conservative defaults and ship optional native auto review and
+  immediate-parent delegation. Mark manual `ask` experimental and unavailable in
+  the tested Desktop child view; retain its no-consent timeout. Never substitute
+  a synthetic human response or replay the requested operation to pass acceptance.
+- Why: a fresh Sonnet-led Desktop session verified five real delegated cases,
+  exact positive/negative marker files, source completion/interruption and archive
+  cleanup. The same host displayed generic manual request details without buttons;
+  the request expired without applying its patch. Native auto review had already
+  passed a separate fresh-session capability check.
+- Consequences: stable does not mean every experimental host control is accepted.
+  Permissions/stdin variants, computer window control and custom Coordinator paint
+  retain their documented gates. Approval-policy and execution-policy helpers run
+  in hosted CI; proprietary hook tests and strict validation remain local evidence.
+  Version 1.2.1 gets a new stable tag; the 1.2.0 prerelease tag stays unchanged.
