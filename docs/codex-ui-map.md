@@ -18,6 +18,46 @@ because the engine refuses any other tool before the guard sees it.
 - **deferred**: not implemented or not yet admitted/verified; not drawn.
 - **out of reach**: Claude Code has no fitting surface, or drawing it would be misleading.
 
+## Parent progress query (unreleased)
+
+`codex_agent_status({targetAgentId})` exposes bounded JSON to the authoritative
+immediate Claude parent of a live owned root source, including an actual Claude
+subagent parent. It is registered for every approval mode and grants no approval
+rights. Source/display/prefix calls, unrelated/sibling/grandparent callers,
+other sessions and failed/incomplete/ambiguous host identity are refused. Native
+transcript/tool-row task progress continues independently; this is a model-callable
+query, not a host task-summary setter or a new display action.
+
+`sourceState` reflects observed source turn events. `currentAction` selects the
+latest still-active source item, `activeActions` discloses parallel activity,
+and `lastAction` retains the latest observed public action, including completion.
+Explicit source status and observed lifecycle remain separate; absent status is
+`null`. Completed actions deduplicate item identities, with a `null` count when
+identity is missing. Plan/commentary and command previews disclose clipping.
+The JSON remains below 4 KiB and excludes raw/private reasoning, full results,
+tool arguments, request identities/tokens, prompts and env/config contents.
+Source-public text may contain arbitrary text already visible to the owner;
+the query does not promise to recognize arbitrary embedded secrets.
+
+All timestamps use milliseconds: query observation time, recorded launch time,
+elapsed launch time and recorded last source event observation. Missing values
+are `null`; receipt/store updates and polling never refresh source activity.
+Pending approval/question counts can precede emitted rows. The endpoint reads
+only the existing live observations, clock and authoritative host identity; no
+source polling/RPC, filesystem read/migration/write, subprocess, extra model
+turn, notification or automatic stuck inference occurs. Effective
+cwd/model/effort/sandbox/network/approval/transport come from the launched run.
+
+Mirrors and end/restart/missing runs do not support progress recovery. Main
+callers get `available:false` with a final-report fallback; subagent callers
+without a live parent binding are refused. Host Completed badges and saved
+records never become inferred source completion. Completed/restart/mirror reads
+and fresh Desktop-session acceptance remain deferred. `codex_message_status`
+continues to report SendMessage receipts only, not agent progress or approval
+delivery. Existing `codex-sandbox: read-only` already enforces review isolation;
+project/caller setup owns environments, with no `codex-env` support, automatic
+activation or tool-version probing added here.
+
 ## Map
 
 | Codex item (exec / app-server) | Codex CLI shows | Codex app shows | Closest Claude Code row | Status | Fields used |

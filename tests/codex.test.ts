@@ -210,6 +210,7 @@ function world(on: On, opts: WorldOpts = {}) {
   const store = opts.store ?? new Map<string, unknown>()
   const files = opts.files ?? new Map<string, string>()
   const reads: string[] = []
+  const envReads: string[] = []
   const location = { cwd: '/tmp/project' }
   const clock = { now: 1_000_000 }
   // every call that reached the engine's own tool path (permission + run)
@@ -258,7 +259,7 @@ function world(on: On, opts: WorldOpts = {}) {
     clock.now += e.ms
     return { value: undefined }
   })
-  on('env.get', (_$, e: any) => ({ value: e.name === 'HOME' ? '/home/t' : undefined }))
+  on('env.get', (_$, e: any) => { envReads.push(e.name); return { value: e.name === 'HOME' ? '/home/t' : undefined } })
   on('fs.read', (_$, e: any) => {
     // The host resolves relative reads before dispatching this mock hook.
     const path = e.path.endsWith('/.claude/codex-mod.json') ? '.claude/codex-mod.json' : e.path
@@ -342,7 +343,7 @@ function world(on: On, opts: WorldOpts = {}) {
     yield { kind: 'text' as const, index: 0, text: 'from the model' }
     return { turnId: e.turnId, index: e.index, answer: 'from the model', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  return { spawned, modelCalls, logs, sleeps, kills, source, status, store, clock, files, core, checks, writes, stateWrites, reads, location, toolSpecs, toolLists }
+  return { spawned, modelCalls, logs, sleeps, kills, source, status, store, clock, files, core, checks, writes, stateWrites, reads, envReads, location, toolSpecs, toolLists }
 }
 
 // Source evidence and display payloads now recover from private cache files.
@@ -560,6 +561,8 @@ test('nested mirrors: hidden type; early core-event identity reconciles with lis
     await $.turn.start({ text: e.prompt, turnId: 'mirror-host-turn', agentId: host })
     for (let i = 0; i < 8; i++) {
       const s = await step($, host, i, 'mirror-host-turn')
+      const mirrorStatus: any = await $.tool.call({ tool: 'mcp__codex-mod__codex_agent_status', tool_use_id: 'query-live-mirror', targetAgentId: host } as any)
+      expect(JSON.parse(mirrorStatus.result[0].text).available).toBe(false)
       if (s.result.toolUses.some(u => u.name === 'SubagentHandback')) { childFinal = handback(s.result); break }
       if (s.result.stopReason === 'end_turn') { childFinal = s.result.answer; break }
       await runCalls($, s.chunks, host)
@@ -1830,8 +1833,8 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   expect(runs.map(r => r.join(' '))).toEqual(['which codex', '/usr/local/bin/codex --version', '/usr/local/bin/codex login status'])
   expect(registered.map(r => r.name)).toEqual(['codex', 'implementer', 'implementer-high', 'gpt-6-1-sol', 'gpt-6-luna'])
   expect(registered[1]).toMatchObject({ tools: ['Bash', 'Edit', 'Write', 'WebSearch', 'Agent', 'mcp__codex-mod__codex_tool', 'mcp__codex-mod__codex_plan', 'mcp__codex-mod__coordinator_message', 'mcp__codex-mod__codex_question'], model: 'haiku', maxTurns: 400, background: true, omitClaudeMd: true })
-  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question', 'codex_message_status'])
-  expect(w.toolSpecs.filter(t => t.name !== 'codex_message_status').every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
+  expect(w.toolSpecs.map(t => t.name)).toEqual(['codex_tool', 'codex_plan', 'coordinator_message', 'codex_question', 'codex_message_status', 'codex_agent_status'])
+  expect(w.toolSpecs.filter(t => !['codex_message_status', 'codex_agent_status'].includes(t.name)).every(t => t.description.includes('Display-only') && t.description.includes('refused'))).toBe(true)
   expect(w.toolSpecs[3].description).toContain('question or owner-enabled approval')
   expect(w.toolSpecs[3].description).toContain('one-shot approval')
   expect(w.toolSpecs[3].description).toContain('Only an explicit human answer, one-shot approval, decline or cancel submits a response')
@@ -1843,7 +1846,7 @@ test('session.start: finds codex on PATH, checks it, registers the agents with t
   // The host spreads arguments beside its envelope fields, so display schemas
   // must keep these keys out of their top-level inputs.
   const envelopeKeys = ['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent', 'input', 'ceiling']
-  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text'], ['server', 'name', 'arguments'], ['targetAgentId', 'messageId']])
+  expect(w.toolSpecs.map(t => Object.keys(t.inputSchema.properties))).toEqual([['server', 'name', 'arguments'], ['explanation', 'steps'], ['sourceUuid', 'text'], ['server', 'name', 'arguments'], ['targetAgentId', 'messageId'], ['targetAgentId']])
   for (const spec of w.toolSpecs) {
     expect(spec.inputSchema.additionalProperties).toBe(false)
     expect(Object.keys(spec.inputSchema.properties).some(key => envelopeKeys.includes(key))).toBe(false)
@@ -6840,3 +6843,146 @@ test('execution launch refuses selecting protected descendants from a parent wri
     expect(handback(r.result)).toContain('exactly match an explicit canonical owner root')
     expect(w.core).toEqual([])
   })
+
+const AGENT_STATUS_TOOL = 'mcp__codex-mod__codex_agent_status'
+const statusQuery = { tool: AGENT_STATUS_TOOL, tool_use_id: 'query-live-source', targetAgentId: 'agent-codex' }
+const statusJSON = (answer: any) => JSON.parse(answer.result[0].text)
+const statusCommand = (transport: 'exec' | 'app-server', event: 'started' | 'completed', command = 'node --test') => {
+  const item = { id: 'status-command', type: 'commandExecution', command, status: event === 'started' ? 'inProgress' : 'completed', aggregatedOutput: 'PRIVATE_OUTPUT', exitCode: 0 }
+  return out(JSON.stringify({ type: `item.${event}`, item: { ...item, type: 'command_execution', aggregated_output: item.aggregatedOutput, exit_code: 0 },
+    ...(transport === 'app-server' ? { source: { transport, event: `item/${event}`, threadId: 'status-thread', turnId: 'status-turn', item } } : {}) }))
+}
+
+for (const [transport, approvalMode, nested] of [
+  ['exec', 'never', false], ['app-server', 'auto', true], ['app-server', 'orchestrator', false], ['app-server', 'ask', true],
+] as const) test(`agent status ${transport}/${approvalMode} authorizes only the actual ${nested ? 'Claude subagent' : 'main'} parent and observes active/completed commands`,
+  { options: { transport, approvalMode, progressIntervalMs: 0 } }, async ($, on) => {
+    let release = false, reached!: () => void, hostMode = 'valid', sid = 'sess-1'
+    const observed = new Promise<void>(resolve => { reached = resolve })
+    const hosts = () => {
+      if (hostMode === 'failure') throw new Error('host list unavailable')
+      const list: any[] = [
+        { id: 'agent-codex', type: 'codex-mod:codex', description: 'source', status: 'running', ...(nested ? { parentId: 'claude-parent' } : {}) },
+        { id: 'claude-parent', type: 'general-purpose', description: 'immediate parent', status: 'running', parentId: 'grandparent' },
+        { id: 'grandparent', type: 'general-purpose', description: 'grandparent', status: 'running' },
+        { id: 'sibling', type: 'general-purpose', description: 'sibling', status: 'running' },
+        { id: 'codex-display', type: 'codex-mod:codex-child', description: 'display', status: 'running' },
+      ]
+      if (hostMode === 'missing') return list.slice(1)
+      if (hostMode === 'incomplete') delete list[0].description
+      if (hostMode === 'terminal') list[0].status = 'completed'
+      if (hostMode === 'ambiguous') list.push({ ...list[0] })
+      if (hostMode === 'parent-missing' && nested) return list.filter(a => a.id !== 'claude-parent')
+      if (hostMode === 'parent-codex' && nested) list[1].type = 'codex-mod:codex'
+      if (hostMode === 'reparented') list[0].parentId = 'grandparent'
+      return list
+    }
+    const w = appWorld(on, { agentList: hosts, sessionId: () => { if (sid === 'failure') throw new Error('session ID unavailable'); return sid }, pieces: [THREAD('status-thread'),
+      transport === 'exec' ? out('{"type":"turn.started"}') : TURN('status-turn'), statusCommand(transport, 'started'),
+      () => { reached(); return release }, statusCommand(transport, 'completed'), MESSAGE('status final report')] })
+    let rpc = 0
+    on('http.fetch', () => { rpc++; throw new Error('status must not poll an RPC') })
+    await startSession($)
+    const running = step($, 'agent-codex')
+    await observed
+    const parent = nested ? { agentId: 'claude-parent' } : {}
+    const before = { reads: w.reads.length, env: w.envReads.length, writes: w.writes.length, stateWrites: w.stateWrites.length,
+      processes: w.runs.length, spawns: w.spawned.length, store: JSON.stringify([...w.store]) }
+    const active = statusJSON(await $.tool.call({ ...statusQuery, ...parent } as any))
+    expect(active).toMatchObject({ available: true, sourceState: 'inProgress', activeActions: 1, completedActions: 0,
+      currentAction: { type: 'commandExecution', status: 'inProgress', lifecycle: 'started', command: { text: 'node --test', clipped: false } },
+      execution: { cwd: { text: '/tmp/project', clipped: false }, model: { text: 'gpt-6.1-sol' }, effort: { text: 'medium' }, sandbox: 'workspace-write', networkAccess: false, approvalMode, transport } })
+    expect(active.launchedAt).toBe(1_000_000)
+    expect(active.lastSourceObservedAt).toBe(1_000_000)
+    w.clock.now += 123
+    const again = statusJSON(await $.tool.call({ ...statusQuery, ...parent } as any))
+    expect(again.observedAt).toBe(1_000_123)
+    expect(again.elapsedMs).toBe(123)
+    expect(again.lastSourceObservedAt).toBe(active.lastSourceObservedAt)
+    for (const agentId of ['agent-codex', 'codex-display', 'sibling', 'grandparent', ...(nested ? [undefined] : ['claude-parent'])]) {
+      expect((await $.tool.call({ ...statusQuery, agentId } as any) as any).deny).toContain('immediate Claude parent')
+    }
+    expect((await $.tool.call({ ...statusQuery, ...parent, tool_use_id: 'toolu_codexmod_forged' } as any) as any).deny).toContain('immediate Claude parent')
+    expect((await $.tool.check({ ...statusQuery, input: { targetAgentId: 'agent-codex' }, ...parent } as any)).decision).toBe('deny')
+    for (const invalid of ['missing', 'incomplete', 'terminal', 'ambiguous', 'failure', 'reparented', ...(nested ? ['parent-missing', 'parent-codex'] : [])]) {
+      hostMode = invalid
+      expect((await $.tool.call({ ...statusQuery, ...parent } as any) as any).deny).toContain('immediate Claude parent')
+    }
+    hostMode = 'valid'
+    sid = 'other-session'
+    expect((await $.tool.call({ ...statusQuery, ...parent } as any) as any).deny).toContain('immediate Claude parent')
+    sid = 'failure'
+    expect((await $.tool.call({ ...statusQuery, ...parent } as any) as any).deny).toContain('immediate Claude parent')
+    sid = 'sess-1'
+    expect({ reads: w.reads.length, env: w.envReads.length, writes: w.writes.length, stateWrites: w.stateWrites.length,
+      processes: w.runs.length, spawns: w.spawned.length, store: JSON.stringify([...w.store]) }).toEqual(before)
+    expect(rpc).toBe(0)
+    expect(w.modelCalls).toEqual([])
+    release = true
+    const first = await running
+    const done = statusJSON(await $.tool.call({ ...statusQuery, ...parent } as any))
+    expect(done).toMatchObject({ available: true, currentAction: null, activeActions: 0, lastAction: { status: 'completed', lifecycle: 'completed' }, completedActions: 1 })
+    expect(done.lastSourceObservedAt).toBe(1_000_123)
+    await runCalls($, first.chunks, 'agent-codex')
+    expect(handback((await step($, 'agent-codex', 1)).result)).toContain('status final report')
+    const ended: any = await $.tool.call({ ...statusQuery, ...parent } as any)
+    if (nested) expect(ended.deny).toContain('immediate Claude parent')
+    else expect(statusJSON(ended)).toMatchObject({ available: false })
+    expect(w.spawned.length).toBe(1)
+    expect(w.core).toEqual([])
+    expect(w.checks).toEqual([])
+  })
+
+test('agent status counts pending source questions and approvals before display, without leaking request identities',
+  { options: { transport: 'app-server', approvalMode: 'orchestrator', lean: false, progressIntervalMs: 0 } }, async ($, on) => {
+    const approval = { type: 'codexmod.request', token: 'PRIVATE-APPROVAL-TOKEN', requestId: 81, method: 'item/commandExecution/requestApproval', status: 'pending',
+      params: { threadId: 'thr-1', turnId: 'turn-1', itemId: 'approval-item', command: 'PRIVATE_COMMAND_PARAM', startedAtMs: 1 } }
+    const question = { type: 'codexmod.request', token: 'PRIVATE-QUESTION-TOKEN', requestId: 82, method: 'item/tool/requestUserInput', status: 'pending', params: questionParams }
+    const batch = (status: string) => out([approval, question].map(q => JSON.stringify({ ...q, status })).join('\n'))
+    const w = appWorld(on, { agentList: approvalHost, pieces: [THREAD('thr-1'), TURN('turn-1'), batch('pending'), batch('cancelled'), cmdDone('pwd'), MESSAGE('done')] })
+    await startSession($)
+    const first = await step($, 'agent-codex')
+    const pending: any = await $.tool.call(statusQuery as any)
+    expect(statusJSON(pending).pending).toEqual({ approvals: 1, questions: 1 })
+    expect(JSON.stringify(pending)).not.toContain('PRIVATE')
+    expect(w.writes).toEqual([])
+    await runCalls($, first.chunks, 'agent-codex')
+    await step($, 'agent-codex', 1)
+    expect(statusJSON(await $.tool.call(statusQuery as any)).pending).toEqual({ approvals: 0, questions: 0 })
+    expect(w.modelCalls).toEqual([])
+    expect(w.core).toEqual([])
+  })
+
+test('agent status never recovers terminal progress from a saved record or invents completion for missing targets', async ($, on) => {
+  const w = appWorld(on, { store: new Map([['agent:sess-1:agent-restarted', { ...quietCoordinatorRecord('body'), thread: 'previous-thread',
+    wire: { records: [{ event: 'turn.completed', transport: 'exec', threadId: 'previous-thread' }], rows: {} } }]]) })
+  await startSession($)
+  const reads = w.reads.length, writes = w.stateWrites.length, processes = w.runs.length
+  for (const targetAgentId of ['agent-restarted', 'missing-target']) {
+    const result = statusJSON(await $.tool.call({ ...statusQuery, targetAgentId } as any))
+    expect(result.available).toBe(false)
+    expect(result.sourceState).toBe(undefined)
+    expect(result.reason).toContain('use the final report')
+    expect((await $.tool.call({ ...statusQuery, targetAgentId, agentId: 'agent-codex' } as any) as any).deny).toContain('immediate Claude parent')
+  }
+  expect(w.reads.length).toBe(reads)
+  expect(w.stateWrites.length).toBe(writes)
+  expect(w.runs.length).toBe(processes)
+  expect(w.spawned).toEqual([])
+  expect(w.modelCalls).toEqual([])
+})
+
+test('agent status call/check catchers have no executor fallback, and a stopped source is unavailable', async ($, on) => {
+  const h = await nestedLaunchHarness(on, { agentList: () => [{ id: 'agent-progress', type: 'codex-mod:codex', description: 'source', status: 'running' }],
+    pieces: [THREAD('status-source'), cmdDone('pwd'), MESSAGE('done')] })
+  await h.step(0)
+  const e = { ...statusQuery, targetAgentId: h.parent }
+  const noExecutor = b7Next(async () => { throw new Error('must not execute') })
+  const read = statusJSON(await h.hooks.get('tool.call')!.handler(h.engine, e, noExecutor))
+  expect(read.available).toBe(true)
+  expect(h.hooks.get('tool.call')!.catcher(h.engine, e, noExecutor).deny).toContain('not executed')
+  expect(h.hooks.get('tool.check')!.catcher(h.engine, e, noExecutor).decision).toBe('deny')
+  await h.hooks.get('turn.complete')!.handler(h.engine, { agentId: h.parent, isAborted: true }, b7Next(async () => ({})))
+  expect(statusJSON(await h.hooks.get('tool.call')!.handler(h.engine, e, noExecutor)).available).toBe(false)
+  expect(h.w.modelCalls).toEqual([])
+})

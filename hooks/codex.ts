@@ -130,6 +130,7 @@ import type { RolePolicy, EffectiveConfig } from './run-policy.ts'
 import { executionRequest, resolveExecution, executionOverrides, executionOverride, permissionEvidence, APPROVAL_MODES } from './execution-policy.ts'
 import type { ApprovalMode, ExecutionPolicy } from './execution-policy.ts'
 import { APPROVAL_METHODS, approvalRequest, approvalIdentity, matchesApproval, approvalResponse, approvalParent, parentMayDecide, fileApprovalEvidence, FILE_APPROVAL_UNAVAILABLE, commandApprovalContext, COMMAND_APPROVAL_UNAVAILABLE } from './approval-policy.mjs'
+import { agentStatus } from './agent-status.ts'
 import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
@@ -1555,6 +1556,9 @@ export function steerNote(what: 'accepted' | 'finished' | 'queued'): string {
 /** One Codex child and what has been read from it so far. */
 type Run = {
   sessionId: string
+  // Live observation timestamps only; receipt/store writes must not refresh them.
+  startedAtMs?: number
+  lastSourceObservedAtMs?: number
   ledger: SourceLedger
   rows: Record<string, SourceRecord | null>
   agentId: string
@@ -1651,6 +1655,7 @@ const nativeSources = new Map<string, { uuid: string; text: string }>()
 const nativeSends = new Map<string, { id: string; received?: string }>()
 const sendGates = new Map<string, Promise<void>>()
 let statusTool: string | undefined
+let agentStatusTool: string | undefined
 let approvalTool: string | undefined
 const pendingApprovals = new Map<string, { run: Run; question: Question }>()
 const MAX_DELIVERIES = 20
@@ -2347,6 +2352,7 @@ export const register: Register = (on, options) => {
     flushMirrorDiagnostics($)
     if (held) return next(e)
     if (e.tool === approvalTool) return approvalCall($, e)
+    if (e.tool === agentStatusTool) return agentStatusCall($, e)
     if (e.tool === statusTool) {
       if (e.agentId !== undefined || hasPrefix(e.tool_use_id)) return { deny: NOT_EXECUTED }
       const agentId = (e as any).targetAgentId
@@ -2425,7 +2431,7 @@ export const register: Register = (on, options) => {
     }
     return next(e)
   }).catch(($, e, next) => {
-    if (e.tool === statusTool || e.tool === approvalTool) return { deny: NOT_EXECUTED }
+    if (e.tool === statusTool || e.tool === approvalTool || e.tool === agentStatusTool) return { deny: NOT_EXECUTED }
     if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin)) return next(e)
     if (!guarded(e) && !unresolved(e)) return next(e)
     const held = typeof e.tool_use_id === 'string' ? answers.get(e.tool_use_id) : undefined
@@ -2436,13 +2442,14 @@ export const register: Register = (on, options) => {
   // never calls for these calls; reaching it means guard 1 was bypassed, so
   // the verdict is deny, whatever the id.
   on('tool.check', async ($, e, next) => {
-    if (e.tool === statusTool || e.tool === approvalTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
+    if (e.tool === statusTool || e.tool === approvalTool || e.tool === agentStatusTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
     const held = heldMirrorCall(e, next.origin.plugin, 'check')
     flushMirrorDiagnostics($)
     if (held) return next(e)
     if (!hasPrefix(e.tool_use_id) && !isDisplay(e.tool) && unresolved(e)) await agentName($, e.agentId!)
     return guarded(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
   }).catch(($, e, next) => {
+    if (e.tool === agentStatusTool) return { decision: 'deny' as const, reason: NOT_EXECUTED }
     if (next.error?.kind === 're-entry' && heldMirrorCall(e, next.origin.plugin, 'check')) return next(e)
     return guarded(e) || unresolved(e) ? { decision: 'deny' as const, reason: NOT_EXECUTED } : next(e)
   })
@@ -3020,6 +3027,38 @@ const proposedFileChanges = (run: Run, q: Question) => fileApprovalEvidence(q,
 const proposedCommand = (run: Run, q: Question) => commandApprovalContext(q,
   run.ledger.items.get(JSON.stringify([q.params.threadId, q.params.turnId, q.params.itemId])))
 
+/** Only the authoritative immediate Claude parent of a live source qualifies. */
+async function agentStatusCall($: EngineInterface, e: any): Promise<any> {
+  const deny = () => ({ deny: 'codex-mod: only the authoritative immediate Claude parent may read live source status' })
+  if (hasPrefix(e.tool_use_id)) return deny()
+  const run = typeof e.targetAgentId === 'string' ? runs.get(e.targetAgentId) : undefined
+  if (run) {
+    const currentSession = await $.session.id().catch(() => undefined)
+    if (typeof currentSession !== 'string' || !currentSession || run.sessionId !== currentSession) return deny()
+  }
+  if (!run || run.ended || run.killed || run.mirror) {
+    // Without a live root binding no subagent caller can establish parenthood.
+    if (e.agentId !== undefined) return deny()
+    return { result: [{ type: 'text', text: JSON.stringify({ available: false, reason: 'Live owned source status unavailable; use the final report. Completed, restarted and mirror reads are not supported.' }) }] }
+  }
+  const list = await $.agent.list().catch(() => undefined)
+  if (!Array.isArray(list) || new Set(list.map(a => a?.id)).size !== list.length) return deny()
+  const isCodex = (a: any) => typeof a?.type !== 'string' || a.type.startsWith(`${$.plugin.name}:`) || records.has(a.id) || runs.has(a.id)
+  const parent = approvalParent(list, run.agentId, isCodex)
+  if (!parent || JSON.stringify(parent) !== JSON.stringify(run.approvalParent) || !parentMayDecide(parent, e.agentId, list, isCodex)) return deny()
+  // Requests count from source evidence even before their display row is emitted.
+  const questions = new Map<string, Question>()
+  for (const source of run.ledger.records) {
+    const q = source.data as Question | undefined
+    if (source.event === 'codexmod.request' && q?.params?.threadId === run.thread && q.params?.turnId === run.turnId &&
+        typeof q.token === 'string' && /^[A-Za-z0-9-]+$/.test(q.token) && q.method === QUESTION_METHOD && choiceQuestions(q.params)) questions.set(q.token, q)
+  }
+  const pending = { approvals: [...pendingApprovals.values()].filter(p => p.run === run && p.question.status === 'pending' && p.question.params.threadId === run.thread && p.question.params.turnId === run.turnId).length,
+    questions: [...questions.values()].filter(q => q.status === 'pending').length }
+  const observedAt = await $.clock.now().catch(() => null)
+  return { result: [{ type: 'text', text: JSON.stringify(agentStatus(run, observedAt, pending, describeCommand)) }] }
+}
+
 /** No source-provided identity is trusted by the delegated approval endpoint. */
 async function approvalCall($: EngineInterface, e: any): Promise<any> {
   const deny = (reason: string) => ({ deny: `codex-mod: ${reason}` })
@@ -3091,6 +3130,12 @@ async function registerDisplayTools($: EngineInterface): Promise<void> {
       inputSchema: { type: 'object', additionalProperties: false,
         properties: { targetAgentId: { type: 'string' }, messageId: { type: 'string' } }, required: ['targetAgentId', 'messageId'] } })
     statusTool = registered.tool
+  }
+  if (!agentStatusTool) {
+    const registered = await $.tool.register({ name: 'codex_agent_status', isDeferred: false,
+      description: 'Read compact deterministic progress already observed for a live owned Codex source. Only its authoritative immediate Claude parent may query. Does not poll Codex, summarize with a model, send messages or start work. Unavailable after end/restart and for mirrors; use the final report.',
+      inputSchema: { type: 'object', additionalProperties: false, properties: { targetAgentId: { type: 'string' } }, required: ['targetAgentId'] } })
+    agentStatusTool = registered.tool
   }
 }
 
@@ -3759,10 +3804,11 @@ async function* startRun(
   const env = { CODEX_HOME: rec.effectiveConfig.home }
   const via = await transportFor($, config)
   if (execution.approvalMode !== 'never' && via.transport !== 'app-server') return yield* handBack($, e, `codex failed: approval mode ${execution.approvalMode} requires app-server; ${via.transport === 'exec' ? via.note ?? 'exec transport selected' : ''}. No fallback run was made.`, '', handback)
-  let parent: Run['approvalParent']
+  // Status uses the same launch-bound host identity in every approval mode.
+  const hostAgents = await $.agent.list().catch(() => undefined)
+  const parent: Run['approvalParent'] = Array.isArray(hostAgents) && new Set(hostAgents.map(a => a?.id)).size === hostAgents.length
+    ? approvalParent(hostAgents, agentId, (a: any) => typeof a?.type !== 'string' || a.type.startsWith(`${$.plugin.name}:`) || records.has(a.id) || runs.has(a.id)) : undefined
   if (execution.approvalMode === 'orchestrator') {
-    const list = await $.agent.list().catch(() => undefined)
-    parent = approvalParent(list, agentId, (a: any) => a.type.startsWith(`${$.plugin.name}:`) || records.has(a.id) || runs.has(a.id))
     if (!parent || !approvalTool) return yield* handBack($, e, 'codex failed: authoritative Claude parent identity or approval tool unavailable; orchestrator approvals refused', '', handback)
   }
   if (execution.approvalMode === 'ask' && (!config.nativeActions || !displayTools.codex_question || agentTools.get(name) && !agentTools.get(name)!.has(displayTools.codex_question!))) return yield* handBack($, e, 'codex failed: ask approvals require owned native UI controls; host UI unavailable', '', handback)
@@ -3804,6 +3850,7 @@ async function* startRun(
   await loadCapabilities($)
   const run: Run = {
     sessionId: await sessionId($),
+    startedAtMs: await $.clock.now().catch(() => undefined),
     ledger: new SourceLedger(),
     rows: {},
     agentId,
@@ -4033,6 +4080,9 @@ async function feedLine($: EngineInterface, run: Run, line: string): Promise<voi
     return
   }
   const source = normalizeSource(line, { transport: run.transport, threadId: run.thread, turnId: run.turnId, cwd: run.cwd })
+  if (source && (envelope?.source || EXEC_TYPES.includes(source.event) || source.event === 'codexmod.turn')) {
+    run.lastSourceObservedAtMs = await $.clock.now().catch(() => run.lastSourceObservedAtMs)
+  }
   if (source && run.execution) source.executionPolicy = run.execution
   if (source?.event === 'turn.started' && source.turnId) run.turnId = source.turnId
   const captured = source ? run.ledger.capture(source) : undefined
@@ -4232,6 +4282,7 @@ async function handle($: EngineInterface, run: Run, ev: CodexEvent, source?: Sou
       run.queue.push({ kind: 'interim', text: `Codex request ignored: unbound RPC ${JSON.stringify(q.requestId)} (${q.method})` })
       return
     }
+    if (q.status === 'pending') run.lastSourceObservedAtMs = await $.clock.now().catch(() => run.lastSourceObservedAtMs)
     for (const row of questionRows.values()) if (row.agent === run.agentId && row.question.token === q.token) row.question = q
     $.ui.invalidate('ui.render')
     if (APPROVAL_METHODS.has(q.method)) {

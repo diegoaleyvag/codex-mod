@@ -206,3 +206,29 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
   retain their documented gates. Approval-policy and execution-policy helpers run
   in hosted CI; proprietary hook tests and strict validation remain local evidence.
   Version 1.2.1 gets a new stable tag; the 1.2.0 prerelease tag stays unchanged.
+
+## D-017 - Expose observed live source progress only to its real immediate parent
+- Date: 2026-10-19 (unreleased).
+- Decision: register `codex_agent_status` independently of approval mode and bind
+  each launched root source to the existing authoritative `approvalParent` /
+  `parentMayDecide` host identity contract. The read-only endpoint uses the live
+  run ledger, explicit launch/source observation timestamps, clock and host list.
+  It returns bounded public action/plan/commentary excerpts, exact source status
+  and lifecycle separately, parallel active and completed-action counts, pending
+  request counts and effective execution facts. It grants no approval authority.
+- Why: a Claude parent needs deterministic progress without pulling transcripts,
+  asking another model to summarize, relying on message delivery receipts or
+  changing native UI progress. A completed parallel action must not hide one
+  still active, and polling is not source activity or evidence of a stuck run.
+- Consequences: source/display/prefix/unrelated callers, ambiguous/incomplete
+  host identity, other sessions and mirrors fail closed. Without a live root run,
+  main callers receive unavailable/use-final-report; subagents lose the live
+  parent binding and are refused. Completed/restart/mirror reads stay deferred;
+  no persistent status cache or inferred terminal state is introduced. Queries
+  never read env/config/request payloads, reasoning or full results, write files,
+  poll source RPCs, control a sidecar or invoke a model. Public source commands
+  and commentary remain arbitrary source text, with clipping disclosed rather
+  than a promise of secret sanitization. Existing `codex-sandbox: read-only`
+  enforces review isolation; environments belong to the project/caller and no
+  `codex-env`, environment activation or tool-version probing is added. New
+  Desktop-session acceptance remains a separate unverified gate.

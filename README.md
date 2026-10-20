@@ -412,6 +412,41 @@ and may make an auxiliary `agent_summary` provider request; the plugin does
 not enable it or substitute paid API billing. See the
 [task/card contract and limits](docs/codex-ui-map.md#agents-and-task-cards-batch-8).
 
+The registered `codex_agent_status({targetAgentId})` tool gives the real immediate
+Claude parent a compact deterministic snapshot of an active owned root source.
+Launch the Codex agent in the background, then query its exact host agent ID.
+This works with `never`, `auto`, `ask` and `orchestrator` approval modes; reading
+status does not grant any approval rights or require a new option. Main-loop and
+actual Claude subagent parents use the same authoritative host identity contract
+as delegated approvals. Source Codex agents, display/prefix calls, siblings,
+grandparents, other sessions, ambiguous/incomplete host lists and mirrors cannot
+read source progress. Existing transcript/tool-row progress remains available.
+
+The JSON reports `observedAt`, `launchedAt`, `elapsedMs` and
+`lastSourceObservedAt` in milliseconds, a source turn state, the most recently
+observed active action (`currentAction`), `activeActions`, `lastAction`, a public
+plan/commentary excerpt, completed-action and pending approval/question counts,
+and effective cwd/model/effort/sandbox/network/approval/transport facts. Action
+status comes from the source field; lifecycle comes from its event, so a missing
+status stays `null`. Parallel completion does not hide another active command.
+Action counts deduplicate reported item IDs; incomplete identities make the
+affected count `null`. Missing timestamps/facts remain `null` or `unknown`. Text previews
+carry explicit `clipped` flags, with a response bounded below 4 KiB. Public
+commands and commentary may contain arbitrary text already visible in the owned
+source transcript; this is not a generic secret sanitizer. Requests, tokens,
+tool arguments/results, prompts, environment/config contents and reasoning are
+excluded. The query reads existing observations, the clock and authoritative
+host identity only: no source RPC polling, filesystem migration/writes,
+subprocess, model summary, background notification or automatic stuck inference.
+Polling changes observation time, never source activity time.
+
+This first status contract is live-only. Ended/killed/missing runs, a restarted
+hook worker and mirror targets have no recoverable live status; the main caller
+gets explicit `available:false` and must use the final report. A subagent caller
+without a live parent binding is refused. No terminal state is inferred from
+saved records or host task badges. Completed/restart/mirror status reads remain
+deferred, and fresh Desktop session acceptance has not been run for this change.
+
 Full footers retain the full thread ID and show direct usage plus `tree` usage when descendants exist. Exec follow-ups subtract the last known cumulative full-thread baseline; duplicate completion totals replace each other. Unknown or interrupted baselines are labeled partial/unknown instead of charging historical totals to the next run. App-server uses response IDs or guarded turn deltas, including final usage arriving after completion. Transport switches share the persisted thread total when available.
 Tree counts already include direct usage: never add the two. Exec reports known direct usage as a lower bound with missing descendant usage; app-server adds observed descendants once by source identity. Failed capacity-attempt usage, when known, is shown separately before the resumed launch. Responses and cumulative turn snapshots are deduplicated; cache and reasoning
 subtotals are not added twice. Missing observations are labeled partial.
@@ -563,6 +598,12 @@ codex-writable-roots: ["/absolute/explicit-owner-root"]
 codex-model: gpt-6.1-sol
 Implement the bounded task here.
 ```
+
+The existing `codex-sandbox: read-only` header already narrows Codex execution
+to a read-only review sandbox; status reporting exposes that effective policy
+and adds no second review mode. Project/caller setup owns Python/Conda/venv and
+other execution environments. The plugin does not support `codex-env`, activate
+an environment, inspect secrets or probe tool versions for a status query.
 
 The requested cwd must exist and resolve either to a registered worktree with the
 same Git common directory as the host repository, or under an explicit

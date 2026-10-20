@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add the registered `codex_agent_status` tool for a live owned root Codex source's authoritative immediate Claude parent, across approval modes. Return bounded deterministic public progress, explicit observation timestamps, source action lifecycles, parallel active-action and completed-action counts, pending request counts and effective execution facts from existing observations. Preserve current UI progress, SendMessage receipts and all approval/replay guards.
+- Fail closed for source/display/unrelated callers, incomplete or ambiguous host identity, other sessions and mirror targets. End/restart/missing live runs expose no inferred terminal state; use the final report. Status reads never poll the source, mutate files, invoke a model or switch environments. Fresh Desktop status acceptance remains unverified.
+
 ## 1.2.1 - 2026-10-19
 
 - Run the approval-policy suite in every CI job and the execution-policy suite in the Node 22 jobs, alongside existing runner and recovery tests.
