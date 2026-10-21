@@ -132,6 +132,7 @@ import type { ApprovalMode, ExecutionPolicy } from './execution-policy.ts'
 import { APPROVAL_METHODS, approvalRequest, approvalIdentity, matchesApproval, approvalResponse, approvalParent, parentMayDecide, fileApprovalEvidence, FILE_APPROVAL_UNAVAILABLE, commandApprovalContext, COMMAND_APPROVAL_UNAVAILABLE } from './approval-policy.mjs'
 import { agentStatus } from './agent-status.ts'
 import { execDelta, zeroUsage, validUsage } from './exec-usage.mjs'
+import { displayBashCommand } from './display-input.ts'
 import type { DisplayState, PlanInput } from './plans-children.ts'
 import type { GlobResult, GrepResult } from './exploration.ts'
 export { explorationAction, literalWords } from './exploration.ts'
@@ -1710,14 +1711,24 @@ const unresolved = (e: { tool?: unknown; agentId?: unknown }): boolean =>
   isNative(e.tool) && typeof e.agentId === 'string' && !known.has(e.agentId)
 
 /** The answer to a guarded call: the stored result of our own action, else a refusal. Never runs anything. */
-export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown; [key: string]: unknown }, sid: string): GuardAnswer {
+export function answerGuarded(e: { tool?: unknown; tool_use_id?: unknown; agentId?: unknown; [key: string]: unknown }, sid: string, refused?: (reason: string) => void): GuardAnswer {
   const id = typeof e.tool_use_id === 'string' ? e.tool_use_id : ''
   const held = hasPrefix(id) ? answers.get(id) : undefined
   // e.tool is the dispatch name, distinct from codex_tool's input.name.
   const row = sourceRows.get(id)
   const input = Object.fromEntries(Object.entries(e).filter(([key]) => !['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'].includes(key)))
-  if (held === undefined || held.sessionId !== sid || held.agentId !== e.agentId || held.action.tool !== e.tool || !isCodexAgent(e.agentId) ||
-    row?.sessionId !== sid || row.agentId !== e.agentId || row.tool !== e.tool || stableJSON(input) !== held.inputDigest || row.sourceDigest !== held.sourceDigest || !validAction(held.action)) {
+  const reason = held === undefined ? 'missing-answer'
+    : held.sessionId !== sid ? 'session'
+    : held.agentId !== e.agentId ? 'agent'
+    : held.action.tool !== e.tool ? 'tool'
+    : !isCodexAgent(e.agentId) ? 'agent-type'
+    : row === undefined ? 'missing-row'
+    : row.sessionId !== sid || row.agentId !== e.agentId || row.tool !== e.tool ? 'row-binding'
+    : stableJSON(input) !== held.inputDigest ? 'input'
+    : row.sourceDigest !== held.sourceDigest ? 'source'
+    : !validAction(held.action) ? 'action' : undefined
+  if (reason !== undefined) {
+    refused?.(reason)
     return { deny: `${NOT_EXECUTED} (${String(e.tool)} is display-only for Codex agents; only a stored Codex result can answer this call)` }
   }
   answers.delete(id)
@@ -2370,8 +2381,9 @@ export const register: Register = (on, options) => {
       if (!o && rec?.coordinator?.received.includes(sourceId)) o = { messageId: sourceId, sourceUuid: sourceId, status: 'received', receivedAt: rec.updatedAt }
       return { result: [{ type: 'text', text: JSON.stringify(o ?? { messageId, status: 'unknown', reason: 'no owned receipt' }) }] }
     }
-    if (guarded(e)) return answerGuarded(e, await sessionId($))
-    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($))
+    const refused = (reason: string) => { $.ui.log(`codex-mod: display guard refused (${reason})`, { to: 'debug' }) }
+    if (guarded(e)) return answerGuarded(e, await sessionId($), refused)
+    if (unresolved(e) && (await agentName($, e.agentId!)) !== undefined) return answerGuarded(e, await sessionId($), refused)
     // The current host omits effort from agent.spawn but exposes the Agent
     // input here. Keep it scoped to this real call's lifetime and tool ID.
     if (e.tool === 'Agent' && typeof (e as any).subagent_type === 'string' && (e as any).subagent_type.startsWith(`${$.plugin.name}:`) && typeof e.tool_use_id === 'string') {
@@ -4636,6 +4648,7 @@ async function* withCoordinatorMessages(
  */
 async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSignal, run: Run): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   await loadCapabilities($)
+  let hostCwd: string | undefined
   const tools = agentTools.get(run.name) ?? new Set([...NATIVE_TOOLS.filter(tool => availableTools!.has(tool) && (cfg.richRows || !RICH_TOOLS.has(tool))), ...Object.values(displayTools)])
   let cut = -1
   let n = 0
@@ -4704,6 +4717,17 @@ async function* actionStep($: EngineInterface, e: TurnStepInput, signal: AbortSi
         } else {
           blocks.push({ text: `${reason}; display tool unavailable\n${JSON.stringify(original.input)}\n${original.error ?? JSON.stringify(original.result)}` })
           continue
+        }
+      }
+      if (q.action.tool === 'Bash' && typeof q.action.input.command === 'string') {
+        hostCwd ??= await $.session.cwd()
+        const command = displayBashCommand(q.action.input.command, hostCwd)
+        if (command !== q.action.input.command) {
+          const source = q.action.source
+          blocks.push({ text: `Codex command (cwd ${JSON.stringify(source?.cwd ?? run.cwd)}):\n${source?.item?.command ?? q.action.input.command}` })
+          // Bind the exact emitted native input before the host sees it. The
+          // source command, result, failure and digest remain unchanged.
+          q.action = { ...q.action, input: { ...q.action.input, command } }
         }
       }
       if (!holdAnswer(id, run.sessionId, run.agentId, q.action)) {

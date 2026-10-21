@@ -25,9 +25,9 @@ jobs:
         run: node --check scripts/codex-runner.mjs
       - name: Runner and approval-policy tests
         run: node --test tests/runner.test.mjs tests/approval-policy.test.mjs
-      - name: Cache, checkpoint, execution-policy, and status projection tests
+      - name: Cache, checkpoint, execution-policy, status, and display-input tests
         if: matrix.node == 22
-        run: node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs tests/execution-policy.test.mjs tests/agent-status.test.mjs
+        run: node --experimental-strip-types --test tests/store-state.test.mjs tests/row-cache.test.mjs tests/execution-policy.test.mjs tests/agent-status.test.mjs tests/display-input.test.mjs
       - name: JSON validity
         run: |
           node -e "

@@ -1514,6 +1514,75 @@ test('safety: an action answer is used once; a replay of the same id is refused,
   expect(w.core).toEqual([])
 })
 
+test('safety: display guard diagnostics contain only a refusal category', async ($, on) => {
+  const w = world(on, { pieces: [THREAD('guard-diagnostic'), cmdDone('/bin/zsh -lc original-command', 'original-result'), MESSAGE('ok')] })
+  const s = await step($, 'agent-progress')
+  const [call] = callsOf(s.chunks)
+  const event = { tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' }
+  expect((await $.tool.call({ ...event, command: 'changed-command' } as any) as any).deny).toContain('not executed')
+  expect((await $.tool.call({ ...event, agentId: 'agent-gp' } as any) as any).deny).toContain('not executed')
+  expect((await $.tool.call(event as any) as any).result.stdout).toBe('original-result')
+  expect((await $.tool.call(event as any) as any).deny).toContain('not executed')
+  expect(w.logs.filter(l => l.startsWith('codex-mod: display guard refused'))).toEqual([
+    'codex-mod: display guard refused (input)',
+    'codex-mod: display guard refused (agent)',
+    'codex-mod: display guard refused (missing-answer)',
+  ])
+  expect(w.core).toEqual([])
+})
+
+test('safety: a host cwd change canonicalizes native Bash input before binding and preserves source outcomes', async ($, on) => {
+  const original = "cd /tmp/project/worktree && sed -n '1,2p' fixture.txt && cat fixture.txt"
+  const canonical = "sed -n '1,2p' fixture.txt && cat fixture.txt"
+  const failure = 'cd /tmp/project/worktree && sh -c "exit 7"'
+  const w = world(on, { pieces: [THREAD('cwd-transition'), cmdDone(original, 'before'), cmdDone(original, 'after'), cmdDone(failure, 'failed', 7), MESSAGE('ok')] })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks)[0].input.command).toBe(original)
+  expect((await runCalls($, first.chunks, 'agent-progress'))[0].result.stdout).toBe('before')
+  // Codex's source remains in its original cwd while the host resumes in a worktree.
+  w.location.cwd = '/tmp/project/worktree'
+  const second = await step($, 'agent-progress', 1)
+  const [call] = callsOf(second.chunks)
+  expect(call.input.command).toBe(canonical)
+  expect(second.chunks.filter(c => c.kind === 'text').map(c => c.text).join('\n')).toContain(`Codex command (cwd "/tmp/project"):\n${original}`)
+  const event = { tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' }
+  for (const change of [{ command: original }, { command: 'cat changed.txt' }, { extra: true }, { agentId: 'agent-gp' }, { tool: 'Write' }]) {
+    expect((await $.tool.call({ ...event, ...change } as any) as any).deny).toContain('not executed')
+  }
+  const row = savedState(w, 'agent:sess-1:agent-progress').wire.rows[call.id]
+  expect(row.cwd).toBe('/tmp/project')
+  expect(row.item.command).toBe(original)
+  expect(row.item.aggregatedOutput).toBe('after')
+  expect((await $.tool.call(event as any) as any).result.stdout).toBe('after')
+  expect((await $.tool.call(event as any) as any).deny).toContain('not executed')
+  const third = await step($, 'agent-progress', 2)
+  expect(callsOf(third.chunks)[0].input.command).toBe('sh -c "exit 7"')
+  const [failed] = await runCalls($, third.chunks, 'agent-progress')
+  expect(failed.deny).toBe('Codex command failed (exit code 7):\nfailed')
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+  expect(w.spawned.length).toBe(1)
+})
+
+test('safety: quoted native Bash prefixes remain literal and foreign sessions cannot consume a canonical answer', async ($, on) => {
+  let sid = 'sess-1'
+  const quoted = "cd '/tmp/project' && cat fixture.txt"
+  const w = world(on, { sessionId: () => sid, pieces: [THREAD('cwd-quoted'), cmdDone(quoted, 'quoted'), cmdDone('cd /tmp/project && cat fixture.txt', 'literal'), MESSAGE('ok')] })
+  const first = await step($, 'agent-progress')
+  expect(callsOf(first.chunks)[0].input.command).toBe(quoted)
+  expect((await runCalls($, first.chunks, 'agent-progress'))[0].result.stdout).toBe('quoted')
+  const second = await step($, 'agent-progress', 1)
+  const [call] = callsOf(second.chunks)
+  expect(call.input.command).toBe('cat fixture.txt')
+  const event = { tool: call.name, ...call.input, tool_use_id: call.id, agentId: 'agent-progress' }
+  sid = 'foreign-session'
+  expect((await $.tool.call(event as any) as any).deny).toContain('not executed')
+  sid = 'sess-1'
+  expect((await $.tool.call(event as any) as any).result.stdout).toBe('literal')
+  expect(w.core).toEqual([])
+  expect(w.checks).toEqual([])
+})
+
 test('safety: Bash/Edit/Write of a Codex agent without our id prefix is refused, never run', async ($, on) => {
   const w = world(on)
   await step($, 'agent-codex')

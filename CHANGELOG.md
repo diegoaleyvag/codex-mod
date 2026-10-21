@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bind native Bash results after adapting the host's literal same-cwd `cd ... && ` input rewrite. Preserve the original source command/cwd beside adapted rows, actual success/failure results, exact input/identity/source checks and one-use answers. Add bounded refusal-category diagnostics without recording source content. Real bundled CLI 2.1.304 probes passed on both transports; Desktop rendering of the genuine completed results preserved success and the intentional failure. The candidate was not installed into the active Desktop plugin.
+
 - Add the registered `codex_agent_status` tool for a live owned root Codex source's authoritative immediate Claude parent, across approval modes. Return bounded deterministic public progress, explicit observation timestamps, source action lifecycles, parallel active-action and completed-action counts, pending request counts and effective execution facts from existing observations. Preserve current UI progress, SendMessage receipts and all approval/replay guards.
 - Fail closed for source/display/unrelated callers, incomplete or ambiguous host identity, other sessions and mirror targets. End/restart/missing live runs expose no inferred terminal state; use the final report. Status reads never poll the source, mutate files, invoke a model or switch environments. A fresh Desktop session verified main-parent live queries and the post-handback fallback with `app-server`/`auto`; nested-parent Desktop acceptance remains unverified.
 

@@ -121,7 +121,49 @@ Exec only emits eight item types (`agent_message`, `reasoning`, `command_executi
 `file_change`, `mcp_tool_call`, `web_search`, `todo_list`, `collab_tool_call`) plus `error`.
 Every other row in the table needs the `app-server` transport.
 
+## Native Bash binding verification
+
+Bundled CLI 2.1.304 reproduced a source command exiting 0 while its native
+Bash row failed the input binding after the host removed an unquoted same-cwd
+`cd` prefix. The quoted control retained the prefix and passed. Historical
+failure logs also show the host moving into the cd target on resume while
+the Codex source cwd stayed unchanged.
+
+The isolated candidate passed 798 hook tests, 167 Node tests and strict
+validation. Real saved-subscription Sonnet/Sol probes on both transports ran
+exactly two source commands each: a compound fixture read exiting 0 and an
+intentional `exit 7`. The fixed native results retained failure flags
+`false` and `true`, respectively; source rollouts independently confirmed the
+two exit codes and no replay. Hosted CI was not run for this unpublished branch.
+
+After the candidate CLI process ended, its genuine completed transcript was
+opened through the supported `--desktop --resume` route, with no customization
+flags or new prompt. In Desktop's child-task panel, the control showed
+**2 commands (2 failed)**, while the fixed result showed **2 commands (1 failed)**.
+Expanded native rows showed the successful read's exact fixture output without
+a Failed label and the intentional failure's original exit-code-7 error.
+The stored native tool blocks matched the original captured CLI results.
+
+This verifies Desktop rendering of candidate-produced stored results. It does
+not establish that the candidate stays loaded after Desktop adoption. The
+active plugin, its settings and ongoing sessions were not installed over,
+reloaded or restarted. Old failure entries were not rewritten. Live Desktop
+candidate loading, Windows cwd aliases and other native input rewrites remain
+outside this check.
+
 ## How 1.2 draws them
+
+- **Native Bash input binding (unreleased).** Claude Code 2.1.304 removes an
+  exact unquoted `cd <current host cwd> && ` prefix before `tool.call`. A real
+  isolated bundled-CLI probe reproduced a successful source command becoming
+  a refused display call; the quoted control passed. The adapter emits the
+  stable display input before holding its answer and shows the original source
+  command/cwd alongside it. Only a matching absolute Unix cwd word qualifies;
+  quoted and nonmatching forms stay literal. Original source results and failures,
+  exact input/source/identity checks and one-use answers are preserved. Fixed
+  refusal-category debug diagnostics contain no source input or output. Native
+  Desktop stored-result acceptance is recorded above; live Desktop candidate
+  hook loading remains separate from bundled-CLI checks.
 
 - **Reasoning summary -> `thinking` chunks.** Only the summary text, never raw reasoning, and only
   within the existing step pacing. Claude Code shows hook-made thinking live but does not record it,

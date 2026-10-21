@@ -232,3 +232,24 @@ add a new entry that supersedes it and mark the old one `superseded by D-NNN`.
   enforces review isolation; environments belong to the project/caller and no
   `codex-env`, environment activation or tool-version probing is added. New
   Desktop-session acceptance remains a separate unverified gate.
+
+## D-018 - Bind native Bash display input before the host's same-cwd rewrite
+- Date: 2026-10-21 (unreleased). Refines D-001.
+- Decision: adapt only an exact literal `cd <observed host cwd> && ` prefix
+  for an absolute Unix shell word before storing and emitting a native Bash
+  display input. Remove repeated identical prefixes to make the emitted input
+  stable under the host rewrite. Quoted, relative, unsafe and nonmatching cwd
+  forms remain unchanged. Show the original source command and source cwd
+  beside an adapted row; retain the complete original source binding and result.
+- Why: bundled Claude Code 2.1.304 normalizes native Bash input before
+  `tool.call`. A real isolated probe succeeded at source but its unquoted
+  same-cwd display call failed the exact input guard; the quoted control passed.
+  Historical failures began when the host resumed in the cd target while the
+  Codex source kept its original cwd. The guard was correctly refusing changed
+  input, rather than reporting a source execution failure.
+- Consequences: input, session, agent, tool, source and one-use checks remain
+  exact; no caller-side alternate input is accepted and no disk presentation
+  restores an answer. Guard diagnostics expose a fixed refusal category only.
+  This bounded adapter does not parse arbitrary shell syntax or establish
+  compatibility with every native input normalization. Bundled CLI verification
+  and native Desktop candidate acceptance remain distinct gates.
